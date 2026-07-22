@@ -865,11 +865,38 @@ class SampleManagerMixin:
         self.sync_adjustment_ratio_for_current_view()
         if not getattr(self, "_loading_sample_data", False):
             if self.apply_process_file_for_program(program_name):
-                if self._process_current_input_for_preview():
-                    return
+                if not self._has_authoritative_segmentation_state():
+                    if self._process_current_input_for_preview():
+                        return
+                else:
+                    refresher = getattr(self, "_refresh_segmentation_sample_projection", None)
+                    if callable(refresher):
+                        refresher(refresh_view=False, silent=True)
             else:
-                self.set_input_files([])
-                self.prompt_process_file_for_program(program_name)
+                if not self._has_authoritative_segmentation_state():
+                    self.set_input_files([])
+                    self.prompt_process_file_for_program(program_name)
+                else:
+                    # 工艺信息先导入时程序名尚不可知，通常暂记为“当前工艺”。
+                    # 后导入实际文件后直接用已有权威过程域结果做映射，不要求
+                    # 用户重复选择同一份工艺信息文件；映射自身会校验覆盖与歧义。
+                    current_primary = self.get_primary_input_file()
+                    if hasattr(self, "matched_process_file_var"):
+                        current_name = (
+                            os.path.basename(current_primary)
+                            if current_primary
+                            else "当前过程域结果"
+                        )
+                        self.matched_process_file_var.set(
+                            f"使用已划分工艺信息: {current_name}"
+                        )
+                    refresher = getattr(
+                        self,
+                        "_refresh_segmentation_sample_projection",
+                        None,
+                    )
+                    if callable(refresher):
+                        refresher(refresh_view=False, silent=True)
         self.on_sample_selection_change()
 
     def on_sample_display_mode_change(self):
@@ -966,6 +993,8 @@ class SampleManagerMixin:
 
     def on_sample_selection_change(self, event=None):
         """实测数据显示条件变化时刷新图表（加入去抖，防止频繁切换卡顿）"""
+        if bool(getattr(self, "_loading_sample_data", False)):
+            return
         try:
             # 记录当前选择签名，快速跳过重复请求
             sig = self.build_sample_selection_signature()
@@ -1064,6 +1093,8 @@ class SampleManagerMixin:
             sample_dir = os.path.dirname(csv_path)
         self.sample_csv_path = csv_path
         self.sample_txt_path = txt_path
+        if hasattr(self, "_invalidate_measurement_runtime_state"):
+            self._invalidate_measurement_runtime_state(keep_profile_lock=True)
         self.manual_measurement_path = None
         self.manual_measurement_data = None
         self.measurement_case_signature = ""
@@ -1099,6 +1130,8 @@ class SampleManagerMixin:
                     messagebox.showerror("格式错误", "SampleData.csv 列数不足")
                 if hasattr(self, "sample_auto_status_var"):
                     self.sample_auto_status_var.set("SampleData.csv格式错误")
+                if hasattr(self, "reset_sample_data_state"):
+                    self.reset_sample_data_state()
                 return False
 
             values = df.iloc[:, 0:3].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=float)
@@ -1125,6 +1158,12 @@ class SampleManagerMixin:
             self.align_sample_data_to_processed()
             self.update_sample_program_options()
             self.on_sample_display_mode_change()
+            projection_refresher = getattr(self, "_refresh_segmentation_sample_projection", None)
+            if callable(projection_refresher):
+                projection_refresher(
+                    refresh_view=self._has_authoritative_segmentation_state(),
+                    silent=True,
+                )
             self._refresh_ideal_tree()
             self._refresh_current_ideal_display()
 
@@ -1155,6 +1194,10 @@ class SampleManagerMixin:
                 self.show_sample_preview()
             return True
         except Exception as e:
+            try:
+                self.reset_sample_data_state()
+            except Exception:
+                pass
             if not silent:
                 messagebox.showerror("加载失败", f"读取实测数据时发生错误:\n{str(e)}")
             if hasattr(self, "sample_auto_status_var"):
@@ -1166,11 +1209,8 @@ class SampleManagerMixin:
             self._loading_sample_data = False
 
     def _clear_process_context_for_measurement_reimport(self, program_name):
-        """重新导入实测文件时清空当前工艺信息及其派生缓存。"""
-        self.set_input_files([])
-        if program_name:
-            self.program_process_file_map.pop(program_name, None)
-            self.program_prompt_skip.pop(program_name, None)
+        """重新导入实测时只撤销采样映射，保留工艺信息与过程域结果。"""
+        self._last_process_application_context = ""
 
     def load_experiment_measurement_file(self, file_path, silent=False):
         """加载手动导入的实验实测文件。"""
@@ -1245,23 +1285,16 @@ class SampleManagerMixin:
             self.sample_data_loaded = True
 
             self.align_sample_data_to_processed()
-            model_status = "none"
-            if self.data and hasattr(self, "_ensure_prediction_model_for_current_process"):
-                model_status = self._ensure_prediction_model_for_current_process(
-                    auto_identify_missing=False,
-                    save_strategy="none",
-                )
-            elif self.data:
-                self._refresh_manual_measurement_prediction()
+            current_process_path = str(self.get_primary_input_file() or "").strip()
+            if current_process_path and os.path.exists(current_process_path):
+                self.program_process_file_map.setdefault(program_name, current_process_path)
             self.update_sample_program_options()
             self.on_sample_display_mode_change()
-            if self.data and model_status != "auto_identified":
-                interval_policy = self._get_default_interval_policy() if hasattr(self, "_get_default_interval_policy") else "fresh_or_empty"
-                self.generate_plots(
-                    save=False,
+            projection_refresher = getattr(self, "_refresh_segmentation_sample_projection", None)
+            if callable(projection_refresher):
+                projection_refresher(
+                    refresh_view=self._has_authoritative_segmentation_state(),
                     silent=True,
-                    interval_policy=interval_policy,
-                    persist_profile=False,
                 )
             self._refresh_ideal_tree()
             self._refresh_current_ideal_display()
@@ -1276,7 +1309,14 @@ class SampleManagerMixin:
             if corrected_count > 0:
                 status_text += f" | 负载负值已取绝对值 {corrected_count} 点"
             if is_measurement_reimport:
-                status_text += " | 原工艺信息及页面缓存已清空，请重新导入工艺信息"
+                status_text += " | 已保留过程域划分并重新建立采样映射"
+            mapping_status = str(getattr(self, "_sample_mapping_status", "") or "")
+            if mapping_status == "valid":
+                status_text += " | 采样映射成功"
+            elif mapping_status == "failed":
+                status_text += " | 采样映射失败，过程域结果未变"
+            elif self.data:
+                status_text += " | 采样映射待建立"
             if hasattr(self, "sample_auto_status_var"):
                 self.sample_auto_status_var.set(status_text)
             if hasattr(self, "status_var_data"):
@@ -1385,10 +1425,7 @@ class SampleManagerMixin:
 
     def choose_process_file_for_current_program(self):
         """为当前程序选择工艺信息表。"""
-        program_name = self.sample_program_name.get().strip()
-        if not program_name:
-            self.set_status("请先选择程序名", 3000)
-            return
+        program_name = self.sample_program_name.get().strip() or "当前工艺"
         if hasattr(self, "_ensure_ready_for_process_info_import") and not self._ensure_ready_for_process_info_import():
             return
         self.choose_process_file_for_program(program_name)
@@ -1475,9 +1512,8 @@ class SampleManagerMixin:
             f"已绑定{source_label}: {status_detail}；保留最近一次 P_idle / K_e / 全局K_c，如需刷新请点击“辨识参数”",
             5000
         )
-        # 启用保存区间信息按钮
-        if hasattr(self, 'export_i_code_btn'):
-            self.export_i_code_btn.configure(state="normal")
+        if hasattr(self, "_refresh_import_order_controls"):
+            self._refresh_import_order_controls()
         # 为当前程序的所有刀具设置默认优化倍率2.0
         self._set_default_rg_for_program(program_name)
         return True
@@ -1534,12 +1570,22 @@ class SampleManagerMixin:
             return False
         process_path = self.program_process_file_map.get(program_name)
         if not process_path:
-            self.set_input_files([])
+            if not self._has_authoritative_segmentation_state():
+                self.set_input_files([])
+            else:
+                invalidator = getattr(self, "_invalidate_segmentation_sample_projection", None)
+                if callable(invalidator):
+                    invalidator(reason=f"程序 {program_name} 尚未绑定工艺信息")
             if hasattr(self, "matched_process_file_var"):
                 self.matched_process_file_var.set(f"未绑定工艺信息表: {program_name}")
             return False
         if not os.path.exists(process_path):
-            self.set_input_files([])
+            if not self._has_authoritative_segmentation_state():
+                self.set_input_files([])
+            else:
+                invalidator = getattr(self, "_invalidate_segmentation_sample_projection", None)
+                if callable(invalidator):
+                    invalidator(reason=f"程序 {program_name} 绑定的工艺信息表不存在")
             if hasattr(self, "matched_process_file_var"):
                 self.matched_process_file_var.set(f"工艺信息表不存在: {process_path}")
             return False
@@ -1569,7 +1615,7 @@ class SampleManagerMixin:
         elif self.processed_file_path:
             sample_dir = os.path.dirname(self.processed_file_path)
         else:
-            sample_dir = base_dir
+            sample_dir = getattr(self, "sample_data_dir", None)
         if not sample_dir:
             if not silent:
                 messagebox.showwarning("路径缺失", "请先导入 SampleData")

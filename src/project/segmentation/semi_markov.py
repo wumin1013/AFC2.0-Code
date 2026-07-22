@@ -1011,8 +1011,11 @@ class SemiMarkovDecoder:
         scorer: SegmentScorer,
         fallback_state: SegmentState,
         reason: str,
+        *,
+        first_unreachable_atom: int | None = None,
+        unreachable_states: Sequence[str] = tuple(),
     ) -> DecodeResult:
-        """按原子段功率门控生成确定性的完整覆盖安全回退。"""
+        """生成仅供诊断的全局回退；调用层不得把它当作权威结果。"""
 
         atom_states: List[SegmentState] = []
         tolerance = max(float(self.config.tie_epsilon), 1e-12)
@@ -1063,6 +1066,24 @@ class SemiMarkovDecoder:
             total_score=total_score,
             used_fallback=True,
             failure_reason=f"{reason}{gate_note}",
+            fallback_scope="global_unverified",
+            fallback_validated=False,
+            diagnostics={
+                "first_unreachable_atom": (
+                    int(first_unreachable_atom)
+                    if first_unreachable_atom is not None else None
+                ),
+                "unreachable_states": [str(value) for value in unreachable_states],
+                "fallback_interval_records": [
+                    {
+                        "start_idx": int(segment.start_idx),
+                        "end_idx": int(segment.end_idx),
+                        "state": segment.state.value,
+                    }
+                    for segment in segments
+                ],
+                "preserved_strict_steady_interval_count": 0,
+            },
         )
 
     def decode(
@@ -1083,7 +1104,6 @@ class SemiMarkovDecoder:
         back_state = np.full((atom_count, state_count), -1, dtype=np.int8)
         initial_states = {SegmentState(value) for value in self.config.initial_states}
 
-        max_atoms = int(self.config.max_segment_atoms)
         atom_starts = np.asarray([atom.start_s for atom in atoms], dtype=float)
         epsilon = float(self.config.tie_epsilon)
         tolerance = float(self.config.path_tolerance_mm)
@@ -1094,6 +1114,10 @@ class SemiMarkovDecoder:
                 continue
             state_idx = STATE_INDEX[state]
             minimum, maximum = self.config.duration_bounds(state)
+            if state is SegmentState.ENTRY:
+                # entry 的终点已经由权威局部峰值唯一确定；旧的毫米上限
+                # 不能再把该业务边界裁掉或造成全行程不可达。
+                maximum = float("inf")
             chunk_limited = state in {
                 SegmentState.IDLE,
                 SegmentState.STEADY,
@@ -1129,17 +1153,25 @@ class SemiMarkovDecoder:
                 )
             )
         for end_atom in range(atom_count):
-            # max_segment_atoms 只限制允许同态计算分块的长状态。entry/exit
-            # 不允许靠同态分块延长，必须按各自物理毫米上限完整回溯候选，
-            # steady 则额外保留一组跨过最短毫米长度的候选；否则细化原子
-            # 会错误改变业务边界或让合法 steady 完全无法形成。
-            chunk_earliest = max(0, end_atom - max_atoms + 1)
+            # idle/nonsteady 使用单原子同态块，steady 使用评分器预先证明
+            # 合法且与批量大小无关的结构起点；max_segment_atoms 因此只在
+            # 评分器中控制向量化批次，不再改变这里的候选集合。
             end_s = float(atoms[end_atom].end_s)
-            start_groups = [
-                np.arange(chunk_earliest, end_atom + 1, dtype=int)
-            ]
-            for bounded_state in (SegmentState.ENTRY, SegmentState.EXIT):
-                _, maximum = self.config.duration_bounds(bounded_state)
+            start_groups = [np.asarray([end_atom], dtype=int)]
+            structural_exit_starts = np.asarray(
+                scorer.structural_candidate_starts(
+                    end_atom,
+                    SegmentState.EXIT,
+                ),
+                dtype=int,
+            )
+            if scorer.structural_candidates_are_complete(SegmentState.EXIT):
+                if structural_exit_starts.size:
+                    start_groups.append(structural_exit_starts)
+            else:
+                # 自定义评分器默认保留通用窗口；只有明确声明结构候选
+                # 完整的评分器才能剪枝，避免改变扩展实现的候选语义。
+                _, maximum = self.config.duration_bounds(SegmentState.EXIT)
                 if np.isfinite(maximum):
                     first = int(np.searchsorted(
                         atom_starts,
@@ -1150,23 +1182,26 @@ class SemiMarkovDecoder:
                         start_groups.append(
                             np.arange(max(first, 0), end_atom + 1, dtype=int)
                         )
-            steady_minimum, _ = self.config.duration_bounds(SegmentState.STEADY)
-            steady_latest = int(np.searchsorted(
-                atom_starts,
-                end_s - steady_minimum + tolerance,
-                side="right",
-            )) - 1
-            steady_window_start = end_atom + 1
-            if steady_latest >= 0:
-                steady_latest = min(steady_latest, end_atom)
-                steady_window_start = max(0, steady_latest - max_atoms + 1)
+            structural_entry_starts = np.asarray(
+                scorer.structural_candidate_starts(
+                    end_atom,
+                    SegmentState.ENTRY,
+                ),
+                dtype=int,
+            )
+            structural_steady_starts = np.asarray(
+                scorer.structural_candidate_starts(
+                    end_atom,
+                    SegmentState.STEADY,
+                ),
+                dtype=int,
+            )
+            if structural_entry_starts.size:
                 start_groups.append(
-                    np.arange(
-                        steady_window_start,
-                        steady_latest + 1,
-                        dtype=int,
-                    )
+                    structural_entry_starts
                 )
+            if structural_steady_starts.size:
+                start_groups.append(structural_steady_starts)
             starts = np.unique(np.concatenate(start_groups))
             durations = np.maximum(end_s - atom_starts[starts], 0.0)
             evidence_lengths = np.maximum(durations, max(tolerance, 1e-6))
@@ -1192,40 +1227,44 @@ class SemiMarkovDecoder:
                     )
                 valid_duration = durations <= maximum + tolerance
                 if state is SegmentState.STEADY:
-                    steady_window = (
-                        (starts >= steady_window_start)
-                        & (starts <= steady_latest)
-                    )
-                    valid_duration &= (
-                        (starts >= chunk_earliest) | steady_window
-                    )
-                elif chunk_limited:
-                    valid_duration &= starts >= chunk_earliest
+                    if structural_steady_starts.size == 1:
+                        valid_duration &= starts == int(structural_steady_starts[0])
+                    elif structural_steady_starts.size:
+                        valid_duration &= np.isin(
+                            starts,
+                            structural_steady_starts,
+                            assume_unique=False,
+                        )
+                    else:
+                        valid_duration[:] = False
+                elif state in {SegmentState.IDLE, SegmentState.NONSTEADY}:
+                    valid_duration &= starts == end_atom
                 if state is SegmentState.STEADY:
                     # steady 是 transition 的结构锚点，最短长度必须在 DP 中
                     # 直接成为硬约束，不能等回溯后再删除伪稳态。
                     valid_duration &= durations >= minimum - tolerance
-                segment_scores = (
-                    np.asarray(local_values[state], dtype=float) * evidence_lengths
-                    + duration_adjustments
-                )
-
+                segment_scores = np.asarray(
+                    local_values[state],
+                    dtype=float,
+                ) * evidence_lengths + duration_adjustments
+                direct_usable = valid_duration & np.isfinite(segment_scores)
+                if state is not SegmentState.STEADY and not direct_usable.any():
+                    continue
                 base_scores = np.full(len(starts), -np.inf, dtype=float)
                 previous_choice = np.full(len(starts), -1, dtype=np.int8)
-                if starts[0] == 0 and is_initial_state:
+                if starts[0] == 0 and is_initial_state and direct_usable[0]:
                     base_scores[0] = 0.0
 
-                positive_offset = 1 if starts[0] == 0 else 0
-                positive_count = len(starts) - positive_offset
-                if positive_count > 0 and previous_indices.size:
-                    previous_end_rows = starts[positive_offset:] - 1
+                positive_positions = np.flatnonzero(direct_usable & (starts > 0))
+                if positive_positions.size and previous_indices.size:
+                    previous_end_rows = starts[positive_positions] - 1
                     previous_values = scores[
                         previous_end_rows[:, None],
                         previous_indices[None, :],
                     ].copy()
                     previous_values -= previous_penalties[None, :]
                     row_max = np.max(previous_values, axis=1)
-                    chosen_column = np.full(positive_count, -1, dtype=int)
+                    chosen_column = np.full(len(positive_positions), -1, dtype=int)
                     for column in range(previous_indices.size):
                         choose = (
                             (chosen_column < 0)
@@ -1234,15 +1273,64 @@ class SemiMarkovDecoder:
                         )
                         chosen_column[choose] = column
                     usable = chosen_column >= 0
-                    if np.any(usable):
-                        target_positions = np.flatnonzero(usable) + positive_offset
+                    if usable.any():
+                        target_positions = positive_positions[usable]
                         chosen = chosen_column[usable]
                         base_scores[target_positions] = previous_values[usable, chosen]
                         previous_choice[target_positions] = previous_indices[chosen].astype(np.int8)
 
                 candidate_scores = base_scores + segment_scores
-                candidate_scores[~valid_duration] = -np.inf
-                if not np.any(np.isfinite(candidate_scores)):
+                candidate_scores[~direct_usable] = -np.inf
+                if state is SegmentState.STEADY:
+                    # 后续同态块只承担计算续接，不是新的业务区间。固定使用
+                    # 单原子续块可使 max_segment_atoms 不再成为隐含最小/最大
+                    # 稳态长度；回溯合并后仍由完整 steady 判据统一复查。
+                    continuation_scores = np.full(len(starts), -np.inf, dtype=float)
+                    continuation_mask = (
+                        (starts == end_atom)
+                        & (starts > 0)
+                        & np.isfinite(scores[max(end_atom - 1, 0), state_idx])
+                    )
+                    if continuation_mask.any():
+                        continuation_positions = np.flatnonzero(continuation_mask)
+                        continuation_values = np.asarray(
+                            scorer.score_steady_continuation_candidates(
+                                starts[continuation_positions],
+                                end_atom,
+                            ),
+                            dtype=float,
+                        )
+                        previous_rows = starts[continuation_positions] - 1
+                        previous_steady_scores = scores[previous_rows, state_idx]
+                        usable = (
+                            np.isfinite(previous_steady_scores)
+                            & np.isfinite(continuation_values)
+                        )
+                        if usable.any():
+                            positions = continuation_positions[usable]
+                            continuation_scores[positions] = (
+                                previous_steady_scores[usable]
+                                + continuation_values[usable]
+                                * evidence_lengths[positions]
+                            )
+                    prefer_continuation = continuation_scores > candidate_scores + epsilon
+                    tied_continuation = np.zeros(len(starts), dtype=bool)
+                    finite_both = np.isfinite(continuation_scores) & np.isfinite(
+                        candidate_scores
+                    )
+                    tied_continuation[finite_both] = (
+                        np.abs(
+                            continuation_scores[finite_both]
+                            - candidate_scores[finite_both]
+                        )
+                        <= epsilon
+                    ) & (previous_choice[finite_both] != state_idx)
+                    use_continuation = prefer_continuation | tied_continuation
+                    candidate_scores[use_continuation] = continuation_scores[
+                        use_continuation
+                    ]
+                    previous_choice[use_continuation] = state_idx
+                if not np.isfinite(candidate_scores).any():
                     continue
                 maximum_score = float(np.max(candidate_scores))
                 tied = np.flatnonzero(
@@ -1268,11 +1356,21 @@ class SemiMarkovDecoder:
                 final_key = key
 
         if final_state is None:
+            reachable_rows = np.flatnonzero(
+                np.any(np.isfinite(scores), axis=1)
+            )
+            if reachable_rows.size:
+                last_reachable = int(reachable_rows[-1])
+                first_unreachable = min(last_reachable + 1, atom_count - 1)
+            else:
+                first_unreachable = 0
             return self._fallback_result(
                 atoms,
                 scorer,
                 fallback_state,
                 "无合法全行程最优划分结果，已保守全覆盖回退",
+                first_unreachable_atom=first_unreachable,
+                unreachable_states=[state.value for state in terminal_states],
             )
 
         chunks: List[DecodedSegment] = []
@@ -1313,9 +1411,27 @@ class SemiMarkovDecoder:
             )
 
         chunks.reverse()
+        steady_continuation_chunk_count = int(sum(
+            previous.state is SegmentState.STEADY
+            and current.state is SegmentState.STEADY
+            for previous, current in zip(chunks, chunks[1:])
+        ))
         return DecodeResult(
             segments=_merge_adjacent_segments(chunks),
             total_score=float(final_score),
+            diagnostics={
+                "first_unreachable_atom": None,
+                "unreachable_states": [],
+                "fallback_interval_records": [],
+                "preserved_strict_steady_interval_count": int(sum(
+                    segment.state is SegmentState.STEADY
+                    for segment in _merge_adjacent_segments(chunks)
+                )),
+                "steady_continuation_chunk_count": (
+                    steady_continuation_chunk_count
+                ),
+                "max_segment_atoms_role": "candidate_scoring_batch_size",
+            },
         )
 
 

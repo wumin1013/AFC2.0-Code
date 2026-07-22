@@ -525,12 +525,32 @@ class ConfigStateMixin:
             == "segmentation"
         )
         if segmentation_authoritative and display_interval_records:
-            projection_reason = ""
-            try:
-                projected_records = self._get_authoritative_segmentation_sample_records()
-            except Exception as projection_exc:
-                projected_records = []
-                projection_reason = str(projection_exc)
+            mapping_status = str(
+                getattr(self, "_sample_mapping_status", "not_available")
+                or "not_available"
+            )
+            mapping_status_labels = {
+                "not_available": "未导入实际采样文件",
+                "pending": "待建立采样映射",
+                "valid": "已建立采样映射",
+                "failed": "采样映射失败",
+            }
+            result = getattr(self, "_latest_segmentation_result", None)
+            diagnostics = getattr(result, "diagnostics", None)
+            projection_diagnostics = (
+                dict(diagnostics.get("sample_projection") or {})
+                if isinstance(diagnostics, dict)
+                else {}
+            )
+            projection_reason = str(projection_diagnostics.get("reason") or "")
+            projected_records = []
+            if mapping_status == "valid":
+                try:
+                    projected_records = self._get_authoritative_segmentation_sample_records()
+                except Exception as projection_exc:
+                    projected_records = []
+                    projection_reason = str(projection_exc)
+                    mapping_status = "failed"
 
             projected_by_id = {}
             for projected in projected_records:
@@ -568,14 +588,18 @@ class ConfigStateMixin:
                     display_record["_sample_projection_status"] = "已投影"
                     display_record["_sample_projection_reason"] = ""
                 else:
-                    display_record["_sample_projection_status"] = (
-                        "无采样投影"
-                        if projection_reason
-                        else "无独立采样投影（已折叠或合并）"
-                    )
-                    display_record["_sample_projection_reason"] = (
-                        projection_reason or "该过程区间没有独立的实际采样点"
-                    )
+                    if mapping_status == "valid":
+                        display_record["_sample_projection_status"] = "无独立采样投影（已折叠或合并）"
+                        display_record["_sample_projection_reason"] = "该过程区间没有独立的实际采样点"
+                    else:
+                        display_record["_sample_projection_status"] = mapping_status_labels.get(
+                            mapping_status,
+                            "无采样投影",
+                        )
+                        display_record["_sample_projection_reason"] = (
+                            projection_reason
+                            or mapping_status_labels.get(mapping_status, "采样映射当前不可用")
+                        )
 
         programs: Dict[str, Dict[str, Optional[Dict]]] = {}
         for prog, program_info in (self.sample_programs or {}).items():
@@ -600,6 +624,8 @@ class ConfigStateMixin:
             tool_map = programs[prog]
 
             process_path = self.program_process_file_map.get(prog)
+            if is_active_program and not process_path and hasattr(self, "get_primary_input_file"):
+                process_path = self.get_primary_input_file()
             has_process_file = bool(process_path and os.path.exists(process_path))
             has_processed = self._has_processed_result_for(process_path)
             process_name = os.path.basename(process_path) if has_process_file else "未绑定"
@@ -621,6 +647,18 @@ class ConfigStateMixin:
                     text=f"当前模型：K_c={kc_text} | K_e={ke_text} | σ_Kc={sigma_text}",
                     values=_row_values(f"K_c={kc_text}", f"K_e={ke_text}", "", f"σ_Kc={sigma_text}"),
                 )
+                if segmentation_authoritative:
+                    mapping_text = str(
+                        self.sample_mapping_status_var.get()
+                        if hasattr(self, "sample_mapping_status_var")
+                        else "采样映射: 未知"
+                    )
+                    self.ideal_tree.insert(
+                        prog_node,
+                        "end",
+                        text=mapping_text,
+                        values=_row_values("", mapping_text, "", ""),
+                    )
 
             if is_active_program and interval_records:
                 state_counts = {state: 0 for state in self._SEGMENT_STATE_LABELS}

@@ -6,9 +6,9 @@ from enum import Enum
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 
-INPUT_SCHEMA_VERSION = "process-info-power-mrr-v2"
-CONFIG_SCHEMA_VERSION = "segmentation-config-power-mrr-v7"
-RULE_SCORER_VERSION = "rule-power-mrr-v7"
+INPUT_SCHEMA_VERSION = "process-info-mrr-v3"
+CONFIG_SCHEMA_VERSION = "segmentation-config-mrr-v9"
+RULE_SCORER_VERSION = "rule-mrr-v9"
 
 
 class SegmentState(str, Enum):
@@ -97,6 +97,8 @@ class SegmentationConfig:
     path_tolerance_mm: float = 1e-8
     sequential_fallback_step_mm: float = 1.0
     mrr_cutting_epsilon: float = 1e-9
+    # 仅为旧配置兼容保留；六态分类只使用工艺表重算 MRR，
+    # 该字段不再参与 idle 判定或过程域签名。
     idle_power_tolerance: float = 1e-9
     steady_mrr_relative_std_max: float = 0.08
     # 规则基线只接受真正的平台：候选区间的 MRR 线性拟合总漂移
@@ -106,6 +108,11 @@ class SegmentationConfig:
     steady_min_plateau_points: int = 24
 
     local_window_points: int = 9
+    # entry 的峰值候选为第一个 MRR 局部峰值。窗口只用于确认峰后
+    # 短期内不再上升，容差用于合并数值上等高的连续峰顶。最终进刀终点还需
+    # 与首个合法稳态起点比较，且稳态优先。
+    entry_peak_window_points: int = 3
+    entry_peak_relative_tolerance: float = 1e-6
 
     relative_change_threshold: float = 0.08
     mrr_change_abs_mm3_min: float = 1e-6
@@ -174,6 +181,7 @@ class SegmentationConfig:
             "idle_power_tolerance",
             "steady_mrr_relative_std_max",
             "steady_mrr_relative_slope_max",
+            "entry_peak_relative_tolerance",
             "relative_change_threshold",
             "mrr_change_abs_mm3_min",
             "mrr_trend_relative_per_point",
@@ -216,6 +224,12 @@ class SegmentationConfig:
             raise ValueError("max_segment_atoms 必须大于 0")
         if int(self.local_window_points) < 1:
             raise ValueError("local_window_points 必须大于 0")
+        entry_peak_window_points = int(self.entry_peak_window_points)
+        if (
+            entry_peak_window_points < 1
+            or entry_peak_window_points != self.entry_peak_window_points
+        ):
+            raise ValueError("entry_peak_window_points 必须是大于等于 1 的整数")
         plateau_points = int(self.steady_min_plateau_points)
         if plateau_points < 2 or plateau_points != self.steady_min_plateau_points:
             raise ValueError("steady_min_plateau_points 必须是大于等于 2 的整数")
@@ -305,6 +319,9 @@ class DecodeResult:
     total_score: float
     used_fallback: bool = False
     failure_reason: str = ""
+    fallback_scope: str = "none"
+    fallback_validated: bool = True
+    diagnostics: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

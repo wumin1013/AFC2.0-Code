@@ -1536,6 +1536,11 @@ class ProcessingCoreMixin:
             self.sample_auto_status_var.set("未导入实测数据")
         if hasattr(self, "refresh_sample_source_labels"):
             self.refresh_sample_source_labels()
+        invalidator = getattr(self, "_invalidate_segmentation_sample_projection", None)
+        if callable(invalidator):
+            invalidator(reason="实际采样文件已移除")
+        if hasattr(self, "_refresh_import_order_controls"):
+            self._refresh_import_order_controls()
 
     def ensure_sample_data_matches_inputs(self, file_paths):
         """导入工艺信息表变更时，多目录时重置实测数据"""
@@ -1554,6 +1559,17 @@ class ProcessingCoreMixin:
         self.data = []
         self._clear_current_interval_state()
         self._latest_segmentation_result = None
+        self._current_process_signature = ""
+        self._current_mapping_signature = ""
+        self._segmentation_sample_projection_records = []
+        mapping_status = (
+            "pending" if bool(getattr(self, "sample_data_loaded", False)) else "not_available"
+        )
+        status_setter = getattr(self, "_set_segmentation_mapping_status", None)
+        if callable(status_setter):
+            status_setter(mapping_status, reason="工艺信息已变更，等待新的过程域划分")
+        else:
+            self._sample_mapping_status = mapping_status
         cleaner = getattr(self, "_clear_segmentation_output_artifacts", None)
         if callable(cleaner):
             try:
@@ -1562,7 +1578,7 @@ class ProcessingCoreMixin:
                 if hasattr(self, "segmentation_status_var"):
                     self.segmentation_status_var.set(f"全行程六类划分: 旧导出清理失败（{exc}）")
         if hasattr(self, "segmentation_status_var"):
-            self.segmentation_status_var.set("全行程六类划分: 未运行")
+            self.segmentation_status_var.set("过程域六类划分: 未运行")
         if hasattr(self, "_clear_runtime_identified_profile_state"):
             self._clear_runtime_identified_profile_state(clear_active=True, reason="reset_processing_state")
         self.processed_file_path = ""
@@ -1600,6 +1616,8 @@ class ProcessingCoreMixin:
             self.refresh_main_pit_preview()
         if hasattr(self, "refresh_prediction_metrics_summary"):
             self.refresh_prediction_metrics_summary()
+        if hasattr(self, "_refresh_import_order_controls"):
+            self._refresh_import_order_controls()
 
     def build_raw_to_aligned_line_map(self):
         """构建原始行号到重构行号的映射
@@ -1705,6 +1723,18 @@ class ProcessingCoreMixin:
         self.sample_data_valid_mask = None
         self.sample_data_valid_blocks = []
         self._sample_line_point_context_cache = None
+        self._authoritative_segmentation_sample_lookup_cache = None
+        if (
+            bool(getattr(self, "_current_interval_ready", False))
+            and str(getattr(self, "_current_interval_source", "") or "") == "segmentation"
+            and (
+                bool(str(getattr(self, "_current_mapping_signature", "") or ""))
+                or str(getattr(self, "_sample_mapping_status", "") or "") == "valid"
+            )
+        ):
+            invalidator = getattr(self, "_invalidate_segmentation_sample_projection", None)
+            if callable(invalidator):
+                invalidator(reason="实际采样坐标已重新对齐")
 
     def detect_file_encoding(self,file_path):
         """使用 Python 内置方法检测文件编码"""

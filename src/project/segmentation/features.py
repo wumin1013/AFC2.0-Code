@@ -165,10 +165,11 @@ def _validate_bounds(
 
 def standardize_input(input_frame, config: SegmentationConfig) -> Tuple[pd.DataFrame, PathDiagnostics]:
     """
-    只读取 alpha 允许的工艺字段及追溯元数据，并优先使用有效累计行程。
+    只读取六态分类所需的工艺字段及追溯元数据。
 
     G 代码/NC 几何计算属于上游职责；本函数只接收上游已生成的
     ``path_start``/``path_end``。两种物理来源都不可用时才进入集中配置的顺序回退。
+    ``P_pred``/``P_idle`` 如果存在只作兼容性透传，不作为必填项。
     """
 
     source = _as_frame(input_frame)
@@ -278,20 +279,11 @@ def standardize_input(input_frame, config: SegmentationConfig) -> Tuple[pd.DataF
     ap_raw = _numeric(source, ("ap", "ap(mm)"))
     ae_raw = _numeric(source, ("ae", "ae(mm)"))
     feed_raw = _numeric(source, ("F_program", "feed_effective", "F(mm/min)"))
-    predicted_power_names = ("P_pred", "predicted_load", "P")
-    idle_power_names = ("P_idle", "predicted_idle_power")
-    if not any(name in source.columns for name in predicted_power_names):
-        raise ValueError("六态划分缺少预测负载 P_pred，无法执行 idle 功率硬门控")
-    if not any(name in source.columns for name in idle_power_names):
-        raise ValueError("六态划分缺少预测空载功率 P_idle，无法执行 idle 功率硬门控")
-    predicted_power = _numeric(source, predicted_power_names)
-    idle_power = _numeric(source, idle_power_names)
+    # 旧调用方仍可以传入预测功率，但六态分类不读取它们。
+    # 缺失时保留 NaN，方便上层逐步去除旧字段而不破坏表结构。
+    predicted_power = _numeric(source, ("P_pred", "predicted_load", "P"))
+    idle_power = _numeric(source, ("P_idle", "predicted_idle_power"))
     power_gate_valid = np.isfinite(predicted_power) & np.isfinite(idle_power)
-    if not np.all(power_gate_valid):
-        invalid_count = int(np.sum(~power_gate_valid))
-        raise ValueError(
-            f"P_pred/P_idle 含 {invalid_count} 个非有限值，idle 功率硬门控已安全停止"
-        )
     invalid_process_value = (
         ~np.isfinite(ap_raw)
         | ~np.isfinite(ae_raw)
@@ -463,17 +455,110 @@ def _local_relative_path_slope(
     return np.abs(slope) * span / scale
 
 
+def _first_entry_local_peak(
+    non_idle_indices: np.ndarray,
+    mrr: np.ndarray,
+    config: SegmentationConfig,
+) -> tuple[int, int, float, str]:
+    """返回第一次正 MRR 局部峰顶的首点、末点、数值和确定方式。"""
+
+    indices = np.asarray(non_idle_indices, dtype=int)
+    if indices.size == 0:
+        return -1, -1, float("nan"), "no_non_idle_point"
+    values = np.asarray(mrr[indices], dtype=float)
+    positive = values > float(config.mrr_cutting_epsilon)
+    if not np.any(positive):
+        return -1, -1, float("nan"), "no_positive_mrr"
+
+    relative_tolerance = float(config.entry_peak_relative_tolerance)
+    absolute_floor = max(float(config.mrr_cutting_epsilon), 1e-12)
+    lookahead = int(config.entry_peak_window_points)
+
+    def tolerance(left: float, right: float) -> float:
+        scale = max(abs(float(left)), abs(float(right)), absolute_floor)
+        return max(scale * relative_tolerance, absolute_floor)
+
+    def close(left: float, right: float) -> bool:
+        return abs(float(left) - float(right)) <= tolerance(left, right)
+
+    offset = 0
+    while offset < len(indices):
+        peak_value = float(values[offset])
+        if peak_value <= float(config.mrr_cutting_epsilon):
+            offset += 1
+            continue
+        plateau_end = offset
+        while (
+            plateau_end + 1 < len(indices)
+            and int(indices[plateau_end + 1]) == int(indices[plateau_end]) + 1
+            and close(float(values[plateau_end + 1]), peak_value)
+        ):
+            plateau_end += 1
+
+        previous_start = max(0, offset - lookahead)
+        previous_values = values[previous_start:offset]
+        if previous_values.size:
+            rose_to_peak = bool(np.any([
+                peak_value > float(value) + tolerance(peak_value, float(value))
+                for value in previous_values
+            ]))
+        else:
+            # 离开有效 idle 后的正 MRR 本身构成从空载基线开始的上升。
+            rose_to_peak = peak_value > float(config.mrr_cutting_epsilon)
+
+        future_end = min(len(indices), plateau_end + 1 + lookahead)
+        future_values = values[plateau_end + 1:future_end]
+        no_future_rise = bool(
+            future_values.size
+            and np.all([
+                float(value) <= peak_value + tolerance(peak_value, float(value))
+                for value in future_values
+            ])
+        )
+        if rose_to_peak and no_future_rise:
+            return (
+                int(indices[offset]),
+                int(indices[plateau_end]),
+                peak_value,
+                "local_turning_point",
+            )
+        offset = plateau_end + 1
+
+    # 阶段在形成标准转折前结束：确定性地取第一次达到阶段最大 MRR 的点。
+    peak_value = float(np.max(values[positive]))
+    matching = np.flatnonzero([
+        bool(is_positive and close(float(value), peak_value))
+        for value, is_positive in zip(values, positive)
+    ])
+    peak_offset = int(matching[0])
+    plateau_end = peak_offset
+    while (
+        plateau_end + 1 < len(indices)
+        and int(indices[plateau_end + 1]) == int(indices[plateau_end]) + 1
+        and close(float(values[plateau_end + 1]), peak_value)
+    ):
+        plateau_end += 1
+    return (
+        int(indices[peak_offset]),
+        int(indices[plateau_end]),
+        peak_value,
+        "stage_first_max_fallback",
+    )
+
+
 def _build_machining_segment_features(
     machining_active: np.ndarray,
     non_idle: np.ndarray,
     mrr: np.ndarray,
+    config: SegmentationConfig,
 ) -> dict[str, np.ndarray]:
-    """按有效 idle 重置边界切分加工段，并建立独立 MRR 峰值参照。
+    """按有效 idle 重置边界切分加工段，并建立进刀峰值候选。
 
     ``machining_active`` 会跨越不具备重置资格的短 idle 脉冲，但
-    ``non_idle`` 仍保留功率门控真值。因此短脉冲前后共享加工段和峰值，
-    而 idle 点自身仍只能被解码为 idle。此时还没有合法稳态锚点，
-    entry/exit 先建立完整峰值阶段，之后由评分器收紧。
+    ``non_idle`` 仍保留工艺切削门控真值。因此短脉冲前后共享加工段和峰值，
+    而 idle 点自身仍只能被解码为 idle。此时只记录局部峰值或阶段首次
+    最大值回退点，不预先占用进刀范围。评分器须先独立找到完整稳态
+    父平台，再决定最终进刀终点。
     """
 
     count = len(non_idle)
@@ -490,6 +575,14 @@ def _build_machining_segment_features(
     last_steady_idx = np.full(count, -1, dtype=np.int32)
     entry_eligible = np.zeros(count, dtype=bool)
     exit_eligible = np.zeros(count, dtype=bool)
+    entry_start_idx = np.full(count, -1, dtype=np.int32)
+    entry_peak_idx = np.full(count, -1, dtype=np.int32)
+    entry_peak_plateau_start_idx = np.full(count, -1, dtype=np.int32)
+    entry_peak_plateau_end_idx = np.full(count, -1, dtype=np.int32)
+    entry_peak_mrr = np.full(count, np.nan, dtype=float)
+    entry_peak_method = np.full(count, "", dtype=object)
+    selected_entry_end_idx = np.full(count, -1, dtype=np.int32)
+    entry_required = np.zeros(count, dtype=bool)
 
     starts = np.flatnonzero(
         machining_active & np.concatenate(([True], ~machining_active[:-1]))
@@ -504,6 +597,13 @@ def _build_machining_segment_features(
         cutting_indices = indices[non_idle[indices]]
         if cutting_indices.size == 0:
             continue
+        current_entry_start_idx = int(cutting_indices[0])
+        (
+            current_entry_peak_idx,
+            current_entry_peak_plateau_end_idx,
+            current_entry_peak_mrr,
+            current_entry_peak_method,
+        ) = _first_entry_local_peak(cutting_indices, mrr, config)
         local_mrr = mrr[cutting_indices]
         peak_value = float(np.max(local_mrr))
         peak_tolerance = max(abs(peak_value) * 1e-12, 1e-12)
@@ -521,16 +621,18 @@ def _build_machining_segment_features(
         first_peak_idx[indices] = current_first_peak_idx
         last_peak_idx[indices] = current_last_peak_idx
         peak_mrr[indices] = peak_value
+        entry_start_idx[indices] = current_entry_start_idx
+        entry_peak_idx[indices] = current_entry_peak_idx
+        entry_peak_plateau_start_idx[indices] = current_entry_peak_idx
+        entry_peak_plateau_end_idx[indices] = current_entry_peak_plateau_end_idx
+        entry_peak_mrr[indices] = current_entry_peak_mrr
+        entry_peak_method[indices] = current_entry_peak_method
         if end_idx > start_idx:
             relative_position[indices] = (
                 (indices - start_idx).astype(float) / float(end_idx - start_idx)
             )
         phase[indices[indices < current_first_peak_idx]] = -1
         phase[indices[indices > current_last_peak_idx]] = 1
-        entry_end = current_first_peak_idx
-        if entry_end >= start_idx:
-            entry_eligible[start_idx:entry_end + 1] = True
-
         exit_start = current_last_peak_idx
         if exit_start <= end_idx:
             exit_eligible[exit_start:end_idx + 1] = True
@@ -547,6 +649,15 @@ def _build_machining_segment_features(
         "machining_phase": phase,
         "machining_first_steady_idx": first_steady_idx,
         "machining_last_steady_idx": last_steady_idx,
+        "machining_entry_start_idx": entry_start_idx,
+        "machining_entry_peak_idx": entry_peak_idx,
+        "machining_entry_peak_plateau_start_idx": entry_peak_plateau_start_idx,
+        "machining_entry_peak_plateau_end_idx": entry_peak_plateau_end_idx,
+        "machining_entry_peak_mrr": entry_peak_mrr,
+        "machining_entry_peak_method": entry_peak_method,
+        "selected_entry_end_idx": selected_entry_end_idx,
+        "machining_selected_entry_end_idx": selected_entry_end_idx.copy(),
+        "entry_required": entry_required,
         "entry_phase_eligible": entry_eligible,
         "exit_phase_eligible": exit_eligible,
     }
@@ -608,22 +719,23 @@ def compute_point_features(frame: pd.DataFrame, config: SegmentationConfig) -> p
     ae = features["ae"].to_numpy(dtype=float)
     feed = features["F_program"].to_numpy(dtype=float)
     mrr = ap * ae * feed / 60.0
-    cutting = mrr > config.mrr_cutting_epsilon
-    predicted_power = features["P_pred"].to_numpy(dtype=float)
-    idle_power = features["P_idle"].to_numpy(dtype=float)
-    power_gate_valid = (
-        features["power_gate_valid"].to_numpy(dtype=bool)
-        & np.isfinite(predicted_power)
-        & np.isfinite(idle_power)
+    # 四个工艺条件是六态分类唯一的切削门控。MRR 始终由前三项
+    # 现场重算，不信任输入表中可能存在的同名列。
+    cutting = (
+        (ap > 0.0)
+        & (ae > 0.0)
+        & (feed > 0.0)
+        & (mrr > float(config.mrr_cutting_epsilon))
     )
-    idle_gate = power_gate_valid & (
-        predicted_power <= idle_power + float(config.idle_power_tolerance)
-    )
-    non_idle = ~idle_gate
+    idle_gate = ~cutting
+    non_idle = cutting
 
     features["MRR_program"] = mrr
     features["is_effective_cutting"] = cutting
-    features["power_gate_valid"] = power_gate_valid
+    # 只保留输入功率字段的完整性诊断，不参与任何状态判定。
+    features["power_gate_valid"] = features["power_gate_valid"].to_numpy(
+        dtype=bool
+    )
     features["is_idle_gate"] = idle_gate
     features["is_non_idle"] = non_idle
     reset_features = _idle_reset_features(
@@ -683,6 +795,7 @@ def compute_point_features(frame: pd.DataFrame, config: SegmentationConfig) -> p
         features["machining_phase_active"].to_numpy(dtype=bool),
         non_idle,
         mrr,
+        config,
     ).items():
         features[name] = values
     return features
@@ -694,8 +807,6 @@ def build_atomic_segments(frame: pd.DataFrame, config: SegmentationConfig) -> Tu
     count = len(frame)
     # transition 的比例边界以有效 ProcessInfo 点数定义，因此原子边界
     # 必须与输入点一一对应。这里只细化已有点，不插值也不制造工艺点。
-    starts = np.arange(count, dtype=int)
-    ends = starts.copy()
     cutting = frame["is_effective_cutting"].to_numpy(dtype=bool)
     idle_gate = frame["is_idle_gate"].to_numpy(dtype=bool)
     machining_segment_id = frame["machining_segment_id"].to_numpy(dtype=np.int32)
@@ -705,25 +816,31 @@ def build_atomic_segments(frame: pd.DataFrame, config: SegmentationConfig) -> Tu
     path_end = frame["path_end"].to_numpy(dtype=float)
     line_id = frame["line_id"].to_numpy(dtype=int)
     atoms = []
-    for atom_id, (start_idx, end_idx) in enumerate(zip(starts, ends), 1):
-        sample = slice(int(start_idx), int(end_idx) + 1)
+    for start_idx in range(count):
+        # 过渡比例要求“一个 ProcessInfo 点对应一个原子”。
+        # 因此单元素切片上的 mean/std 可以直接写成标量，
+        # 避免长程序为每个点重复创建 NumPy 临时对象。
+        mrr_value = float(mrr[start_idx])
         atoms.append(
             AtomicSegment(
-                atom_id=int(atom_id),
+                atom_id=int(start_idx + 1),
                 start_idx=int(start_idx),
-                end_idx=int(end_idx),
+                end_idx=int(start_idx),
                 start_s=float(path_start[start_idx]),
-                end_s=float(path_end[end_idx]),
-                length_mm=max(float(path_end[end_idx] - path_start[start_idx]), 0.0),
+                end_s=float(path_end[start_idx]),
+                length_mm=max(
+                    float(path_end[start_idx] - path_start[start_idx]),
+                    0.0,
+                ),
                 start_line_id=int(line_id[start_idx]),
-                end_line_id=int(line_id[end_idx]),
-                point_count=int(end_idx - start_idx + 1),
-                cutting_fraction=float(np.mean(cutting[sample])),
-                mrr_mean=float(np.mean(mrr[sample])),
-                mrr_std=float(np.std(mrr[sample], ddof=0)),
-                mrr_trend_sign=int(np.sign(np.mean(trend_sign[sample]))),
-                idle_fraction=float(np.mean(idle_gate[sample])),
-                non_idle_fraction=float(np.mean(~idle_gate[sample])),
+                end_line_id=int(line_id[start_idx]),
+                point_count=1,
+                cutting_fraction=float(cutting[start_idx]),
+                mrr_mean=mrr_value,
+                mrr_std=0.0 if np.isfinite(mrr_value) else float("nan"),
+                mrr_trend_sign=int(np.sign(trend_sign[start_idx])),
+                idle_fraction=float(idle_gate[start_idx]),
+                non_idle_fraction=float(not idle_gate[start_idx]),
                 machining_segment_id=int(machining_segment_id[start_idx]),
             )
         )

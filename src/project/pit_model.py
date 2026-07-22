@@ -1201,11 +1201,6 @@ class PitModelMixin:
                 "clear_runtime_profile",
                 reason=str(reason or ""),
             )
-        if str(reason or "") == "switch_to_sampledata":
-            invalidator = getattr(self, "_invalidate_segmentation_sample_projection", None)
-            if callable(invalidator):
-                invalidator(reason="切换实际负载文件")
-
     def _activate_profile_state(
         self,
         profile,
@@ -1391,6 +1386,14 @@ class PitModelMixin:
         if hasattr(self, "_smif_source_cache"):
             self._smif_source_cache = None
         self._process_model_state_version = int(getattr(self, "_process_model_state_version", 0) or 0) + 1
+        has_sample_projection = bool(
+            str(getattr(self, "_current_mapping_signature", "") or "")
+            or str(getattr(self, "_sample_mapping_status", "") or "") == "valid"
+        )
+        if self._has_authoritative_segmentation_state() and has_sample_projection:
+            invalidator = getattr(self, "_invalidate_segmentation_sample_projection", None)
+            if callable(invalidator):
+                invalidator(reason=reason or "采样显示上下文发生变化")
         if reason:
             self._debug_prediction_state_event(
                 "invalidate_process_alignment_caches",
@@ -1407,31 +1410,17 @@ class PitModelMixin:
         if not self._has_authoritative_segmentation_state():
             return False
 
-        current_signature = str(
-            getattr(self, "_current_interval_context_signature", "") or ""
-        )
-        expected_signature = str(expected_context_signature or "")
-        if current_signature and expected_signature and current_signature == expected_signature:
-            return False
-
-        self._clear_current_interval_state(keep_profile_lock=False)
-        self._latest_segmentation_result = None
-        cleaner = getattr(self, "_clear_segmentation_output_artifacts", None)
-        cleanup_error = ""
-        if callable(cleaner):
-            try:
-                cleaner()
-            except OSError as exc:
-                cleanup_error = str(exc)
-        if hasattr(self, "segmentation_status_var"):
-            suffix = f"；旧导出清理失败（{cleanup_error}）" if cleanup_error else ""
-            self.segmentation_status_var.set(f"全行程六类划分: 待重算（{reason}）{suffix}")
+        # 六态过程域结果不使用 prediction/profile/实测参数。
+        # 这些上下文变化时只撤销采样投影和叠图，保留过程签名及标签。
+        invalidator = getattr(self, "_invalidate_segmentation_sample_projection", None)
+        if callable(invalidator):
+            invalidator(reason=reason)
         self._debug_interval_state_event(
             "invalidate_segmentation_prediction_context",
             reason=str(reason or ""),
-            previous_context_signature=current_signature or "none",
-            expected_context_signature=expected_signature or "none",
-            cleanup_error=cleanup_error or "none",
+            process_signature=str(getattr(self, "_current_process_signature", "") or "none"),
+            ignored_prediction_context_signature=str(expected_context_signature or "none"),
+            process_state_preserved=True,
         )
         return True
 
@@ -1457,6 +1446,17 @@ class PitModelMixin:
             self.prediction_source = "no_profile"
 
         self._last_process_application_context = ""
+        if (
+            previous_case_signature != current_case_signature
+            and self._has_authoritative_segmentation_state()
+            and (
+                bool(str(getattr(self, "_current_mapping_signature", "") or ""))
+                or str(getattr(self, "_sample_mapping_status", "") or "") == "valid"
+            )
+        ):
+            invalidator = getattr(self, "_invalidate_segmentation_sample_projection", None)
+            if callable(invalidator):
+                invalidator(reason=reason or "实际负载案例已更换")
         self._debug_prediction_state_event(
             "sync_measurement_case_state",
             previous_case_signature=previous_case_signature or "none",
@@ -1479,6 +1479,9 @@ class PitModelMixin:
     def _can_reuse_current_interval_template(self, prediction_source=None, measurement=None):
         if not bool(getattr(self, "_current_interval_ready", False)):
             return False
+        if self._has_authoritative_segmentation_state():
+            # 过程域标签只由工艺信息决定，不与采样或预测上下文绑定。
+            return True
         expected_prediction_source = self._normalize_profile_origin(
             prediction_source if prediction_source is not None else self._get_prediction_source()
         )
@@ -1558,6 +1561,20 @@ class PitModelMixin:
         self._current_interval_prediction_source = "no_profile"
         self._current_interval_measurement_case_signature = ""
         self._authoritative_segmentation_sample_lookup_cache = None
+        if previous_source == "segmentation":
+            self._current_process_signature = ""
+            self._current_mapping_signature = ""
+            self._segmentation_sample_projection_records = []
+            mapping_status = (
+                "pending"
+                if bool(getattr(self, "sample_data_loaded", False))
+                else "not_available"
+            )
+            status_setter = getattr(self, "_set_segmentation_mapping_status", None)
+            if callable(status_setter):
+                status_setter(mapping_status, reason="过程域划分已清除")
+            else:
+                self._sample_mapping_status = mapping_status
         if not keep_profile_lock:
             self._profile_intervals_locked = False
 
@@ -1631,11 +1648,22 @@ class PitModelMixin:
         locked_flag = bool(profile_locked)
         self._current_interval_source = source_text
         self._profile_intervals_locked = locked_flag
-        self._current_interval_context_signature = str(context_signature or "")
-        self._current_interval_prediction_source = self._normalize_profile_origin(prediction_source)
-        self._current_interval_measurement_case_signature = str(
-            measurement_case_signature or self._get_current_measurement_case_signature()
-        )
+        if source_text == "segmentation":
+            process_signature = str(
+                context_signature
+                or getattr(self, "_current_process_signature", "")
+                or ""
+            )
+            self._current_process_signature = process_signature
+            self._current_interval_context_signature = process_signature
+            self._current_interval_prediction_source = "no_profile"
+            self._current_interval_measurement_case_signature = ""
+        else:
+            self._current_interval_context_signature = str(context_signature or "")
+            self._current_interval_prediction_source = self._normalize_profile_origin(prediction_source)
+            self._current_interval_measurement_case_signature = str(
+                measurement_case_signature or self._get_current_measurement_case_signature()
+            )
         self._authoritative_segmentation_sample_lookup_cache = None
 
         # 兼容旧代码读取，禁止其他位置直接写入
@@ -1666,6 +1694,11 @@ class PitModelMixin:
     def _sync_current_interval_state_prediction_context(self, prediction_source=None, measurement=None):
         if not bool(getattr(self, "_current_interval_ready", False)):
             return False
+        if self._has_authoritative_segmentation_state():
+            invalidator = getattr(self, "_invalidate_segmentation_sample_projection", None)
+            if callable(invalidator):
+                invalidator(reason="预测模型已更新")
+            return True
 
         resolved_prediction_source = self._normalize_profile_origin(
             prediction_source if prediction_source is not None else self._get_prediction_source()
@@ -1734,9 +1767,7 @@ class PitModelMixin:
         return int(bounds["sample_start_idx"]), int(bounds["sample_end_idx"])
 
     def _invalidate_measurement_runtime_state(self, keep_profile_lock=True, clear_interval_state=True):
-        preserve_segmentation = bool(
-            clear_interval_state and self._has_authoritative_segmentation_state()
-        )
+        preserve_segmentation = self._has_authoritative_segmentation_state()
         measurement = getattr(self, "manual_measurement_data", None)
         runtime_keys = (
             "mapped_ap",
@@ -1783,7 +1814,7 @@ class PitModelMixin:
             self._clear_current_interval_state(
                 keep_profile_lock=bool(keep_profile_lock and getattr(self, "_profile_intervals_locked", False))
             )
-        elif preserve_segmentation:
+        if preserve_segmentation:
             invalidator = getattr(self, "_invalidate_segmentation_sample_projection", None)
             if callable(invalidator):
                 invalidator(reason="实际负载上下文变化")

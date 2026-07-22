@@ -9,23 +9,45 @@ from .shared import *
 
 
 class AnalysisExportMixin:
-    def _clear_segmentation_output_artifacts(self, output_dir=None):
-        """清理固定六态导出及其临时文件，避免旧结果冒充当前结果。"""
+    def _clear_segmentation_output_artifacts(self, output_dir=None, *, scope="all"):
+        """按过程域/映射域清理固定导出，避免实测变化误删过程结果。"""
         target_dir = Path(output_dir) if output_dir is not None else OUTPUT_DIR / "segmentation"
         if not target_dir.exists():
             return
-        file_names = (
+        process_file_names = (
             "intervals.csv",
             "overview.png",
             "diagnostics.json",
             "point_labels.csv",
             ".intervals.tmp.csv",
+            ".point_labels.tmp.csv",
             ".overview.tmp.png",
             ".diagnostics.tmp.json",
             ".intervals.bak.csv",
+            ".point_labels.bak.csv",
             ".overview.bak.png",
             ".diagnostics.bak.json",
         )
+        mapping_file_names = (
+            "sample_projection.csv",
+            "sample_overview.png",
+            "sample_mapping_diagnostics.json",
+            ".sample_projection.tmp.csv",
+            ".sample_overview.tmp.png",
+            ".sample_mapping_diagnostics.tmp.json",
+            ".sample_projection.bak.csv",
+            ".sample_overview.bak.png",
+            ".sample_mapping_diagnostics.bak.json",
+        )
+        normalized_scope = str(scope or "all").strip().lower()
+        if normalized_scope == "process":
+            file_names = process_file_names
+        elif normalized_scope == "mapping":
+            file_names = mapping_file_names
+        elif normalized_scope == "all":
+            file_names = (*process_file_names, *mapping_file_names)
+        else:
+            raise ValueError(f"未知六态导出清理范围: {scope}")
         errors = []
         for file_name in file_names:
             path = target_dir / file_name
@@ -71,73 +93,121 @@ class AnalysisExportMixin:
 
     def _save_segmentation_overview(
         self,
-        predicted_load,
+        sample_values,
         interval_records,
         output_path,
         *,
         predicted_idle_power=None,
         background_payload=None,
+        background_height_values=None,
+        predicted_values=None,
+        show_actual=True,
     ):
-        """绘制实际采样级预测负载及六态背景，不显示其他工艺量。"""
-        predicted = np.asarray(predicted_load, dtype=float)
-        if predicted.size == 0 or not np.any(np.isfinite(predicted)):
-            raise ValueError("样本级预测负载为空，无法生成 overview.png")
+        """保存与页面一致的单轴负载曲线及六态曲线高度填充。"""
+        actual = np.asarray(sample_values, dtype=float).reshape(-1)
+        if actual.size == 0 or not np.any(np.isfinite(actual)):
+            raise ValueError("实际采样值为空，无法生成 sample_overview.png")
+        if predicted_values is None:
+            raise ValueError("预测负载不可用，无法生成 sample_overview.png")
+        display_prediction = np.asarray(
+            predicted_values,
+            dtype=float,
+        ).reshape(-1)
+        if (
+            display_prediction.size != actual.size
+            or not np.all(np.isfinite(display_prediction))
+        ):
+            raise ValueError("预测负载必须与实际负载等长且全部有效")
+        if background_height_values is None:
+            fill_values = np.maximum(display_prediction, 0.0)
+        else:
+            fill_values = np.asarray(
+                background_height_values,
+                dtype=float,
+            ).reshape(-1)
+            if fill_values.size != actual.size:
+                raise ValueError("采样域填充高度与实际负载数量不一致")
+            if not np.all(np.isfinite(fill_values)):
+                raise ValueError("采样域填充高度包含无效值")
         if background_payload is None:
             background_payload = self.build_segmentation_sample_background_masks(
-                predicted,
-                predicted_idle_power,
+                fill_values,
+                None,
                 interval_records,
+                valid_mask=np.isfinite(fill_values),
             )
 
-        x_values = np.arange(predicted.size, dtype=float)
+        x_values = np.arange(actual.size, dtype=float)
         fig, ax = plt.subplots(1, 1, figsize=(16, 5.8), dpi=120)
         try:
             fig.patch.set_facecolor(PLOT_FIG_BG)
             self.apply_plot_style(ax, grid=True)
-            boundaries = set()
             state_masks = dict(background_payload.get("state_masks", {}) or {})
-            for segment_type, mask in state_masks.items():
-                style = self.get_segmentation_state_style(segment_type)
-                blocks = self.compute_contiguous_blocks(np.asarray(mask, dtype=bool))
-                for block_index, (start_idx, end_idx) in enumerate(blocks):
-                    ax.axvspan(
-                        float(start_idx) - 0.5,
-                        float(end_idx) + 0.5,
-                        facecolor=style["color"],
-                        edgecolor="none",
-                        alpha=0.30,
-                        label=style["label"] if block_index == 0 else None,
-                        zorder=0,
-                    )
-                    boundaries.add(float(start_idx) - 0.5)
-                    boundaries.add(float(end_idx) + 0.5)
-            for boundary in sorted(boundaries):
-                ax.axvline(
-                    float(boundary),
-                    color="#263238",
-                    linewidth=0.45,
-                    alpha=0.45,
-                    zorder=1,
-                )
+            self.draw_segmentation_curve_background(
+                ax,
+                x_values,
+                fill_values,
+                state_masks,
+                alpha=0.30,
+                show_labels=True,
+                zorder=1,
+            )
 
-            finite_mask = np.asarray(
-                background_payload.get("valid_mask", np.zeros(predicted.size, dtype=bool)),
+            background_valid_mask = np.asarray(
+                background_payload.get(
+                    "valid_mask",
+                    np.zeros(actual.size, dtype=bool),
+                ),
                 dtype=bool,
             )
-            if finite_mask.size != predicted.size:
+            if background_valid_mask.size != actual.size:
                 raise ValueError("六态背景有效掩码与预测负载数量不一致")
-            ax.plot(
-                x_values[finite_mask],
-                predicted[finite_mask],
-                color=self.get_segmentation_predicted_line_color(),
-                linewidth=1.05,
-                label="预测负载",
-                zorder=3,
+            actual_mask = np.isfinite(actual)
+            if bool(show_actual) and np.any(actual_mask):
+                actual_x, actual_plot_values = (
+                    self._compress_plot_series_preserve_gaps(
+                        x_values,
+                        actual,
+                        int(getattr(self, "preview_plot_max_points", 60000) or 60000),
+                    )
+                )
+                ax.plot(
+                    actual_x,
+                    actual_plot_values,
+                    color=STYLE_MEASURED["color"],
+                    linewidth=1.05,
+                    label="实际负载",
+                    zorder=4,
+                )
+            prediction_x, prediction_plot_values = (
+                self._compress_plot_series_preserve_gaps(
+                    x_values,
+                    display_prediction,
+                    int(getattr(self, "preview_plot_max_points", 60000) or 60000),
+                )
             )
-            ax.set_title("预测负载与六态区间", fontsize=14, fontweight="bold")
+            ax.plot(
+                prediction_x,
+                prediction_plot_values,
+                color=self.get_segmentation_predicted_line_color(),
+                linewidth=1.25,
+                linestyle="--",
+                label="预测负载",
+                zorder=5,
+            )
+            ax.set_title(
+                (
+                    "实际负载、预测负载与过程域六态投影"
+                    if show_actual
+                    else "预测负载与过程域六态投影"
+                ),
+                fontsize=14,
+                fontweight="bold",
+            )
             ax.set_xlabel("实际负载采样点索引（0 基）", fontsize=11)
-            ax.set_ylabel("预测负载", fontsize=11)
-            ax.set_xlim(-0.5, float(max(predicted.size, 1)) - 0.5)
+            ax.set_ylabel("功率 (W)", fontsize=11)
+            ax.set_xlim(-0.5, float(max(actual.size, 1)) - 0.5)
+            ax.set_ylim(bottom=0.0)
             ax.margins(x=0)
             handles, labels = ax.get_legend_handles_labels()
             if handles:
@@ -155,11 +225,463 @@ class AnalysisExportMixin:
         finally:
             plt.close(fig)
 
-    def export_latest_segmentation_result(self, result=None, output_dir=None):
+    def _save_segmentation_process_overview(
+        self,
+        point_labels,
+        intervals,
+        output_path,
+    ):
+        """保存仅依赖 ProcessInfo 的程序 MRR 与六态背景图。"""
+
+        fig, ax = plt.subplots(1, 1, figsize=(16, 5.8), dpi=120)
+        try:
+            fig.patch.set_facecolor(PLOT_FIG_BG)
+            self.apply_plot_style(ax, grid=True)
+            artists = self.draw_process_mrr_segmentation(
+                ax,
+                point_labels,
+                intervals,
+                show_labels=True,
+            )
+            if not artists:
+                raise ValueError("过程域结果为空，无法生成 overview.png")
+            handles, labels = ax.get_legend_handles_labels()
+            if handles:
+                unique = {}
+                for handle, label in zip(handles, labels):
+                    if label and label not in unique:
+                        unique[label] = handle
+                ax.legend(
+                    list(unique.values()),
+                    list(unique.keys()),
+                    loc="upper center",
+                    bbox_to_anchor=(0.5, 1.18),
+                    ncol=7,
+                    frameon=False,
+                    fontsize=9,
+                )
+            fig.subplots_adjust(left=0.075, right=0.985, top=0.82, bottom=0.14)
+            fig.savefig(
+                output_path,
+                dpi=180,
+                bbox_inches="tight",
+                facecolor=fig.get_facecolor(),
+            )
+        finally:
+            plt.close(fig)
+
+    def _render_process_domain_segmentation_view(self, *, save=False):
+        """在没有有效采样映射时显示权威过程域 MRR 视图。"""
+
+        result = getattr(self, "_latest_segmentation_result", None)
+        if result is None:
+            return False
+        point_labels = self._coerce_segmentation_dataframe(result, "point_labels")
+        intervals = self._coerce_segmentation_dataframe(result, "intervals")
+        if point_labels.empty:
+            return False
+        fig, ax = plt.subplots(figsize=(16, 8), dpi=100)
+        fig.patch.set_facecolor(PLOT_FIG_BG)
+        self.apply_plot_style(ax, grid=True)
+        self.draw_process_mrr_segmentation(
+            ax,
+            point_labels,
+            intervals,
+            show_labels=True,
+        )
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            unique = {}
+            for handle, label in zip(handles, labels):
+                if label and label not in unique:
+                    unique[label] = handle
+            ax.legend(
+                list(unique.values()),
+                list(unique.keys()),
+                loc="upper left",
+                framealpha=0.95,
+                fontsize=PLOT_FONT_BASE - 1,
+            )
+        fig.subplots_adjust(left=0.07, right=0.985, top=0.92, bottom=0.11)
+        self.figures = [fig]
+        self.figure_names = ["过程域 MRR 与六态区间"]
+        self.current_figure_index = 0
+        if hasattr(self, "interval_count_var"):
+            self.interval_count_var.set(str(len(intervals)))
+        if hasattr(self, "_refresh_ideal_tree"):
+            self._refresh_ideal_tree()
+        if save:
+            self.save_all_plots(silent=True)
+        self.show_current_figure(0)
+        return True
+
+    def _resolve_segmentation_display_prediction(self, sample_count):
+        """返回等长的显示预测曲线；必要时只刷新预测，不重跑六态分类。"""
+
+        self._segmentation_display_prediction_error = ""
+
+        def _read_prediction(payload):
+            if not isinstance(payload, dict):
+                return None
+            try:
+                values = np.asarray(
+                    payload.get("predicted_load", []),
+                    dtype=float,
+                ).reshape(-1)
+            except Exception:
+                return None
+            if (
+                values.size != int(sample_count)
+                or not np.all(np.isfinite(values))
+            ):
+                return None
+            return values
+
+        prediction_payload = None
+        sample_mode = str(getattr(self, "sample_data_mode", "") or "").strip()
+        if sample_mode == "experiment_measurement":
+            candidate = getattr(self, "manual_measurement_data", None)
+            if isinstance(candidate, dict):
+                prediction_payload = candidate
+            predicted_values = _read_prediction(prediction_payload)
+            if predicted_values is not None:
+                self._segmentation_display_prediction_error = ""
+                return predicted_values
+
+            # 工艺信息先行划分时，generate_plots 会走过程域快速路径，不再经过
+            # 旧的预测刷新流程。实测文件后导入后在这里补一次显示预测即可；
+            # 过程域标签和边界仍直接复用，预测结果不进入六态分类。
+            refresher = getattr(self, "_refresh_manual_measurement_prediction", None)
+            refresh_in_progress = bool(
+                getattr(self, "_segmentation_display_prediction_refreshing", False)
+            )
+            if callable(refresher) and not refresh_in_progress:
+                self._segmentation_display_prediction_refreshing = True
+                try:
+                    refresher()
+                except Exception as exc:
+                    self._segmentation_display_prediction_error = str(exc)
+                finally:
+                    self._segmentation_display_prediction_refreshing = False
+                prediction_payload = getattr(
+                    self,
+                    "manual_measurement_data",
+                    prediction_payload,
+                )
+        elif sample_mode == "sampledata":
+            model_ready = bool(
+                self.has_prediction_model_ready()
+                if hasattr(self, "has_prediction_model_ready")
+                else False
+            )
+            builder = getattr(self, "_build_sampledata_prediction_payload", None)
+            if model_ready and callable(builder):
+                try:
+                    candidate = builder()
+                except Exception:
+                    candidate = None
+                if isinstance(candidate, dict):
+                    prediction_payload = candidate
+
+        predicted_values = _read_prediction(prediction_payload)
+        if predicted_values is None:
+            if not str(
+                getattr(self, "_segmentation_display_prediction_error", "") or ""
+            ).strip():
+                self._segmentation_display_prediction_error = (
+                    "预测负载未生成，或长度与实际负载不一致，或包含缺失值"
+                )
+        else:
+            self._segmentation_display_prediction_error = ""
+        return predicted_values
+
+    def _render_segmentation_sample_overlay_view(
+        self,
+        mapping_records,
+        *,
+        save=False,
+    ):
+        """在单轴上绘制实际/预测负载及已有过程域六态投影。"""
+
+        result = getattr(self, "_latest_segmentation_result", None)
+        values = np.asarray(getattr(self, "sample_data_values", []), dtype=float)
+        if result is None or values.size == 0 or not mapping_records:
+            return False
+        if values.ndim == 2:
+            source_var = getattr(self, "sample_data_source", None)
+            try:
+                source_index = int(source_var.get()) if source_var is not None else 0
+            except Exception:
+                source_index = 0
+            if not 0 <= source_index < values.shape[1]:
+                source_index = 0
+            actual_values = values[:, source_index]
+        else:
+            actual_values = values.reshape(-1)
+        actual_values = np.asarray(actual_values, dtype=float).reshape(-1)
+        actual_finite = np.isfinite(actual_values)
+        if not np.any(actual_finite):
+            return False
+
+        sample_x = None
+        x_label = "实际采样点索引（0 基）"
+        time_getter = getattr(self, "get_sample_time_indices_array", None)
+        if callable(time_getter):
+            try:
+                time_values = np.asarray(time_getter(), dtype=float).reshape(-1)
+            except Exception:
+                time_values = np.asarray([], dtype=float)
+            if (
+                time_values.size == actual_values.size
+                and np.all(np.isfinite(time_values))
+            ):
+                sample_x = time_values
+                x_label = "时间 (ms)"
+        if sample_x is None:
+            raw_positions = getattr(self, "sample_data_x_positions", None)
+            if raw_positions is not None:
+                try:
+                    position_values = np.asarray(
+                        raw_positions,
+                        dtype=float,
+                    ).reshape(-1)
+                except Exception:
+                    position_values = np.asarray([], dtype=float)
+                if (
+                    position_values.size == actual_values.size
+                    and np.all(np.isfinite(position_values))
+                ):
+                    sample_x = position_values
+                    x_label = "程序位置"
+        if sample_x is None:
+            sample_x = np.arange(actual_values.size, dtype=float)
+
+        predicted_values = self._resolve_segmentation_display_prediction(
+            actual_values.size
+        )
+        if predicted_values is None:
+            return False
+        fill_values = np.maximum(predicted_values, 0.0)
+        background_payload = self.build_segmentation_sample_background_masks(
+            fill_values,
+            None,
+            mapping_records,
+            valid_mask=np.isfinite(fill_values),
+        )
+
+        fig, sample_ax = plt.subplots(figsize=(16, 8), dpi=100)
+        fig.patch.set_facecolor(PLOT_FIG_BG)
+        self.apply_plot_style(sample_ax, grid=True)
+        self.draw_segmentation_curve_background(
+            sample_ax,
+            sample_x,
+            fill_values,
+            background_payload.get("state_masks", {}),
+            alpha=0.26,
+            show_labels=True,
+            zorder=1,
+        )
+
+        preview_limit = int(getattr(self, "preview_plot_max_points", 60000) or 60000)
+        plot_x, plot_values = self._compress_plot_series_preserve_gaps(
+            sample_x,
+            actual_values,
+            preview_limit,
+        )
+        sample_ax.plot(
+            plot_x,
+            plot_values,
+            color=STYLE_MEASURED["color"],
+            linewidth=1.0,
+            linestyle="-",
+            label="实际负载",
+            zorder=4,
+        )
+        predicted_x, predicted_plot_values = (
+            self._compress_plot_series_preserve_gaps(
+                sample_x,
+                predicted_values,
+                preview_limit,
+            )
+        )
+        sample_ax.plot(
+            predicted_x,
+            predicted_plot_values,
+            color=self.get_segmentation_predicted_line_color(),
+            linewidth=1.25,
+            linestyle="--",
+            label="预测负载",
+            zorder=5,
+        )
+
+        sample_ax.set_title("实际负载、预测负载与过程域六态投影")
+        sample_ax.set_xlabel(x_label)
+        sample_ax.set_ylabel("功率 (W)")
+        finite_x = sample_x[np.isfinite(sample_x)]
+        if finite_x.size:
+            x_min = float(np.min(finite_x))
+            x_max = float(np.max(finite_x))
+            if x_max <= x_min:
+                x_max = x_min + 1.0
+            sample_ax.set_xlim(x_min, x_max)
+        sample_ax.set_ylim(bottom=0.0)
+        sample_ax.margins(x=0)
+
+        projected_mask = np.asarray(
+            background_payload.get(
+                "process_projected_mask",
+                np.zeros(actual_values.size, dtype=bool),
+            ),
+            dtype=bool,
+        )
+        if x_label == "时间 (ms)" and hasattr(self, "apply_line_axis_on_time"):
+            self.apply_line_axis_on_time(sample_ax, projected_mask)
+        elif hasattr(self, "apply_line_axis_on_path"):
+            self.apply_line_axis_on_path(sample_ax, sample_x, projected_mask)
+
+        sample_handles, sample_labels = sample_ax.get_legend_handles_labels()
+        if sample_handles:
+            unique = {}
+            for handle, label in zip(sample_handles, sample_labels):
+                if label and label not in unique:
+                    unique[label] = handle
+            sample_ax.legend(
+                list(unique.values()),
+                list(unique.keys()),
+                loc="upper left",
+                ncol=min(7, max(len(unique), 1)),
+                fontsize=PLOT_FONT_BASE - 1,
+                framealpha=0.95,
+            )
+
+        fig.subplots_adjust(left=0.07, right=0.985, top=0.90, bottom=0.10)
+        self.figures = [fig]
+        self.figure_names = ["负载图"]
+        self.current_figure_index = 0
+        if hasattr(self, "interval_count_var"):
+            self.interval_count_var.set(str(len(mapping_records)))
+        if hasattr(self, "_refresh_ideal_tree"):
+            self._refresh_ideal_tree()
+        if save:
+            self.save_all_plots(silent=True)
+        self.show_current_figure(0)
+        return True
+
+    def _finish_segmentation_fast_plot(self, rendered, message):
+        """统一收尾轻量过程域图，避免进度停在“正在生成”。"""
+
+        rendered = bool(rendered)
+        if rendered:
+            total_charts = len(getattr(self, "figures", []) or [])
+            status_var = getattr(self, "status_var_data", None)
+            if status_var is not None and hasattr(status_var, "set"):
+                status_var.set(f"图表已生成! 共{total_charts}张图表")
+            if hasattr(self, "set_progress"):
+                self.set_progress(100, str(message or "图表已生成"))
+        elif hasattr(self, "set_progress"):
+            self.set_progress(0, "图表生成失败")
+        return rendered
+
+    def _replace_segmentation_bundle(self, paths, temporary_paths):
+        """把同一坐标域的一组临时文件整体替换，并在失败时回滚。"""
+
+        backup_paths = {
+            key: path.with_name(f".{path.stem}.bak{path.suffix}")
+            for key, path in paths.items()
+        }
+        backed_up_keys = []
+        replaced_keys = []
+        try:
+            for key, target_path in paths.items():
+                backup_paths[key].unlink(missing_ok=True)
+                if target_path.exists():
+                    target_path.replace(backup_paths[key])
+                    backed_up_keys.append(key)
+            for key, target_path in paths.items():
+                temporary_paths[key].replace(target_path)
+                replaced_keys.append(key)
+        except Exception as replace_exc:
+            for key in reversed(replaced_keys):
+                paths[key].unlink(missing_ok=True)
+            rollback_errors = []
+            for key in reversed(backed_up_keys):
+                try:
+                    backup_paths[key].replace(paths[key])
+                except Exception as rollback_exc:
+                    rollback_errors.append(f"{key}: {rollback_exc}")
+            if rollback_errors:
+                raise RuntimeError(
+                    "六态导出替换失败，且旧文件回滚不完整："
+                    + "；".join(rollback_errors)
+                ) from replace_exc
+            raise
+        else:
+            for backup_path in backup_paths.values():
+                backup_path.unlink(missing_ok=True)
+
+    def export_segmentation_failure_diagnostics(self, result, output_dir=None):
+        """只导出失败诊断，并确保旧区间和概览不会冒充本轮结果。"""
+
+        if result is None:
+            raise ValueError("缺少需要导出的六态失败诊断")
+        target_dir = Path(output_dir) if output_dir is not None else OUTPUT_DIR / "segmentation"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        self._clear_segmentation_output_artifacts(target_dir)
+        diagnostics = dict(getattr(result, "diagnostics", {}) or {})
+        config = getattr(result, "config", None)
+        diagnostics["config"] = (
+            config.to_dict()
+            if hasattr(config, "to_dict")
+            else dict(getattr(config, "__dict__", {}) or {})
+        )
+        diagnostics["export_status"] = "decode_failed_diagnostics_only"
+        for attribute_name in ("input_schema_version", "scorer_type", "model_version"):
+            diagnostics[attribute_name] = getattr(result, attribute_name, None)
+        payload = self._normalize_segmentation_json_value(diagnostics)
+        target_path = target_dir / "diagnostics.json"
+        temporary_path = target_dir / ".diagnostics.tmp.json"
+        try:
+            with temporary_path.open(
+                "w",
+                encoding="utf-8",
+                newline="\n",
+            ) as stream:
+                json.dump(
+                    payload,
+                    stream,
+                    ensure_ascii=False,
+                    indent=2,
+                    allow_nan=False,
+                )
+                stream.write("\n")
+            temporary_path.replace(target_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+        return target_path
+
+    def _export_latest_segmentation_result_legacy_sample(self, result=None, output_dir=None):
         """独立导出最近一次六态结果，并原子更新固定导出文件。"""
         resolved_result = result or getattr(self, "_latest_segmentation_result", None)
         if resolved_result is None:
             raise ValueError("当前没有可导出的全行程六类划分结果")
+        result_diagnostics = dict(
+            getattr(resolved_result, "diagnostics", {}) or {}
+        )
+        fallback_used = bool(result_diagnostics.get("fallback_used", False))
+        fallback_scope = str(result_diagnostics.get("fallback_scope") or "none")
+        fallback_validated = bool(
+            result_diagnostics.get("fallback_validated", not fallback_used)
+        )
+        if fallback_used and not (
+            fallback_scope == "local_verified" and fallback_validated
+        ):
+            raise ValueError(
+                "未验证的解码回退只能导出失败诊断，不能导出普通六态结果"
+            )
+        if not bool(
+            result_diagnostics.get("postprocess_validation_passed", False)
+        ):
+            raise ValueError("六态结果未通过结构复查，不能导出普通结果")
 
         target_dir = Path(output_dir) if output_dir is not None else OUTPUT_DIR / "segmentation"
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -266,7 +788,7 @@ class AnalysisExportMixin:
             "external_nonsteady_sample_count": int(
                 background_payload["external_nonsteady_sample_count"]
             ),
-            "idle_power_tolerance": float(background_payload["idle_power_tolerance"]),
+            "idle_power_tolerance": background_payload.get("idle_power_tolerance"),
             "display_only": True,
         }
         diagnostics["interval_csv"] = {
@@ -307,6 +829,9 @@ class AnalysisExportMixin:
                 temporary_paths["overview"],
                 predicted_idle_power=predicted_idle_power,
                 background_payload=background_payload,
+                background_height_values=np.maximum(predicted_load, 0.0),
+                predicted_values=predicted_load,
+                show_actual=False,
             )
             with temporary_paths["diagnostics"].open(
                 "w",
@@ -360,6 +885,303 @@ class AnalysisExportMixin:
                 f"覆盖 {covered_sample_count} 个实际采样点（文件共 {predicted_load.size} 点）"
             )
         return paths
+
+    def export_latest_segmentation_result(self, result=None, output_dir=None):
+        """分别导出权威过程结果和可选采样映射；前者不依赖实测文件。"""
+
+        resolved_result = result or getattr(self, "_latest_segmentation_result", None)
+        if resolved_result is None:
+            raise ValueError("当前没有可导出的全行程六类划分结果")
+        diagnostics = dict(getattr(resolved_result, "diagnostics", {}) or {})
+        fallback_used = bool(diagnostics.get("fallback_used", False))
+        fallback_scope = str(diagnostics.get("fallback_scope") or "none")
+        fallback_validated = bool(
+            diagnostics.get("fallback_validated", not fallback_used)
+        )
+        if fallback_used and not (
+            fallback_scope == "local_verified" and fallback_validated
+        ):
+            raise ValueError("未验证的解码回退只能导出失败诊断，不能导出普通六态结果")
+        if not bool(diagnostics.get("postprocess_validation_passed", False)):
+            raise ValueError("六态结果未通过结构复查，不能导出普通结果")
+
+        point_labels = self._coerce_segmentation_dataframe(
+            resolved_result,
+            "point_labels",
+        )
+        intervals = self._coerce_segmentation_dataframe(
+            resolved_result,
+            "intervals",
+        )
+        required_point_columns = {
+            "point_id",
+            "s",
+            "interval_id",
+            "segment_type",
+            "state_code",
+            "review_required",
+        }
+        required_interval_columns = {
+            "interval_id",
+            "start_s",
+            "end_s",
+            "segment_type",
+            "state_code",
+            "review_required",
+        }
+        missing_point_columns = sorted(required_point_columns.difference(point_labels.columns))
+        missing_interval_columns = sorted(required_interval_columns.difference(intervals.columns))
+        if missing_point_columns or missing_interval_columns:
+            details = []
+            if missing_point_columns:
+                details.append(f"point_labels 缺少 {missing_point_columns}")
+            if missing_interval_columns:
+                details.append(f"intervals 缺少 {missing_interval_columns}")
+            raise ValueError("；".join(details))
+
+        point_codes = pd.to_numeric(point_labels["state_code"], errors="coerce")
+        interval_codes = pd.to_numeric(intervals["state_code"], errors="coerce")
+        if not point_codes.isin(range(6)).all() or not interval_codes.isin(range(6)).all():
+            raise ValueError("六态结构化输出包含 0..5 之外的 state_code")
+
+        process_signature = str(
+            diagnostics.get("process_signature")
+            or (
+                dict(diagnostics.get("repeat_run_consistency") or {}).get(
+                    "input_signature"
+                )
+            )
+            or getattr(self, "_current_process_signature", "")
+            or ""
+        )
+        if not process_signature:
+            raise ValueError("过程域结果缺少 process_signature")
+
+        target_dir = Path(output_dir) if output_dir is not None else OUTPUT_DIR / "segmentation"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        process_paths = {
+            "point_labels": target_dir / "point_labels.csv",
+            "intervals": target_dir / "intervals.csv",
+            "overview": target_dir / "overview.png",
+            "diagnostics": target_dir / "diagnostics.json",
+        }
+        process_temporary_paths = {
+            key: path.with_name(f".{path.stem}.tmp{path.suffix}")
+            for key, path in process_paths.items()
+        }
+        process_point_labels = point_labels.copy()
+        process_intervals = intervals.copy()
+        for frame in (process_point_labels, process_intervals):
+            frame["coordinate_domain"] = "process_info"
+            frame["process_signature"] = process_signature
+        process_diagnostics = dict(diagnostics)
+        process_diagnostics.pop("sample_projection", None)
+        process_diagnostics.pop("sample_visualization", None)
+        process_diagnostics.update(
+            {
+                "coordinate_domain": "process_info",
+                "process_signature": process_signature,
+                "export_status": "process_domain_valid",
+                "process_point_row_count": int(len(process_point_labels)),
+                "process_interval_row_count": int(len(process_intervals)),
+            }
+        )
+        config = getattr(resolved_result, "config", None)
+        process_diagnostics["config"] = (
+            config.to_dict()
+            if hasattr(config, "to_dict")
+            else dict(getattr(config, "__dict__", {}) or {})
+        )
+        for attribute_name in ("input_schema_version", "scorer_type", "model_version"):
+            process_diagnostics[attribute_name] = getattr(
+                resolved_result,
+                attribute_name,
+                None,
+            )
+        process_payload = self._normalize_segmentation_json_value(
+            process_diagnostics
+        )
+        try:
+            process_point_labels.to_csv(
+                process_temporary_paths["point_labels"],
+                index=False,
+                encoding="utf-8",
+                lineterminator="\n",
+            )
+            process_intervals.to_csv(
+                process_temporary_paths["intervals"],
+                index=False,
+                encoding="utf-8",
+                lineterminator="\n",
+            )
+            self._save_segmentation_process_overview(
+                process_point_labels,
+                process_intervals,
+                process_temporary_paths["overview"],
+            )
+            with process_temporary_paths["diagnostics"].open(
+                "w",
+                encoding="utf-8",
+                newline="\n",
+            ) as stream:
+                json.dump(
+                    process_payload,
+                    stream,
+                    ensure_ascii=False,
+                    indent=2,
+                    allow_nan=False,
+                )
+                stream.write("\n")
+            self._replace_segmentation_bundle(
+                process_paths,
+                process_temporary_paths,
+            )
+        finally:
+            for temporary_path in process_temporary_paths.values():
+                temporary_path.unlink(missing_ok=True)
+
+        exported_paths = dict(process_paths)
+        mapping_records = None
+        if bool(getattr(self, "sample_data_loaded", False)):
+            refresher = getattr(self, "_refresh_segmentation_sample_projection", None)
+            if callable(refresher):
+                mapping_records = refresher(refresh_view=False, silent=True)
+        else:
+            self._clear_segmentation_output_artifacts(target_dir, scope="mapping")
+
+        projection_diagnostics = dict(
+            getattr(resolved_result, "diagnostics", {}).get("sample_projection", {})
+            or {}
+        )
+        mapping_diagnostics_path = target_dir / "sample_mapping_diagnostics.json"
+        mapping_diagnostics_temp = target_dir / ".sample_mapping_diagnostics.tmp.json"
+        if bool(getattr(self, "sample_data_loaded", False)):
+            mapping_payload = self._normalize_segmentation_json_value(
+                {
+                    **projection_diagnostics,
+                    "coordinate_domain": "sample",
+                    "process_signature": process_signature,
+                    "mapping_signature": str(
+                        getattr(self, "_current_mapping_signature", "") or ""
+                    ),
+                    "mapping_status": str(
+                        getattr(self, "_sample_mapping_status", "failed") or "failed"
+                    ),
+                }
+            )
+            try:
+                with mapping_diagnostics_temp.open(
+                    "w",
+                    encoding="utf-8",
+                    newline="\n",
+                ) as stream:
+                    json.dump(
+                        mapping_payload,
+                        stream,
+                        ensure_ascii=False,
+                        indent=2,
+                        allow_nan=False,
+                    )
+                    stream.write("\n")
+                mapping_diagnostics_temp.replace(mapping_diagnostics_path)
+                exported_paths["sample_mapping_diagnostics"] = mapping_diagnostics_path
+            finally:
+                mapping_diagnostics_temp.unlink(missing_ok=True)
+
+        if mapping_records:
+            values = np.asarray(getattr(self, "sample_data_values", []), dtype=float)
+            if values.ndim == 2:
+                source_var = getattr(self, "sample_data_source", None)
+                try:
+                    source_index = int(source_var.get()) if source_var is not None else 0
+                except Exception:
+                    source_index = 0
+                if not 0 <= source_index < values.shape[1]:
+                    source_index = 0
+                actual_values = values[:, source_index]
+            else:
+                actual_values = values.reshape(-1)
+            sample_lines = np.asarray(
+                getattr(self, "sample_data_line_numbers", []),
+                dtype=int,
+            )
+            if actual_values.size != sample_lines.size or actual_values.size == 0:
+                raise ValueError("实际采样值与程序行号数量不一致")
+
+            mapping_signature = str(
+                getattr(self, "_current_mapping_signature", "") or ""
+            )
+            projection_frame = pd.DataFrame(mapping_records)
+            projection_frame["coordinate_domain"] = "sample"
+            projection_frame["process_signature"] = process_signature
+            projection_frame["mapping_signature"] = mapping_signature
+            mapping_paths = {
+                "sample_projection": target_dir / "sample_projection.csv",
+                "sample_overview": target_dir / "sample_overview.png",
+            }
+            mapping_temporary_paths = {
+                key: path.with_name(f".{path.stem}.tmp{path.suffix}")
+                for key, path in mapping_paths.items()
+            }
+            try:
+                projection_frame.to_csv(
+                    mapping_temporary_paths["sample_projection"],
+                    index=False,
+                    encoding="utf-8",
+                    lineterminator="\n",
+                )
+                predicted_values = self._resolve_segmentation_display_prediction(
+                    actual_values.size
+                )
+                if predicted_values is None:
+                    prediction_error = str(
+                        getattr(
+                            self,
+                            "_segmentation_display_prediction_error",
+                            "预测负载不可用",
+                        )
+                        or "预测负载不可用"
+                    )
+                    raise ValueError(
+                        f"{prediction_error}，无法导出实际/预测负载叠图"
+                    )
+                background_height_values = np.maximum(predicted_values, 0.0)
+                background_payload = self.build_segmentation_sample_background_masks(
+                    background_height_values,
+                    None,
+                    mapping_records,
+                    valid_mask=np.isfinite(background_height_values),
+                )
+                self._save_segmentation_overview(
+                    actual_values,
+                    mapping_records,
+                    mapping_temporary_paths["sample_overview"],
+                    background_payload=background_payload,
+                    background_height_values=background_height_values,
+                    predicted_values=predicted_values,
+                )
+                self._replace_segmentation_bundle(
+                    mapping_paths,
+                    mapping_temporary_paths,
+                )
+                exported_paths.update(mapping_paths)
+            except Exception:
+                for mapping_path in mapping_paths.values():
+                    mapping_path.unlink(missing_ok=True)
+                raise
+            finally:
+                for temporary_path in mapping_temporary_paths.values():
+                    temporary_path.unlink(missing_ok=True)
+        else:
+            for file_name in ("sample_projection.csv", "sample_overview.png"):
+                (target_dir / file_name).unlink(missing_ok=True)
+
+        if hasattr(self, "segmentation_status_var"):
+            self.segmentation_status_var.set(
+                f"过程域六类划分: 已导出 {len(process_point_labels)} 点 / "
+                f"{len(process_intervals)} 段"
+            )
+        return exported_paths
 
     def _format_interval_point_range(self, interval):
         """按“行号.点号-行号.点号”格式返回区间边界。"""
@@ -845,6 +1667,36 @@ class AnalysisExportMixin:
 
     def save_interval_info(self):
         """保存区间信息按钮的处理函数"""
+        segmentation_result = getattr(self, "_latest_segmentation_result", None)
+        process_exported = False
+        if segmentation_result is not None:
+            try:
+                self.export_latest_segmentation_result(segmentation_result)
+                process_exported = True
+            except Exception as exc:
+                messagebox.showerror("过程域导出失败", str(exc))
+                return
+        mapping_valid = bool(
+            str(getattr(self, "_sample_mapping_status", "") or "") == "valid"
+            and str(getattr(self, "_current_mapping_signature", "") or "")
+            and getattr(self, "_segmentation_sample_projection_records", None)
+        )
+        if process_exported and not mapping_valid:
+            mapping_status = str(
+                getattr(self, "_sample_mapping_status", "not_available")
+                or "not_available"
+            )
+            mapping_note = (
+                "实际采样映射失败，未覆盖已有 SampleData.rg。"
+                if mapping_status == "failed"
+                else "导入并成功映射实际采样文件后，可再导出采样域结果。"
+            )
+            messagebox.showinfo(
+                "保存成功",
+                "过程域逐点结果、区间表、诊断和 MRR 总览已保存。\n"
+                + mapping_note,
+            )
+            return
         if not self.sample_programs:
             messagebox.showwarning("无程序信息", "请先加载 SampleData.txt")
             return
@@ -974,6 +1826,19 @@ class AnalysisExportMixin:
 
     def _do_save_interval_info(self, tools_to_save):
         """实际执行保存区间信息"""
+        if (
+            str(getattr(self, "_current_interval_source", "") or "") == "segmentation"
+            and not (
+                str(getattr(self, "_sample_mapping_status", "") or "") == "valid"
+                and str(getattr(self, "_current_mapping_signature", "") or "")
+                and getattr(self, "_segmentation_sample_projection_records", None)
+            )
+        ):
+            messagebox.showwarning(
+                "采样映射无效",
+                "过程域结果仍然有效，但实际采样映射尚未成功，未覆盖已有 SampleData.rg。",
+            )
+            return
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         output_dir = str(OUTPUT_DIR)
         if not output_dir:
@@ -1425,7 +2290,7 @@ class AnalysisExportMixin:
         curve_diff_std_limit = max(1.5, float(band_tolerance) * 0.008)
         curve_diff_mean_limit = max(1.5, float(band_tolerance) * 0.007)
         curve_jump_limit = max(4.0, float(band_tolerance) * 0.03)
-        # 变负载切削允许缓慢漂移，但不接受持续爬坡/下坡段。
+        # 一般切削允许缓慢漂移，但不接受持续爬坡或下坡段。
         curve_slope_limit = max(0.12, float(band_tolerance) / 1500.0)
         flat_pass = bool(curve_span <= curve_flat_limit and curve_drift <= curve_drift_limit)
         fluctuation_pass = bool(
@@ -2144,6 +3009,12 @@ class AnalysisExportMixin:
                 runner = getattr(self, "run_full_path_segmentation", None)
                 if not callable(runner):
                     raise RuntimeError("全行程六类划分入口不可用")
+                if hasattr(self, "set_progress"):
+                    self.set_progress(84, "正在执行全行程六类区间划分...")
+                try:
+                    self.root.update_idletasks()
+                except Exception:
+                    pass
                 runner(
                     export_outputs=False,
                     refresh_view=False,
@@ -2160,6 +3031,70 @@ class AnalysisExportMixin:
                     if not silent:
                         messagebox.showerror("区间划分失败", "未得到有效六类结果，已停止生成图表。")
                     return False
+                if hasattr(self, "set_progress"):
+                    self.set_progress(92, "六类区间划分完成，正在生成图表...")
+                try:
+                    self.root.update_idletasks()
+                except Exception:
+                    pass
+
+            has_sample_values = bool(
+                getattr(self, "sample_data_loaded", False)
+                and getattr(self, "sample_data_values", None) is not None
+            )
+            mapped_records = [
+                dict(record)
+                for record in (
+                    getattr(self, "_segmentation_sample_projection_records", []) or []
+                )
+                if isinstance(record, dict)
+            ]
+            mapping_ready = bool(
+                str(getattr(self, "_sample_mapping_status", "") or "") == "valid"
+                and str(getattr(self, "_current_mapping_signature", "") or "")
+                and mapped_records
+            )
+            if segmentation_authoritative and has_sample_values and not mapping_ready:
+                refresher = getattr(self, "_refresh_segmentation_sample_projection", None)
+                mapped_records = (
+                    refresher(refresh_view=False, silent=True)
+                    if callable(refresher)
+                    else None
+                )
+                mapping_ready = bool(mapped_records)
+            if segmentation_authoritative and (not has_sample_values or not mapping_ready):
+                if hasattr(self, "set_progress"):
+                    self.set_progress(94, "正在生成程序 MRR 与过程域六态图...")
+                rendered = self._render_process_domain_segmentation_view(save=save)
+                return self._finish_segmentation_fast_plot(
+                    rendered,
+                    "过程域图表已生成",
+                )
+            if segmentation_authoritative and mapping_ready:
+                if hasattr(self, "set_progress"):
+                    self.set_progress(94, "正在生成过程域划分与实际负载映射图...")
+                rendered = self._render_segmentation_sample_overlay_view(
+                    mapped_records,
+                    save=save,
+                )
+                if not rendered:
+                    rendered = self._render_process_domain_segmentation_view(save=save)
+                    prediction_error = str(
+                        getattr(
+                            self,
+                            "_segmentation_display_prediction_error",
+                            "预测负载暂不可用",
+                        )
+                        or "预测负载暂不可用"
+                    )
+                    return self._finish_segmentation_fast_plot(
+                        rendered,
+                        f"{prediction_error}；已保留程序 MRR 图",
+                    )
+                return self._finish_segmentation_fast_plot(
+                    rendered,
+                    "过程域划分与实际负载映射图已生成",
+                )
 
             model_ready = self.has_prediction_model_ready() if hasattr(self, "has_prediction_model_ready") else self.has_identified_kc_ke()
             self.figures = []
@@ -2185,12 +3120,15 @@ class AnalysisExportMixin:
                 else:
                     measurement_display_mode = self._get_measurement_display_mode()
                 should_refresh_measurement_prediction = (
-                    True
-                    if imported_forward_lock
-                    else (
-                        bool(refresh_prediction)
-                        if refresh_prediction is not None
-                        else bool(measurement_display_mode != "posterior")
+                    not segmentation_authoritative
+                    and (
+                        True
+                        if imported_forward_lock
+                        else (
+                            bool(refresh_prediction)
+                            if refresh_prediction is not None
+                            else bool(measurement_display_mode != "posterior")
+                        )
                     )
                 )
                 self._debug_prediction_state_event(
@@ -2219,7 +3157,8 @@ class AnalysisExportMixin:
                     measurement=getattr(self, "manual_measurement_data", None),
                 )
                 should_rebuild_process_prediction = (
-                    bool(measurement_display_mode != "posterior")
+                    not segmentation_authoritative
+                    and bool(measurement_display_mode != "posterior")
                     and (
                         resolved_policy in {"recompute_current", "fresh_or_empty"}
                         or (resolved_policy == "reuse_current_template" and not can_reuse_current)
@@ -2468,9 +3407,10 @@ class AnalysisExportMixin:
                             "reason": projection_reason,
                             "display_suppressed": True,
                         }
-                    if hasattr(self, "segmentation_status_var"):
-                        self.segmentation_status_var.set(
-                            f"全行程六类划分: 采样投影失败，已停止背景补色（{projection_reason}）"
+                    status_var = getattr(self, "sample_mapping_status_var", None)
+                    if status_var is not None and hasattr(status_var, "set"):
+                        status_var.set(
+                            f"采样映射: 失败，已停止实际负载叠图（{projection_reason}）"
                         )
             if (
                 current_sample_mode == "experiment_measurement"
@@ -2736,35 +3676,23 @@ class AnalysisExportMixin:
                 if (
                     sample_display_x_all is None
                     or sample_context_mask is None
-                    or sample_prediction_curve is None
+                    or sample_values_all is None
                     or sample_background_intervals is None
                 ):
                     return None
-                independent_checker = getattr(
-                    self,
-                    "_has_independent_segmentation_sample_prediction",
-                    None,
-                )
-                if (
-                    callable(independent_checker)
-                    and not independent_checker(
-                        getattr(self, "manual_measurement_data", None)
-                    )
-                ):
-                    return None
                 x_values = np.asarray(sample_display_x_all, dtype=float)
-                prediction_values = np.asarray(sample_prediction_curve, dtype=float)
-                if len(x_values) != len(prediction_values):
+                actual_values = np.asarray(sample_values_all, dtype=float)
+                if len(x_values) != len(actual_values):
                     return None
-                fill_values = np.maximum(prediction_values, 0.0)
+                fill_values = np.maximum(actual_values, 0.0)
                 context_mask = np.asarray(sample_context_mask, dtype=bool) & np.isfinite(x_values)
-                draw_mask = context_mask & np.isfinite(prediction_values)
+                draw_mask = context_mask & np.isfinite(actual_values)
                 if not np.any(draw_mask):
                     return None
 
                 background_payload = self.build_segmentation_sample_background_masks(
-                    prediction_values,
-                    sample_idle_power_all,
+                    actual_values,
+                    None,
                     sample_background_intervals,
                     valid_mask=context_mask,
                 )

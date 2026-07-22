@@ -34,6 +34,7 @@ class InputIdleMixin:
         self.merged_input_file_path = ""
         self.ensure_sample_data_matches_inputs(file_paths)
         self.reset_processing_state()
+        self._refresh_import_order_controls()
         if len(file_paths) >= 1:
             effective_input_path = file_paths[0]
             if len(file_paths) > 1:
@@ -94,6 +95,7 @@ class InputIdleMixin:
             else:
                 self.show_initial_message()
             self.set_sample_controls_enabled(True, refresh=False)
+            self._refresh_import_order_controls()
             return ""
 
     def on_input_entry_change(self, event=None):
@@ -301,7 +303,12 @@ class InputIdleMixin:
             return None
         return os.path.normcase(os.path.abspath(input_file))
 
-    def _get_process_signature(self, input_file):
+    def _get_process_cache_signature(self, input_file):
+        """建立工艺信息解析缓存签名。
+
+        该签名只用于判断旧的解析行能否复用，不是六态划分的
+        ``process_signature``。后者由划分管线仅基于规范化工艺字段建立。
+        """
         try:
             mtime = os.path.getmtime(input_file)
         except Exception:
@@ -367,7 +374,7 @@ class InputIdleMixin:
             if self.processed_file_path and os.path.normcase(os.path.abspath(self.processed_file_path)) == process_abs:
                 return bool(self.data)
             cache_key = self._get_process_cache_key(process_path)
-            signature = self._get_process_signature(process_path)
+            signature = self._get_process_cache_signature(process_path)
             cached = self._process_cache.get(cache_key)
             if not cached:
                 return False
@@ -376,7 +383,7 @@ class InputIdleMixin:
             return False
 
     def _process_current_input_for_preview(self):
-        """处理当前工艺信息表并刷新预测负载图表"""
+        """处理当前工艺信息表，完成过程域划分后刷新图表。"""
         self._cancel_pending_input_process()
         input_files = self.get_input_files()
         if len(input_files) != 1:
@@ -389,33 +396,38 @@ class InputIdleMixin:
             total_start = time.perf_counter()
             self.set_progress(5, "正在检查缓存...")
             cache_key = self._get_process_cache_key(input_file)
-            signature = self._get_process_signature(input_file)
+            signature = self._get_process_cache_signature(input_file)
             if cache_key and self._load_cached_process(cache_key, signature):
-                self.set_progress(22, "已命中缓存，正在准备参数模型...")
+                self.set_progress(28, "已命中工艺解析缓存，正在计算过程域特征...")
                 stage_times["cache"] = time.perf_counter() - total_start
                 stage_start = time.perf_counter()
-                model_status = "none"
-                if hasattr(self, "_ensure_prediction_model_for_current_process"):
-                    model_status = self._ensure_prediction_model_for_current_process(auto_identify_missing=True, save_strategy="prompt")
-                stage_times["model"] = time.perf_counter() - stage_start
-                if model_status == "profile":
-                    self.set_progress(52, "已导入默认参数配置，正在计算预测负载...")
-                elif model_status == "auto_identified":
-                    self.set_progress(52, "自动辨识已完成，沿用当前图表结果...")
-                else:
-                    self.set_progress(52, "正在刷新预测负载...")
-                if model_status != "auto_identified":
-                    self.set_progress(82, "正在生成图表与稳态区间...")
-                    interval_policy = self._get_default_interval_policy() if hasattr(self, "_get_default_interval_policy") else "fresh_or_empty"
-                    self.generate_plots(save=False, silent=True, interval_policy=interval_policy, persist_profile=False)
-                    stage_times["plot"] = time.perf_counter() - total_start - sum(stage_times.values())
-                self.set_progress(96, "正在刷新预览...")
-                stage_times["preview"] = time.perf_counter() - total_start - sum(stage_times.values())
+                result = self.run_full_path_segmentation(
+                    export_outputs=False,
+                    refresh_view=False,
+                    silent=True,
+                )
+                stage_times["segmentation"] = time.perf_counter() - stage_start
+                if result is None:
+                    self.set_progress(0, "过程域六类划分失败")
+                    self._refresh_import_order_controls()
+                    return False
+                self.set_progress(88, "过程域划分完成，正在生成图表...")
+                stage_start = time.perf_counter()
+                self.generate_plots(
+                    save=False,
+                    silent=True,
+                    interval_policy="reuse_current_template",
+                    persist_profile=False,
+                    refresh_prediction=False,
+                )
+                stage_times["plot"] = time.perf_counter() - stage_start
+                self.set_progress(96, "正在刷新过程域预览...")
                 # 导入工艺信息表后立即刷新“已设定理想值”视图
                 self._refresh_ideal_tree()
                 self._refresh_current_ideal_display()
                 total_elapsed = time.perf_counter() - total_start
-                self.set_progress(100, f"已使用缓存刷新图表（总耗时 {total_elapsed:.1f}s）")
+                self._refresh_import_order_controls()
+                self.set_progress(100, f"已使用解析缓存完成划分（总耗时 {total_elapsed:.1f}s）")
                 return True
             self.set_progress(12, "正在解析工艺信息文件...")
             try:
@@ -429,28 +441,29 @@ class InputIdleMixin:
                 self.set_progress(0, "自动处理失败")
                 return False
             self._store_process_cache(cache_key, signature)
-            self.set_progress(42, "工艺信息解析完成，正在准备参数模型...")
+            self.set_progress(42, "工艺信息解析完成，正在重算 MRR 与过程域特征...")
             stage_start = time.perf_counter()
-            model_status = "none"
-            if hasattr(self, "_ensure_prediction_model_for_current_process"):
-                model_status = self._ensure_prediction_model_for_current_process(auto_identify_missing=True, save_strategy="prompt")
-            stage_times["model"] = time.perf_counter() - stage_start
-            if model_status == "profile":
-                self.set_progress(58, "已导入默认参数配置，直接计算预测负载...")
-            elif model_status == "auto_identified":
-                self.set_progress(58, "自动辨识已完成，沿用当前图表结果...")
-            elif getattr(self, "sample_data_mode", "") == "experiment_measurement":
-                self.set_progress(58, "正在对齐实验实测并计算预测负载...")
-            if model_status != "auto_identified":
-                self.set_progress(84, "正在生成图表与稳态区间...")
-                stage_start = time.perf_counter()
-                interval_policy = self._get_default_interval_policy() if hasattr(self, "_get_default_interval_policy") else "fresh_or_empty"
-                self.generate_plots(save=False, silent=True, interval_policy=interval_policy, persist_profile=False)
-                stage_times["plot"] = time.perf_counter() - stage_start
-            self.set_progress(96, "正在刷新图表预览...")
+            result = self.run_full_path_segmentation(
+                export_outputs=False,
+                refresh_view=False,
+                silent=True,
+            )
+            stage_times["segmentation"] = time.perf_counter() - stage_start
+            if result is None:
+                self.set_progress(0, "过程域六类划分失败")
+                self._refresh_import_order_controls()
+                return False
+            self.set_progress(88, "过程域划分完成，正在生成图表...")
             stage_start = time.perf_counter()
-            # generate_plots(silent=True) 内部已完成预览刷新，这里不再重复重绘一次。
-            stage_times["preview"] = time.perf_counter() - stage_start
+            self.generate_plots(
+                save=False,
+                silent=True,
+                interval_policy="reuse_current_template",
+                persist_profile=False,
+                refresh_prediction=False,
+            )
+            stage_times["plot"] = time.perf_counter() - stage_start
+            self.set_progress(96, "正在刷新过程域预览...")
             # 导入工艺信息表后立即刷新“已设定理想值”视图
             self._refresh_ideal_tree()
             self._refresh_current_ideal_display()
@@ -458,9 +471,8 @@ class InputIdleMixin:
             summary_parts = []
             for key, label in (
                 ("parse", "解析"),
-                ("model", "模型"),
+                ("segmentation", "划分"),
                 ("plot", "图表"),
-                ("preview", "预览"),
             ):
                 if key in stage_times:
                     summary_parts.append(f"{label}{stage_times[key]:.1f}s")
@@ -469,6 +481,7 @@ class InputIdleMixin:
             if summary_text:
                 final_text += f"，{summary_text}"
             final_text += "）"
+            self._refresh_import_order_controls()
             self.set_progress(100, final_text)
             return True
         except Exception as e:
@@ -482,24 +495,33 @@ class InputIdleMixin:
         self._process_current_input_for_preview()
 
     def _refresh_import_order_controls(self):
-        """按导入顺序更新按钮状态：实测负载 -> 工艺信息，NC 为可选增强。"""
-        has_measurement = bool(getattr(self, "sample_data_loaded", False))
+        """分别按过程域和采样域的就绪状态更新按钮。"""
+        has_process_data = bool(getattr(self, "data", None))
+        has_segmentation = bool(
+            getattr(self, "_current_interval_ready", False)
+            and str(getattr(self, "_current_interval_source", "") or "") == "segmentation"
+        )
 
         if hasattr(self, "import_sample_btn"):
             self.import_sample_btn.configure(state="normal")
         if hasattr(self, "import_experiment_btn"):
             self.import_experiment_btn.configure(state="normal")
         if hasattr(self, "choose_process_btn"):
-            self.choose_process_btn.configure(state=("normal" if has_measurement else "disabled"))
+            self.choose_process_btn.configure(state="normal")
+        if hasattr(self, "run_segmentation_btn"):
+            self.run_segmentation_btn.configure(state=("normal" if has_process_data else "disabled"))
+        if hasattr(self, "export_i_code_btn"):
+            self.export_i_code_btn.configure(state=("normal" if has_segmentation else "disabled"))
+
+    def _refresh_segmentation_export_controls(self):
+        """映射状态更新后同步过程域操作按钮。"""
+        self._refresh_import_order_controls()
 
     def _ensure_nc_loaded_before_measurement(self):
         return True
 
     def _ensure_ready_for_process_info_import(self):
-        if not getattr(self, "sample_data_loaded", False):
-            messagebox.showwarning("导入顺序", "请先导入实测负载，再导入工艺信息文件。")
-            self.set_status("请先导入实测负载文件", 3000)
-            return False
+        """工艺信息可以独立导入并完成过程域划分。"""
         return True
 
     def browse_sample_bundle(self):

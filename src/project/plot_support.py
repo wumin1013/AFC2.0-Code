@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from matplotlib.collections import LineCollection, PolyCollection
+
 from .shared import *
 
 
@@ -47,20 +49,16 @@ class PlotSupportMixin:
 
     def build_segmentation_sample_background_masks(
         self,
-        predicted_load,
+        sample_values,
         predicted_idle_power,
         interval_records,
         *,
         valid_mask=None,
     ):
-        """构建采样域六态背景；过程投影优先，域外只补 idle/nonsteady。"""
-        predicted = np.asarray(predicted_load, dtype=float)
-        sample_count = int(predicted.size)
-        idle_power = np.asarray(predicted_idle_power, dtype=float)
-        if idle_power.size != sample_count:
-            raise ValueError("预测空载功率与预测负载数量不一致")
-
-        valid = np.isfinite(predicted) & np.isfinite(idle_power)
+        """只把已有过程状态投影到采样域，绝不在采样域重新分类。"""
+        sample_array = np.asarray(sample_values, dtype=float)
+        sample_count = int(sample_array.size)
+        valid = np.isfinite(sample_array)
         if valid_mask is not None:
             requested_valid = np.asarray(valid_mask, dtype=bool)
             if requested_valid.size != sample_count:
@@ -98,11 +96,10 @@ class PlotSupportMixin:
 
             segment_type = str(record.get("segment_type") or "").strip().lower()
             if segment_type not in state_masks:
-                is_idle = bool(record.get("is_idle_interval")) or str(
-                    record.get("kc_source", "")
-                ).strip().lower() == "idle"
-                segment_type = "idle" if is_idle else "steady"
+                raise ValueError(f"采样投影包含未知六态类型: {segment_type or '空值'}")
             interval_slice = slice(safe_start, safe_end + 1)
+            if np.any(process_mask[interval_slice] & valid[interval_slice]):
+                raise ValueError("采样投影区间存在重叠")
             interval_mask = (
                 valid[interval_slice]
                 & (~process_mask[interval_slice])
@@ -111,15 +108,10 @@ class PlotSupportMixin:
             process_mask[interval_slice] |= interval_mask
 
         external_mask = valid & (~process_mask)
-        tolerance = self.resolve_segmentation_idle_power_tolerance()
-        external_idle_mask = (
-            external_mask
-            & np.isfinite(idle_power)
-            & (predicted <= idle_power + tolerance)
-        )
-        external_nonsteady_mask = external_mask & (~external_idle_mask)
-        state_masks["idle"] |= external_idle_mask
-        state_masks["nonsteady"] |= external_nonsteady_mask
+        # 兼容旧消费者保留两个字段，但它们必须恒为空；域外样本只标记
+        # 为未映射，不能再使用 P_pred/P_idle 猜测 idle 或 nonsteady。
+        external_idle_mask = np.zeros(sample_count, dtype=bool)
+        external_nonsteady_mask = np.zeros(sample_count, dtype=bool)
 
         return {
             "state_masks": state_masks,
@@ -127,12 +119,246 @@ class PlotSupportMixin:
             "process_projected_mask": process_mask,
             "external_idle_mask": external_idle_mask,
             "external_nonsteady_mask": external_nonsteady_mask,
+            "unmapped_mask": external_mask,
             "valid_sample_count": int(np.sum(valid)),
             "process_projected_sample_count": int(np.sum(process_mask)),
             "external_idle_sample_count": int(np.sum(external_idle_mask)),
             "external_nonsteady_sample_count": int(np.sum(external_nonsteady_mask)),
-            "idle_power_tolerance": float(tolerance),
+            "unmapped_sample_count": int(np.sum(external_mask)),
+            "idle_power_tolerance": None,
+            "classification_source": "process_projection_only",
         }
+
+    def draw_segmentation_curve_background(
+        self,
+        ax,
+        x_values,
+        height_values,
+        state_masks,
+        *,
+        cell_left_values=None,
+        cell_right_values=None,
+        alpha=0.30,
+        show_labels=True,
+        zorder=1,
+    ):
+        """按曲线高度绘制六态填充，每种状态只创建一个集合。"""
+
+        if ax is None:
+            return []
+        x_arr = np.asarray(x_values, dtype=float).reshape(-1)
+        height_arr = np.asarray(height_values, dtype=float).reshape(-1)
+        if x_arr.size == 0 or height_arr.size != x_arr.size:
+            return []
+
+        if (cell_left_values is None) != (cell_right_values is None):
+            raise ValueError("六态曲线背景的左右边界必须同时提供")
+        if cell_left_values is not None:
+            cell_left = np.asarray(cell_left_values, dtype=float).reshape(-1)
+            cell_right = np.asarray(cell_right_values, dtype=float).reshape(-1)
+            if cell_left.size != x_arr.size or cell_right.size != x_arr.size:
+                raise ValueError("六态曲线背景边界与曲线点数不一致")
+        else:
+            cell_left = np.full(x_arr.size, np.nan, dtype=float)
+            cell_right = np.full(x_arr.size, np.nan, dtype=float)
+            coordinate_blocks = self.compute_contiguous_blocks(np.isfinite(x_arr))
+            for block_start, block_end in coordinate_blocks:
+                block_indices = np.arange(block_start, block_end + 1, dtype=int)
+                centers = x_arr[block_indices]
+                if block_indices.size == 1:
+                    only_idx = int(block_indices[0])
+                    cell_left[only_idx] = float(centers[0] - 0.5)
+                    cell_right[only_idx] = float(centers[0] + 0.5)
+                    continue
+
+                shared_edges = centers[:-1] + np.diff(centers) * 0.5
+                cell_right[block_indices[:-1]] = shared_edges
+                cell_left[block_indices[1:]] = shared_edges
+                positive_steps = np.diff(centers)
+                positive_steps = positive_steps[
+                    np.isfinite(positive_steps) & (positive_steps > 0.0)
+                ]
+                default_step = (
+                    float(np.median(positive_steps))
+                    if positive_steps.size
+                    else 1.0
+                )
+                first_step = float(centers[1] - centers[0])
+                last_step = float(centers[-1] - centers[-2])
+                if not np.isfinite(first_step) or first_step <= 0.0:
+                    first_step = default_step
+                if not np.isfinite(last_step) or last_step <= 0.0:
+                    last_step = default_step
+                cell_left[int(block_indices[0])] = float(
+                    centers[0] - first_step * 0.5
+                )
+                cell_right[int(block_indices[-1])] = float(
+                    centers[-1] + last_step * 0.5
+                )
+
+        finite = (
+            np.isfinite(x_arr)
+            & np.isfinite(height_arr)
+            & np.isfinite(cell_left)
+            & np.isfinite(cell_right)
+            & (cell_right > cell_left)
+        )
+        if not np.any(finite):
+            return []
+
+        artists = []
+        masks = dict(state_masks or {})
+        for segment_type in SEGMENTATION_STATE_ORDER:
+            mask = np.asarray(
+                masks.get(segment_type, np.zeros(x_arr.size, dtype=bool)),
+                dtype=bool,
+            ).reshape(-1)
+            if mask.size != x_arr.size:
+                raise ValueError("六态曲线背景掩码与曲线点数不一致")
+            blocks = self.compute_contiguous_blocks(mask & finite)
+            polygons = []
+            for start_idx, end_idx in blocks:
+                start_idx = int(start_idx)
+                end_idx = int(end_idx)
+                left_edge = float(cell_left[start_idx])
+                right_edge = float(cell_right[end_idx])
+                if not (
+                    np.isfinite(left_edge)
+                    and np.isfinite(right_edge)
+                    and right_edge > left_edge
+                ):
+                    continue
+                segment_x = x_arr[start_idx:end_idx + 1]
+                segment_y = np.maximum(
+                    height_arr[start_idx:end_idx + 1],
+                    0.0,
+                )
+                top_x = np.concatenate(([left_edge], segment_x, [right_edge]))
+                top_y = np.concatenate((
+                    [segment_y[0]],
+                    segment_y,
+                    [segment_y[-1]],
+                ))
+                top_vertices = np.column_stack((top_x, top_y))
+                bottom_vertices = np.column_stack((
+                    top_x[::-1],
+                    np.zeros(top_x.size, dtype=float),
+                ))
+                polygons.append(np.vstack((top_vertices, bottom_vertices)))
+            if not polygons:
+                continue
+            style = self.get_segmentation_state_style(segment_type)
+            collection = PolyCollection(
+                polygons,
+                facecolors=style["color"],
+                edgecolors="none",
+                linewidths=0.0,
+                alpha=float(alpha),
+                zorder=zorder,
+                label=(
+                    f"{style['label']} [{style['state_code']}]"
+                    if show_labels
+                    else None
+                ),
+            )
+            ax.add_collection(collection)
+            artists.append(collection)
+        return artists
+
+    def draw_process_mrr_segmentation(
+        self,
+        ax,
+        point_labels,
+        intervals,
+        *,
+        show_labels=True,
+    ):
+        """绘制不依赖实际采样或预测模型的程序 MRR 过程域视图。"""
+
+        if ax is None or point_labels is None:
+            return []
+        frame = (
+            point_labels.copy()
+            if isinstance(point_labels, pd.DataFrame)
+            else pd.DataFrame(point_labels)
+        )
+        if frame.empty or "MRR_program" not in frame:
+            return []
+        cell_left_values = None
+        cell_right_values = None
+        if "path_start" in frame and "path_end" in frame:
+            cell_left_values = pd.to_numeric(
+                frame["path_start"],
+                errors="coerce",
+            ).to_numpy(dtype=float)
+            cell_right_values = pd.to_numeric(
+                frame["path_end"],
+                errors="coerce",
+            ).to_numpy(dtype=float)
+            x_values = (cell_left_values + cell_right_values) * 0.5
+        elif "s" in frame:
+            x_values = pd.to_numeric(frame["s"], errors="coerce").to_numpy(dtype=float)
+        else:
+            x_values = np.arange(len(frame), dtype=float)
+        mrr_values = pd.to_numeric(
+            frame["MRR_program"],
+            errors="coerce",
+        ).to_numpy(dtype=float)
+        state_masks = {
+            state: np.zeros(len(frame), dtype=bool)
+            for state in SEGMENTATION_STATE_ORDER
+        }
+        if "segment_type" in frame:
+            point_states = (
+                frame["segment_type"].fillna("").astype(str).str.strip().str.lower()
+            )
+            for state in SEGMENTATION_STATE_ORDER:
+                state_masks[state] = point_states.eq(state).to_numpy(dtype=bool)
+        else:
+            records = (
+                intervals.to_dict(orient="records")
+                if hasattr(intervals, "to_dict")
+                else list(intervals or [])
+            )
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                try:
+                    start_idx = max(0, int(record.get("start_idx")))
+                    end_idx = min(len(frame) - 1, int(record.get("end_idx")))
+                except (TypeError, ValueError):
+                    continue
+                state = str(record.get("segment_type") or "").strip().lower()
+                if state in state_masks and end_idx >= start_idx:
+                    state_masks[state][start_idx:end_idx + 1] = True
+        artists = self.draw_segmentation_curve_background(
+            ax,
+            x_values,
+            mrr_values,
+            state_masks,
+            cell_left_values=cell_left_values,
+            cell_right_values=cell_right_values,
+            alpha=0.30,
+            show_labels=show_labels,
+            zorder=1,
+        )
+        finite = np.isfinite(x_values) & np.isfinite(mrr_values)
+        if np.any(finite):
+            line_values = np.where(finite, mrr_values, np.nan)
+            line, = ax.plot(
+                x_values,
+                line_values,
+                color=SEGMENTATION_PREDICTED_LINE_COLOR,
+                linewidth=1.0,
+                label="程序 MRR",
+                zorder=3,
+            )
+            artists.append(line)
+        ax.set_title("程序 MRR 与过程域六态区间")
+        ax.set_xlabel("过程行程 s (mm)")
+        ax.set_ylabel("MRR_program (mm³/s)")
+        ax.margins(x=0)
+        return artists
 
     def draw_full_path_segmentation_background(
         self,
@@ -152,7 +378,7 @@ class PlotSupportMixin:
             records = list(intervals)
 
         artists = []
-        labeled_states = set()
+        spans_by_state = {state: [] for state in SEGMENTATION_STATE_ORDER}
         boundaries = set()
 
         def _finite_float(record, keys):
@@ -178,35 +404,45 @@ class PlotSupportMixin:
                 continue
 
             segment_type = str(record.get("segment_type") or "nonsteady").strip().lower()
-            style = self.get_segmentation_state_style(segment_type)
-            label = None
-            if show_labels and segment_type not in labeled_states:
-                label = f"{style['label']} [{style['state_code']}]"
-                labeled_states.add(segment_type)
-            artist = ax.axvspan(
-                start,
-                end,
-                facecolor=style["color"],
-                edgecolor="none",
-                alpha=float(alpha),
-                label=label,
-                zorder=0,
-            )
-            artists.append(artist)
+            if segment_type not in SEGMENTATION_STATE_STYLES:
+                segment_type = "nonsteady"
+            spans_by_state[segment_type].append((float(start), float(end - start)))
             boundaries.add(float(start))
             boundaries.add(float(end))
 
-        if mark_boundaries:
-            for boundary in sorted(boundaries):
-                artists.append(
-                    ax.axvline(
-                        boundary,
-                        color="#263238",
-                        linewidth=0.45,
-                        alpha=0.45,
-                        zorder=2,
-                    )
-                )
+        for segment_type in SEGMENTATION_STATE_ORDER:
+            xranges = spans_by_state[segment_type]
+            if not xranges:
+                continue
+            style = self.get_segmentation_state_style(segment_type)
+            label = (
+                f"{style['label']} [{style['state_code']}]"
+                if show_labels
+                else None
+            )
+            artist = ax.broken_barh(
+                xranges,
+                (0.0, 1.0),
+                facecolors=style["color"],
+                edgecolors="none",
+                alpha=float(alpha),
+                label=label,
+                zorder=0,
+                transform=ax.get_xaxis_transform(),
+            )
+            artists.append(artist)
+
+        if mark_boundaries and boundaries:
+            boundary_collection = LineCollection(
+                [((boundary, 0.0), (boundary, 1.0)) for boundary in sorted(boundaries)],
+                colors="#263238",
+                linewidths=0.45,
+                alpha=0.45,
+                zorder=2,
+                transform=ax.get_xaxis_transform(),
+            )
+            ax.add_collection(boundary_collection)
+            artists.append(boundary_collection)
         return artists
 
     def _compress_plot_segment_preserve_extrema(self, x_segment, y_segment, max_points):
@@ -263,6 +499,45 @@ class PlotSupportMixin:
         if len(kept_indices) >= point_count:
             return x_arr, y_arr
         return x_arr[kept_indices], y_arr[kept_indices]
+
+    def _compress_plot_series_preserve_gaps(self, x_values, y_values, max_points):
+        """按有限连续块压缩曲线，并以 NaN 分隔，避免跨缺失点连线。"""
+
+        x_arr = np.asarray(x_values, dtype=float).reshape(-1)
+        y_arr = np.asarray(y_values, dtype=float).reshape(-1)
+        if x_arr.size != y_arr.size:
+            raise ValueError("曲线横纵坐标点数不一致")
+        valid = np.isfinite(x_arr) & np.isfinite(y_arr)
+        blocks = self.compute_contiguous_blocks(valid)
+        if not blocks:
+            return np.asarray([], dtype=float), np.asarray([], dtype=float)
+
+        try:
+            limit = int(max_points)
+        except Exception:
+            limit = 0
+        finite_count = int(np.sum(valid))
+        x_parts = []
+        y_parts = []
+        for block_index, (start_idx, end_idx) in enumerate(blocks):
+            block_x = x_arr[start_idx:end_idx + 1]
+            block_y = y_arr[start_idx:end_idx + 1]
+            if limit > 0 and finite_count > limit:
+                block_limit = max(
+                    2,
+                    int(round(limit * len(block_x) / max(finite_count, 1))),
+                )
+                block_x, block_y = self._compress_plot_segment_preserve_extrema(
+                    block_x,
+                    block_y,
+                    block_limit,
+                )
+            if block_index:
+                x_parts.append(np.asarray([np.nan], dtype=float))
+                y_parts.append(np.asarray([np.nan], dtype=float))
+            x_parts.append(np.asarray(block_x, dtype=float))
+            y_parts.append(np.asarray(block_y, dtype=float))
+        return np.concatenate(x_parts), np.concatenate(y_parts)
 
     def compute_contiguous_blocks(self, mask):
         """将布尔掩码转换为连续区块索引列表 [(start, end), ...]。"""

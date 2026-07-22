@@ -1,0 +1,775 @@
+from __future__ import annotations
+
+import sys
+import unittest
+from dataclasses import replace
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = PROJECT_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from matplotlib.collections import PolyCollection
+
+from project.academic_workbench import AcademicWorkbenchMixin
+from project.analysis_export import AnalysisExportMixin
+from project.plot_support import PlotSupportMixin
+from project.sample_manager import SampleManagerMixin
+from project.segmentation import SegmentationConfig, SegmentationPipeline
+
+
+def _process_frame(mrr_values: list[float], *, step_mm: float = 0.1) -> pd.DataFrame:
+    point_count = len(mrr_values)
+    return pd.DataFrame(
+        {
+            "source_index": range(point_count),
+            "line_id": range(100, 100 + point_count),
+            "line_no_raw": range(100, 100 + point_count),
+            "ap": [0.0 if value == 0.0 else 1.0 for value in mrr_values],
+            "ae": mrr_values,
+            "F_program": [60.0] * point_count,
+            "s": [step_mm] * point_count,
+        }
+    )
+
+
+def _test_config(**overrides) -> SegmentationConfig:
+    values = {
+        "local_window_points": 1,
+        "steady_min_plateau_points": 6,
+        "min_steady_mm": 0.3,
+        "min_entry_mm": 0.0,
+        "min_transition_mm": 0.0,
+        "min_exit_mm": 0.0,
+        "transition_ratio": 0.1,
+        "max_segment_atoms": 32,
+    }
+    values.update(overrides)
+    return SegmentationConfig(**values)
+
+
+def _run(mrr_values: list[float], config: SegmentationConfig | None = None):
+    return SegmentationPipeline(config or _test_config()).run(
+        _process_frame(mrr_values)
+    )
+
+
+def _entry_record(result) -> dict:
+    records = list(result.diagnostics.get("entry_peak_records") or [])
+    if len(records) != 1:
+        raise AssertionError(f"预期一个加工阶段，实际为 {len(records)} 个")
+    return dict(records[0])
+
+
+def _process_signature(result) -> str:
+    repeat = dict(result.diagnostics.get("repeat_run_consistency") or {})
+    return str(
+        result.diagnostics.get("process_signature")
+        or repeat.get("process_signature")
+        or repeat.get("input_signature")
+        or ""
+    )
+
+
+def _result_shape(result) -> tuple[pd.DataFrame, pd.DataFrame]:
+    points = result.point_labels[
+        ["source_index", "segment_type", "state_code", "interval_id"]
+    ].reset_index(drop=True)
+    intervals = result.intervals[
+        ["start_idx", "end_idx", "segment_type", "state_code"]
+    ].reset_index(drop=True)
+    return points, intervals
+
+
+class _MappingHarness(AcademicWorkbenchMixin):
+    """只提供采样投影状态机需要的上下文，不创建 Tk 页面。"""
+
+    def __init__(self, process_result):
+        self._latest_segmentation_result = process_result
+        self._current_interval_ready = True
+        self._current_interval_source = "segmentation"
+        self._current_process_signature = _process_signature(process_result)
+        self._sample_mapping_status = "pending"
+        self._current_mapping_signature = ""
+        self._segmentation_sample_projection_records = []
+        self._authoritative_segmentation_sample_lookup_cache = None
+        self.sample_data_loaded = True
+        self.sample_data_line_numbers = [100, 101, 102, 103]
+        self.mapping_signature = "mapping-success"
+        self.fail_mapping = False
+        self.process_records = [
+            {
+                "interval_id": "SEG0001",
+                "start_idx": 0,
+                "end_idx": 3,
+                "segment_type": "idle",
+                "state_code": 0,
+            }
+        ]
+
+    def _build_segmentation_mapping_signature(self):
+        return self.mapping_signature
+
+    def _get_current_segmentation_process_signature(self):
+        return self._current_process_signature
+
+    def _get_current_interval_records(self, *, allow_profile_fallback=False):
+        self.assert_no_profile_fallback = not allow_profile_fallback
+        return [dict(record) for record in self.process_records]
+
+    def _materialize_segmentation_sample_bounds(self, records):
+        if self.fail_mapping:
+            raise ValueError("程序行映射不唯一")
+        return [
+            {
+                **dict(records[0]),
+                "sample_start_idx": 0,
+                "sample_end_idx": 3,
+                "sample_count": 4,
+            }
+        ]
+
+
+class _ValueVar:
+    def __init__(self, value=""):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+    def set(self, value):
+        self.value = value
+
+
+class _SampleSelectionHarness(SampleManagerMixin):
+    def __init__(self):
+        self.sample_program_name = _ValueVar("PHONE")
+        self.sample_tool_name = _ValueVar("")
+        self.sample_programs = {"PHONE": {"tools": {"T1": []}}}
+        self.sample_tool_combo = {}
+        self._loading_sample_data = False
+        self.matched_process_file_var = _ValueVar("")
+        self.mapping_refresh_count = 0
+        self.prompt_count = 0
+
+    def build_tool_display_label(self, tool_id, display_ranges):
+        return str(tool_id)
+
+    def sync_adjustment_ratio_for_current_view(self):
+        return None
+
+    def apply_process_file_for_program(self, program_name):
+        return False
+
+    def _has_authoritative_segmentation_state(self):
+        return True
+
+    def get_primary_input_file(self):
+        return "process-info.txt"
+
+    def _refresh_segmentation_sample_projection(self, **kwargs):
+        self.mapping_refresh_count += 1
+        return []
+
+    def prompt_process_file_for_program(self, program_name):
+        self.prompt_count += 1
+
+    def on_sample_selection_change(self, event=None):
+        return None
+
+
+class _VisualizationHarness(AnalysisExportMixin, PlotSupportMixin):
+    def __init__(self, process_result):
+        self.data = [{}]
+        self._latest_segmentation_result = process_result
+        self._current_interval_ready = True
+        self._current_interval_source = "segmentation"
+        self._current_process_signature = _process_signature(process_result)
+        self._sample_mapping_status = "not_available"
+        self._current_mapping_signature = ""
+        self._segmentation_sample_projection_records = []
+        self.sample_data_loaded = False
+        self.sample_data_values = None
+        self.sample_data_line_numbers = None
+        self.sample_data_time_indices = None
+        self.sample_data_x_positions = None
+        self.sample_data_source = _ValueVar(0)
+        self.sample_data_mode = ""
+        self.manual_measurement_data = None
+        self.preview_plot_max_points = 60000
+        self.status_var_data = _ValueVar("")
+        self.figures = []
+        self.figure_names = []
+        self.progress = []
+        self.display_prediction_to_generate = None
+        self.prediction_refresh_count = 0
+
+    def set_progress(self, value, text):
+        self.progress.append((value, text))
+
+    def show_current_figure(self, index=0):
+        return None
+
+    def apply_line_axis_on_time(self, ax, sample_mask, max_ticks=60):
+        return None
+
+    def apply_line_axis_on_path(self, ax, sample_positions, sample_mask, max_ticks=60):
+        return None
+
+    def _refresh_manual_measurement_prediction(self):
+        self.prediction_refresh_count += 1
+        if self.display_prediction_to_generate is not None:
+            self.manual_measurement_data["predicted_load"] = np.asarray(
+                self.display_prediction_to_generate,
+                dtype=float,
+            )
+        return self.manual_measurement_data
+
+
+def _fill_heights_at_x(collections, x_values) -> np.ndarray:
+    """从测试图元中还原各曲线采样点的背景上沿。"""
+
+    heights = np.full(len(x_values), np.nan, dtype=float)
+    for index, x_value in enumerate(np.asarray(x_values, dtype=float)):
+        candidates = []
+        for collection in collections:
+            for path in collection.get_paths():
+                vertices = np.asarray(path.vertices, dtype=float)
+                matched = np.isclose(vertices[:, 0], x_value, rtol=0.0, atol=1e-10)
+                if np.any(matched):
+                    candidates.extend(vertices[matched, 1].tolist())
+        if candidates:
+            heights[index] = float(np.max(candidates))
+    return heights
+
+
+class CurrentRequirementRegressionTests(unittest.TestCase):
+    def assert_valid_result(self, result) -> None:
+        diagnostics = result.diagnostics
+        self.assertEqual(1.0, float(diagnostics["coverage_rate"]))
+        self.assertEqual(0, int(diagnostics["gap_count"]))
+        self.assertEqual(0, int(diagnostics["overlap_count"]))
+        self.assertEqual(0, int(diagnostics["illegal_transition_count"]))
+        self.assertTrue(bool(diagnostics["postprocess_validation_passed"]))
+
+    def test_01_entry_endpoint_uses_first_event_and_deterministic_fallback(self):
+        cases = {
+            "peak_before_steady": {
+                "mrr": [0.0] * 3
+                + [1.0, 2.0, 3.0, 2.0, 1.5, 2.5]
+                + [4.0] * 12
+                + [3.0, 2.0, 1.0]
+                + [0.0] * 3,
+                "decision": "local_peak_before_steady",
+                "entry_start": 3,
+                "peak": 5,
+                "steady_start": 9,
+                "entry_end": 5,
+            },
+            "steady_before_peak": {
+                "mrr": [0.0] * 3
+                + [3.0, 7.0]
+                + [10.0 + index * 0.01 for index in range(12)]
+                + [11.0, 12.0, 13.0, 12.0]
+                + [0.0] * 3,
+                "decision": "steady_before_local_peak",
+                "entry_start": 3,
+                "peak": 19,
+                "steady_start": 5,
+                "entry_end": 4,
+            },
+            "peak_equals_steady_and_entry_is_empty": {
+                "mrr": [0.0] * 3 + [10.0] * 12 + [9.0, 8.0, 7.0] + [0.0] * 3,
+                "decision": "local_peak_equals_steady_start",
+                "entry_start": 3,
+                "peak": 3,
+                "steady_start": 3,
+                "entry_end": 2,
+            },
+        }
+        for name, case in cases.items():
+            with self.subTest(name=name):
+                result = _run(case["mrr"])
+                self.assert_valid_result(result)
+                record = _entry_record(result)
+                self.assertEqual(case["decision"], record["boundary_decision"])
+                self.assertEqual(case["entry_start"], record["entry_start_idx"])
+                self.assertEqual(case["peak"], record["local_peak_idx"])
+                self.assertEqual(case["steady_start"], record["first_steady_start_idx"])
+                self.assertEqual(case["entry_end"], record["selected_entry_end_idx"])
+                labels = result.point_labels["segment_type"].astype(str)
+                expected_entry = set(
+                    range(case["entry_start"], case["entry_end"] + 1)
+                )
+                actual_entry = set(labels.index[labels.eq("entry")])
+                self.assertEqual(expected_entry, actual_entry)
+
+        equal_peak = _run(
+            [0.0] * 3
+            + [2.0, 5.0, 10.0, 10.0, 10.0, 9.0, 8.0, 7.0]
+            + [0.0] * 3
+        )
+        equal_peak_record = _entry_record(equal_peak)
+        self.assertEqual("local_turning_point", equal_peak_record["local_peak_method"])
+        self.assertEqual(5, equal_peak_record["local_peak_idx"])
+        self.assertEqual(5, equal_peak_record["peak_plateau_start_idx"])
+        self.assertEqual(7, equal_peak_record["peak_plateau_end_idx"])
+        self.assertEqual(5, equal_peak_record["selected_entry_end_idx"])
+
+        fallback = _run([0.0] * 3 + [1.0, 2.0, 3.0] + [0.0] * 3)
+        fallback_record = _entry_record(fallback)
+        self.assertIsNone(fallback_record["local_peak_idx"])
+        self.assertEqual(5, fallback_record["fallback_peak_idx"])
+        self.assertEqual("stage_first_max_fallback", fallback_record["local_peak_method"])
+        self.assertEqual("stage_first_max_fallback", fallback_record["boundary_decision"])
+        self.assertEqual(5, fallback_record["selected_entry_end_idx"])
+
+    def test_02_steady_parent_and_inner_transitions_are_never_entry(self):
+        mrr = (
+            [0.0] * 3
+            + [3.0, 7.0]
+            + [10.0 + index * 0.01 for index in range(12)]
+            + [11.0, 12.0, 13.0, 12.0]
+            + [0.0] * 3
+        )
+        result = _run(mrr)
+        self.assert_valid_result(result)
+        record = _entry_record(result)
+        self.assertEqual("steady_before_local_peak", record["boundary_decision"])
+        self.assertLess(
+            int(record["selected_entry_end_idx"]),
+            int(record["first_steady_start_idx"]),
+        )
+
+        parent_records = list(result.diagnostics.get("steady_anchor_run_records") or [])
+        self.assertTrue(parent_records)
+        labels = result.point_labels["segment_type"].astype(str)
+        parent = parent_records[0]
+        parent_labels = labels.iloc[
+            int(parent["start_idx"]):int(parent["end_idx"]) + 1
+        ]
+        self.assertFalse(parent_labels.eq("entry").any())
+        self.assertTrue(parent_labels.eq("steady").any())
+        self.assertTrue(parent_labels.eq("transition").any())
+        transition_indices = set(labels.index[labels.eq("transition")])
+        entry_indices = set(labels.index[labels.eq("entry")])
+        self.assertTrue(transition_indices)
+        self.assertTrue(transition_indices.isdisjoint(entry_indices))
+
+    def test_03_only_process_fields_affect_signature_and_labels(self):
+        mrr = (
+            [0.0] * 3
+            + [1.0, 2.0, 3.0, 2.0, 1.5, 2.5]
+            + [4.0] * 12
+            + [3.0, 2.0, 1.0]
+            + [0.0] * 3
+        )
+        frame = _process_frame(mrr)
+        config = _test_config()
+        baseline = SegmentationPipeline(config).run(frame)
+        self.assertTrue(_process_signature(baseline))
+
+        derived = frame.copy()
+        derived["MRR_program"] = [-9999.0 + index for index in range(len(frame))]
+        derived["P_pred"] = [1000.0 + index * 7.0 for index in range(len(frame))]
+        derived["P_idle"] = [5000.0 - index * 11.0 for index in range(len(frame))]
+        derived["actual_load"] = [index**2 for index in range(len(frame))]
+        derived["actual_speed"] = [8000.0 + index for index in range(len(frame))]
+        derived["actual_feed"] = [0.1 * index for index in range(len(frame))]
+        derived["Kc"] = [123.0] * len(frame)
+        derived["Ke"] = [456.0] * len(frame)
+        derived["profile_id"] = [f"profile-{index}" for index in range(len(frame))]
+        changed = SegmentationPipeline(
+            replace(config, idle_power_tolerance=1.0e9)
+        ).run(derived)
+
+        self.assertEqual(_process_signature(baseline), _process_signature(changed))
+        baseline_points, baseline_intervals = _result_shape(baseline)
+        changed_points, changed_intervals = _result_shape(changed)
+        pd.testing.assert_frame_equal(baseline_points, changed_points)
+        pd.testing.assert_frame_equal(baseline_intervals, changed_intervals)
+        expected_mrr = frame["ap"] * frame["ae"] * frame["F_program"] / 60.0
+        pd.testing.assert_series_equal(
+            changed.point_labels["MRR_program"].reset_index(drop=True),
+            expected_mrr.rename("MRR_program").reset_index(drop=True),
+            check_dtype=False,
+        )
+
+    def test_04_max_segment_atoms_is_only_a_batch_size(self):
+        mrr = (
+            [0.0] * 4
+            + [1.0, 2.0, 3.0, 2.0]
+            + [4.0] * 80
+            + [3.0, 2.0, 1.0]
+            + [0.0] * 4
+            + [2.0, 4.0, 6.0, 5.0]
+            + [8.0] * 80
+            + [6.0, 4.0, 2.0]
+            + [0.0] * 4
+        )
+        frame = _process_frame(mrr)
+        results = {
+            batch_size: SegmentationPipeline(
+                _test_config(max_segment_atoms=batch_size)
+            ).run(frame)
+            for batch_size in (32, 48, 64)
+        }
+        for result in results.values():
+            self.assert_valid_result(result)
+            self.assertEqual(
+                "candidate_scoring_batch_size",
+                result.diagnostics["max_segment_atoms_role"],
+            )
+        reference_points, reference_intervals = _result_shape(results[32])
+        reference_signature = _process_signature(results[32])
+        for batch_size in (48, 64):
+            with self.subTest(max_segment_atoms=batch_size):
+                points, intervals = _result_shape(results[batch_size])
+                pd.testing.assert_frame_equal(reference_points, points)
+                pd.testing.assert_frame_equal(reference_intervals, intervals)
+                self.assertEqual(reference_signature, _process_signature(results[batch_size]))
+
+    def test_05_sample_mapping_success_or_failure_preserves_process_result(self):
+        process_result = _run(
+            [0.0] * 3
+            + [1.0, 2.0, 3.0, 2.0]
+            + [4.0] * 12
+            + [3.0, 2.0, 1.0]
+            + [0.0] * 3
+        )
+        before_points, before_intervals = _result_shape(process_result)
+        before_signature = _process_signature(process_result)
+        harness = _MappingHarness(process_result)
+
+        projected = harness._refresh_segmentation_sample_projection()
+        self.assertIsNotNone(projected)
+        self.assertEqual("valid", harness._sample_mapping_status)
+        self.assertEqual("mapping-success", harness._current_mapping_signature)
+        self.assertTrue(process_result.diagnostics["sample_projection"]["valid"])
+        self.assertEqual(before_signature, _process_signature(process_result))
+        after_success_points, after_success_intervals = _result_shape(process_result)
+        pd.testing.assert_frame_equal(before_points, after_success_points)
+        pd.testing.assert_frame_equal(before_intervals, after_success_intervals)
+
+        harness.fail_mapping = True
+        harness.mapping_signature = "mapping-failure"
+        harness._sample_mapping_status = "pending"
+        harness._current_mapping_signature = ""
+        projected = harness._refresh_segmentation_sample_projection()
+        self.assertIsNone(projected)
+        self.assertEqual("failed", harness._sample_mapping_status)
+        self.assertEqual("mapping-failure", harness._current_mapping_signature)
+        projection = process_result.diagnostics["sample_projection"]
+        self.assertFalse(projection["valid"])
+        self.assertIn("不唯一", projection["reason"])
+        self.assertEqual(before_signature, _process_signature(process_result))
+        after_failure_points, after_failure_intervals = _result_shape(process_result)
+        pd.testing.assert_frame_equal(before_points, after_failure_points)
+        pd.testing.assert_frame_equal(before_intervals, after_failure_intervals)
+
+        plotter = PlotSupportMixin()
+        figure, axis = plt.subplots()
+        try:
+            states = ("idle", "entry", "steady", "transition", "nonsteady", "exit")
+            records = [
+                {
+                    "display_start_x": float(index),
+                    "display_end_x": float(index + 1),
+                    "segment_type": states[index % len(states)],
+                }
+                for index in range(600)
+            ]
+            plotter.draw_full_path_segmentation_background(
+                axis,
+                records,
+                show_labels=True,
+                mark_boundaries=True,
+            )
+            self.assertEqual(0, len(axis.patches))
+            self.assertLessEqual(len(axis.collections), len(states) + 1)
+        finally:
+            plt.close(figure)
+
+        export_harness = AnalysisExportMixin()
+        export_harness._current_interval_source = "segmentation"
+        export_harness._sample_mapping_status = "failed"
+        export_harness._current_mapping_signature = "mapping-failure"
+        export_harness._segmentation_sample_projection_records = []
+        with (
+            patch("builtins.open") as mocked_open,
+            patch("project.analysis_export.messagebox.showwarning") as warning,
+        ):
+            export_harness._do_save_interval_info([])
+        warning.assert_called_once()
+        mocked_open.assert_not_called()
+
+        export_harness.figures = [object()]
+        export_harness.status_var_data = _ValueVar("")
+        progress = []
+        export_harness.set_progress = lambda value, text: progress.append((value, text))
+        self.assertTrue(
+            export_harness._finish_segmentation_fast_plot(True, "过程域图表已生成")
+        )
+        self.assertEqual(100, progress[-1][0])
+        self.assertIn("图表已生成", export_harness.status_var_data.get())
+
+        sample_harness = _SampleSelectionHarness()
+        sample_harness.on_sample_program_selected()
+        self.assertEqual(1, sample_harness.mapping_refresh_count)
+        self.assertEqual(0, sample_harness.prompt_count)
+        self.assertIn("使用已划分工艺信息", sample_harness.matched_process_file_var.get())
+
+        visualization = _VisualizationHarness(process_result)
+        self.assertTrue(visualization.generate_plots(silent=True))
+        process_figure = visualization.figures[0]
+        process_axis = process_figure.axes[0]
+        try:
+            self.assertEqual(1, len(process_figure.axes))
+            self.assertIn(
+                "程序 MRR",
+                [line.get_label() for line in process_axis.lines],
+            )
+            process_fills = [
+                artist
+                for artist in process_axis.collections
+                if isinstance(artist, PolyCollection)
+            ]
+            self.assertLessEqual(len(process_fills), 6)
+            process_fill_y = np.concatenate([
+                path.vertices[:, 1]
+                for artist in process_fills
+                for path in artist.get_paths()
+            ])
+            self.assertAlmostEqual(
+                float(process_result.point_labels["MRR_program"].max()),
+                float(np.max(process_fill_y)),
+            )
+            np.testing.assert_allclose(
+                _fill_heights_at_x(
+                    process_fills,
+                    (
+                        process_result.point_labels["path_start"].to_numpy(dtype=float)
+                        + process_result.point_labels["path_end"].to_numpy(dtype=float)
+                    )
+                    * 0.5,
+                ),
+                np.maximum(
+                    process_result.point_labels["MRR_program"].to_numpy(dtype=float),
+                    0.0,
+                ),
+            )
+            self.assertEqual(0.0, float(np.min(process_fill_y)))
+            self.assertEqual(0, len(process_axis.patches))
+            self.assertEqual(100, visualization.progress[-1][0])
+        finally:
+            plt.close(process_figure)
+
+        point_count = len(process_result.point_labels)
+        predicted_load = np.linspace(10.0, 40.0, point_count)
+        actual_load = np.linspace(50.0, 80.0, point_count)
+        actual_load[5] = np.nan
+        mapping_records = []
+        for record in process_result.intervals.to_dict(orient="records"):
+            mapping_records.append({
+                **record,
+                "sample_start_idx": int(record["start_idx"]),
+                "sample_end_idx": int(record["end_idx"]),
+            })
+        visualization.sample_data_loaded = True
+        visualization.sample_data_values = actual_load.reshape(-1, 1)
+        visualization.sample_data_line_numbers = np.arange(
+            100,
+            100 + point_count,
+            dtype=int,
+        )
+        visualization.sample_data_time_indices = np.arange(point_count, dtype=float)
+        visualization.sample_data_mode = "experiment_measurement"
+        visualization.manual_measurement_data = {
+            "actual_load": actual_load,
+        }
+        visualization.display_prediction_to_generate = predicted_load
+        visualization._sample_mapping_status = "valid"
+        visualization._current_mapping_signature = "mapping-valid"
+        visualization._segmentation_sample_projection_records = mapping_records
+        visualization.progress = []
+        self.assertTrue(visualization.generate_plots(silent=True))
+        sample_figure = visualization.figures[0]
+        sample_axis = sample_figure.axes[0]
+        try:
+            self.assertEqual(1, len(sample_figure.axes))
+            line_labels = [line.get_label() for line in sample_axis.lines]
+            self.assertIn("实际负载", line_labels)
+            self.assertIn("预测负载", line_labels)
+            self.assertNotIn("程序 MRR", line_labels)
+            self.assertEqual(1, visualization.prediction_refresh_count)
+            actual_line = next(
+                line for line in sample_axis.lines if line.get_label() == "实际负载"
+            )
+            self.assertTrue(np.isnan(np.asarray(actual_line.get_ydata(), dtype=float)).any())
+            sample_fills = [
+                artist
+                for artist in sample_axis.collections
+                if isinstance(artist, PolyCollection)
+            ]
+            self.assertLessEqual(len(sample_fills), 6)
+            sample_fill_y = np.concatenate([
+                path.vertices[:, 1]
+                for artist in sample_fills
+                for path in artist.get_paths()
+            ])
+            self.assertAlmostEqual(
+                float(np.max(predicted_load)),
+                float(np.max(sample_fill_y)),
+            )
+            np.testing.assert_allclose(
+                _fill_heights_at_x(
+                    sample_fills,
+                    visualization.sample_data_time_indices,
+                ),
+                predicted_load,
+            )
+            self.assertEqual(0.0, float(np.min(sample_fill_y)))
+            self.assertEqual(0, len(sample_axis.patches))
+            self.assertEqual(100, visualization.progress[-1][0])
+        finally:
+            plt.close(sample_figure)
+
+        visualization.progress = []
+        self.assertTrue(visualization.generate_plots(silent=True))
+        self.assertEqual(1, visualization.prediction_refresh_count)
+        plt.close(visualization.figures[0])
+
+        visualization.manual_measurement_data = {"actual_load": actual_load}
+        incomplete_prediction = predicted_load.copy()
+        incomplete_prediction[5] = np.nan
+        visualization.display_prediction_to_generate = incomplete_prediction
+        visualization.progress = []
+        self.assertTrue(visualization.generate_plots(silent=True))
+        fallback_figure = visualization.figures[0]
+        fallback_axis = fallback_figure.axes[0]
+        try:
+            self.assertEqual(1, len(fallback_figure.axes))
+            fallback_labels = [line.get_label() for line in fallback_axis.lines]
+            self.assertIn("程序 MRR", fallback_labels)
+            self.assertNotIn("实际负载", fallback_labels)
+            fallback_fills = [
+                artist
+                for artist in fallback_axis.collections
+                if isinstance(artist, PolyCollection)
+            ]
+            np.testing.assert_allclose(
+                _fill_heights_at_x(
+                    fallback_fills,
+                    (
+                        process_result.point_labels["path_start"].to_numpy(dtype=float)
+                        + process_result.point_labels["path_end"].to_numpy(dtype=float)
+                    )
+                    * 0.5,
+                ),
+                np.maximum(
+                    process_result.point_labels["MRR_program"].to_numpy(dtype=float),
+                    0.0,
+                ),
+            )
+            self.assertEqual(0, len(fallback_axis.patches))
+            self.assertEqual(100, visualization.progress[-1][0])
+        finally:
+            plt.close(fallback_figure)
+
+        visualization._refresh_segmentation_sample_projection = (
+            lambda **kwargs: [dict(record) for record in mapping_records]
+        )
+        with TemporaryDirectory() as temporary_dir:
+            export_dir = Path(temporary_dir)
+            stale_projection = export_dir / "sample_projection.csv"
+            stale_overview = export_dir / "sample_overview.png"
+            stale_projection.write_text("旧投影", encoding="utf-8")
+            stale_overview.write_bytes(b"old-overview")
+            with self.assertRaisesRegex(ValueError, "预测负载"):
+                visualization.export_latest_segmentation_result(
+                    process_result,
+                    export_dir,
+                )
+            self.assertFalse(stale_projection.exists())
+            self.assertFalse(stale_overview.exists())
+            self.assertTrue((export_dir / "point_labels.csv").exists())
+            self.assertTrue((export_dir / "intervals.csv").exists())
+            self.assertTrue((export_dir / "overview.png").exists())
+            self.assertTrue(
+                (export_dir / "sample_mapping_diagnostics.json").exists()
+            )
+
+        after_visualization_points, after_visualization_intervals = _result_shape(
+            process_result
+        )
+        self.assertEqual(before_signature, _process_signature(process_result))
+        pd.testing.assert_frame_equal(before_points, after_visualization_points)
+        pd.testing.assert_frame_equal(before_intervals, after_visualization_intervals)
+
+        boundary_figure, boundary_axis = plt.subplots()
+        try:
+            boundary_points = pd.DataFrame({
+                "path_start": [0.0, 1.0],
+                "path_end": [1.0, 11.0],
+                "s": [1.0, 11.0],
+                "MRR_program": [2.0, 4.0],
+                "segment_type": ["idle", "steady"],
+            })
+            plotter.draw_process_mrr_segmentation(
+                boundary_axis,
+                boundary_points,
+                [],
+            )
+            fills_by_label = {
+                artist.get_label(): artist
+                for artist in boundary_axis.collections
+                if isinstance(artist, PolyCollection)
+            }
+            idle_fill = next(
+                artist for label, artist in fills_by_label.items() if "[0]" in label
+            )
+            steady_fill = next(
+                artist for label, artist in fills_by_label.items() if "[2]" in label
+            )
+            self.assertAlmostEqual(
+                1.0,
+                float(np.max(idle_fill.get_paths()[0].vertices[:, 0])),
+            )
+            self.assertAlmostEqual(
+                1.0,
+                float(np.min(steady_fill.get_paths()[0].vertices[:, 0])),
+            )
+        finally:
+            plt.close(boundary_figure)
+
+        gap_figure, gap_axis = plt.subplots()
+        try:
+            gap_artists = plotter.draw_segmentation_curve_background(
+                gap_axis,
+                [0.0, 1.0, 2.0],
+                [1.0, np.nan, 1.0],
+                {"steady": np.ones(3, dtype=bool)},
+            )
+            gap_paths = gap_artists[0].get_paths()
+            self.assertEqual(2, len(gap_paths))
+            self.assertAlmostEqual(
+                0.5,
+                float(np.max(gap_paths[0].vertices[:, 0])),
+            )
+            self.assertAlmostEqual(
+                1.5,
+                float(np.min(gap_paths[1].vertices[:, 0])),
+            )
+        finally:
+            plt.close(gap_figure)
+
+
+if __name__ == "__main__":
+    unittest.main()

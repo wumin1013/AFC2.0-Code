@@ -107,7 +107,7 @@ class BootstrapUiMixin:
         self.input_file_paths = []
         self.merged_input_file_path = ""
         self.input_file_count_var = tk.StringVar(value="")
-        # 新流程：SampleData 导入后由用户手动绑定工艺信息表
+        # 工艺信息和实际采样独立导入；工艺信息可以先行划分。
         self.sample_bundle_path_var = tk.StringVar(value="")
         self.matched_process_file_var = tk.StringVar(value="未绑定工艺信息表")
         self.program_process_file_map = {}
@@ -145,7 +145,8 @@ class BootstrapUiMixin:
         self.sigma_idle_var = tk.StringVar(value="未计算")
         self.delta_mrr_var = tk.StringVar(value="未计算")
         self.steady_gate_status_var = tk.StringVar(value="稳态门控: 未计算")
-        self.segmentation_status_var = tk.StringVar(value="全行程六类划分: 未运行")
+        self.segmentation_status_var = tk.StringVar(value="过程域六类划分: 未运行")
+        self.sample_mapping_status_var = tk.StringVar(value="采样映射: 未导入实际采样文件")
         self.model_detail_collapsed = tk.BooleanVar(value=True)
         self.model_detail_toggle_text = tk.StringVar(value="展开详情")
         self.interval_detail_collapsed = tk.BooleanVar(value=True)
@@ -181,6 +182,10 @@ class BootstrapUiMixin:
         self._current_interval_prediction_source = "no_profile"
         self._current_interval_measurement_case_signature = ""
         self._profile_intervals_locked = False
+        self._current_process_signature = ""
+        self._current_mapping_signature = ""
+        self._sample_mapping_status = "not_available"
+        self._segmentation_sample_projection_records = []
         self._ideal_tree_interval_payloads = {}
         self._selected_interval_detail_item = ""
         self.pit_records = []
@@ -254,7 +259,8 @@ class BootstrapUiMixin:
         self.sample_display_mode = tk.StringVar(value="tool")  # 只使用tool模式（程序名+刀具号）
         self.sample_plot_mode = tk.StringVar(value="overlay")  # overlay/stacked
         self.process_axis_mode = tk.StringVar(value="时域+指令域")  # 时域+指令域/行程域+指令域
-        self.preview_plot_max_points = 0  # 0=预览不压缩，始终全量显示
+        # 长程序预览使用保留极值的抽稀上限；保存/导出仍使用全量点。
+        self.preview_plot_max_points = 60000
         self.show_measured_curve_var = tk.BooleanVar(value=True)
         self.show_reconstructed_curve_var = tk.BooleanVar(value=True)
         self.show_feed_overlay_var = tk.BooleanVar(value=False)
@@ -1074,6 +1080,19 @@ class BootstrapUiMixin:
             sticky="w",
             pady=(6, 0),
         )
+        self.sample_mapping_status_label = ttk.Label(
+            interval_frame,
+            textvariable=self.sample_mapping_status_var,
+            font=UI_FONT_SMALL,
+            foreground=UI_COLOR_TEXT_MUTED,
+        )
+        self.sample_mapping_status_label.grid(
+            row=3,
+            column=0,
+            columnspan=8,
+            sticky="w",
+            pady=(2, 0),
+        )
 
         # 默认选择叠加显示
         self.overlay_btn.state(['pressed'])
@@ -1146,9 +1165,7 @@ class BootstrapUiMixin:
         self.sample_control_widgets.append(self.show_ae_overlay_btn)
         self.sample_control_widgets.append(self.sample_program_combo)
         self.sample_control_widgets.append(self.sample_tool_combo)
-        self.sample_control_widgets.append(self.run_segmentation_btn)
-        self.sample_control_widgets.append(self.choose_process_btn)
-        self.sample_control_widgets.append(self.export_i_code_btn)
+        # 过程域按钮不属于实测控件组，不得因未导入实测而禁用。
         if hasattr(self, "_refresh_import_order_controls"):
             self._refresh_import_order_controls()
 

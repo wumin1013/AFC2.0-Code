@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import threading
 
 from .segmentation import RuleSegmentScorer, SegmentationConfig, SegmentationPipeline
@@ -103,9 +104,6 @@ class AcademicWorkbenchMixin:
                     "ap": row.get("ap"),
                     "ae": row.get("ae"),
                     "F_program": row.get("feed_effective"),
-                    # 预测功率只承担 idle 硬门控；其余五态仍只使用重算 MRR。
-                    "P_pred": row.get("P"),
-                    "P_idle": row.get("P_idle"),
                 }
             )
         return pd.DataFrame.from_records(rows)
@@ -155,26 +153,6 @@ class AcademicWorkbenchMixin:
             end_pos = int(row.get("end_idx", start_pos))
             start_point = point_labels.iloc[start_pos]
             end_point = point_labels.iloc[end_pos]
-            interval_points = point_labels.iloc[start_pos:end_pos + 1]
-            process_rows = []
-            for value in interval_points["source_index"]:
-                try:
-                    process_index = int(value)
-                except (TypeError, ValueError):
-                    continue
-                if 0 <= process_index < len(self.data) and isinstance(self.data[process_index], dict):
-                    process_rows.append(self.data[process_index])
-
-            def _mean_process_value(key, default=0.0):
-                values = []
-                for process_row in process_rows:
-                    try:
-                        value = float(process_row.get(key))
-                    except (TypeError, ValueError):
-                        continue
-                    if np.isfinite(value):
-                        values.append(value)
-                return float(np.mean(values)) if values else float(default)
 
             start_source_index = int(row.get("start_source_index", start_point["source_index"]))
             end_source_index = int(row.get("end_source_index", end_point["source_index"]))
@@ -207,12 +185,13 @@ class AcademicWorkbenchMixin:
                     "display_start_x": display_start_x,
                     "display_end_x": display_end_x,
                     "sample_count": int(row.get("point_count", end_pos - start_pos + 1)),
-                    # 仅补齐旧运行时/导出消费者需要的描述字段；这些值不参与六态评分。
+                    # 仅补齐旧运行时消费者需要的字段。过程域六态结果不再
+                    # 携带预测模型或实测辨识量，避免显示层误把它们当作判据。
                     "a_p": float(row.get("ap_mean", 0.0) or 0.0),
                     "a_e": float(row.get("ae_mean", 0.0) or 0.0),
                     "F_plan": float(row.get("F_program_mean", 0.0) or 0.0),
-                    "p_idle": _mean_process_value("P_idle", 0.0),
-                    "p_pred": _mean_process_value("P", 0.0),
+                    "p_idle": float("nan"),
+                    "p_pred": float("nan"),
                     "segment_type": segment_type,
                     "state_code": int(row.get("state_code")),
                     "steady_pass": segment_type == "steady",
@@ -231,6 +210,144 @@ class AcademicWorkbenchMixin:
         if sample_lines.size == 0:
             raise ValueError("实际负载文件没有可用的程序行号通道")
         return sample_lines
+
+    @staticmethod
+    def _update_segmentation_digest_with_array(digest, name, values):
+        """把已解析数组稳定写入签名，避免使用文件路径或对象地址。"""
+
+        array = np.asarray(values)
+        digest.update(str(name).encode("utf-8"))
+        digest.update(str(tuple(array.shape)).encode("ascii"))
+        digest.update(str(array.dtype).encode("ascii", errors="ignore"))
+        if array.dtype.kind == "O":
+            hashed = pd.util.hash_array(
+                array.reshape(-1),
+                categorize=True,
+            ).astype(np.uint64, copy=False)
+            digest.update(memoryview(np.ascontiguousarray(hashed)).cast("B"))
+            return
+        contiguous = np.ascontiguousarray(array)
+        digest.update(memoryview(contiguous).cast("B"))
+
+    def _get_current_segmentation_process_signature(self):
+        signature = str(getattr(self, "_current_process_signature", "") or "")
+        if signature:
+            return signature
+        result = getattr(self, "_latest_segmentation_result", None)
+        diagnostics = getattr(result, "diagnostics", None)
+        if not isinstance(diagnostics, dict):
+            return ""
+        signature = str(diagnostics.get("process_signature") or "")
+        if not signature:
+            repeat = dict(diagnostics.get("repeat_run_consistency") or {})
+            signature = str(repeat.get("input_signature") or "")
+        return signature
+
+    def _build_segmentation_mapping_signature(self):
+        """建立只属于采样投影的签名，不反向污染过程域签名。"""
+
+        process_signature = self._get_current_segmentation_process_signature()
+        if not process_signature:
+            return ""
+        if not bool(getattr(self, "sample_data_loaded", False)):
+            return ""
+        sample_lines = np.asarray(
+            getattr(self, "sample_data_line_numbers_raw", None)
+            if getattr(self, "sample_data_line_numbers_raw", None) is not None
+            else getattr(self, "sample_data_line_numbers", []),
+        )
+        sample_values = np.asarray(
+            getattr(self, "sample_data_values_raw", None)
+            if getattr(self, "sample_data_values_raw", None) is not None
+            else getattr(self, "sample_data_values", []),
+        )
+        program_numbers = np.asarray(
+            getattr(self, "sample_data_program_numbers_raw", None)
+            if getattr(self, "sample_data_program_numbers_raw", None) is not None
+            else getattr(self, "sample_data_program_numbers", []),
+        )
+        if sample_lines.size == 0:
+            return ""
+        digest = hashlib.sha256()
+        digest.update(b"process-to-sample-line-point-v2")
+        digest.update(process_signature.encode("ascii", errors="ignore"))
+        digest.update(str(getattr(self, "sample_data_mode", "") or "").encode("utf-8"))
+        self._update_segmentation_digest_with_array(digest, "program_line", sample_lines)
+        self._update_segmentation_digest_with_array(digest, "program_number", program_numbers)
+        self._update_segmentation_digest_with_array(digest, "sample_values", sample_values)
+        return digest.hexdigest()
+
+    def _set_segmentation_mapping_status(
+        self,
+        status,
+        *,
+        reason="",
+        signature="",
+        projected_records=None,
+    ):
+        status = str(status or "pending")
+        reason = str(reason or "")
+        self._sample_mapping_status = status
+        self._current_mapping_signature = str(signature or "")
+        records = [
+            dict(record)
+            for record in (projected_records or [])
+            if isinstance(record, dict)
+        ]
+        if status == "valid":
+            self._segmentation_sample_projection_records = records
+        else:
+            self._segmentation_sample_projection_records = []
+
+        status_text = {
+            "not_available": "采样映射: 未导入实际采样文件",
+            "pending": "采样映射: 待建立",
+            "valid": f"采样映射: 成功（{len(records)} 段）",
+            "failed": f"采样映射: 失败（{reason or '未知原因'}）",
+        }.get(status, f"采样映射: {status}")
+        status_var = getattr(self, "sample_mapping_status_var", None)
+        if status_var is not None and hasattr(status_var, "set"):
+            status_var.set(status_text)
+
+        result = getattr(self, "_latest_segmentation_result", None)
+        diagnostics = getattr(result, "diagnostics", None)
+        if isinstance(diagnostics, dict):
+            if status == "valid" and records:
+                covered_count = int(sum(
+                    int(record.get("sample_count", 0) or 0)
+                    for record in records
+                ))
+                sample_lines = getattr(self, "sample_data_line_numbers", None)
+                sample_count = int(len(sample_lines)) if sample_lines is not None else 0
+                diagnostics["sample_projection"] = {
+                    "valid": True,
+                    "status": status,
+                    "coordinate_domain": "sample",
+                    "process_signature": self._get_current_segmentation_process_signature(),
+                    "mapping_signature": self._current_mapping_signature,
+                    "sample_count": sample_count,
+                    "projected_interval_count": int(len(records)),
+                    "covered_sample_count": covered_count,
+                    "coverage_rate": (
+                        float(covered_count / sample_count) if sample_count else 0.0
+                    ),
+                    "projected_sample_start_idx": int(records[0]["sample_start_idx"]),
+                    "projected_sample_end_idx": int(records[-1]["sample_end_idx"]),
+                    "mapping_source": "program_line_and_point_order",
+                }
+            else:
+                diagnostics["sample_projection"] = {
+                    "valid": False,
+                    "status": status,
+                    "coordinate_domain": "sample",
+                    "process_signature": self._get_current_segmentation_process_signature(),
+                    "mapping_signature": self._current_mapping_signature,
+                    "reason": reason,
+                }
+        refresh_export_state = getattr(self, "_refresh_segmentation_export_controls", None)
+        if callable(refresh_export_state):
+            refresh_export_state()
+        return status
 
     def _materialize_segmentation_sample_bounds(self, records):
         """按过程边界把六态结果投影为实际负载的零基采样区间。"""
@@ -363,7 +480,10 @@ class AcademicWorkbenchMixin:
             local_cuts[1:],
         ):
             if local_end <= local_start:
-                continue
+                interval_id = record.get("interval_id") or record.get("zone_id") or "未知区间"
+                raise ValueError(
+                    f"过程区间 {interval_id} 没有对应的实际采样点，映射不完整"
+                )
             start_idx = block_start + int(local_start)
             end_idx = block_start + int(local_end) - 1
             if not (0 <= start_idx <= end_idx < sample_lines.size):
@@ -392,29 +512,12 @@ class AcademicWorkbenchMixin:
                 }
             )
 
-            if (
-                materialized
-                and int(materialized[-1].get("state_code")) == int(current.get("state_code"))
-                and int(materialized[-1]["sample_end_idx"]) + 1 == start_idx
-            ):
-                previous = materialized[-1]
-                previous.update(
-                    {
-                        "sample_end_idx": end_idx,
-                        "sample_end_line": end_line,
-                        "sample_end_point_index": end_point,
-                        "sample_end_label": end_label,
-                        "sample_interval_range": (
-                            f"{previous['sample_start_label']}-{end_label}"
-                        ),
-                        "sample_count": end_idx - int(previous["sample_start_idx"]) + 1,
-                    }
-                )
-            else:
-                materialized.append(current)
+            materialized.append(current)
 
         if not materialized:
             raise ValueError("六态过程范围内没有可导出的实际负载采样区间")
+        if len(materialized) != len(process_records):
+            raise ValueError("实际采样映射没有保持过程区间一一对应")
 
         expected_start = block_start + int(local_domain_start)
         expected_end = block_start + int(local_domain_end) - 1
@@ -437,15 +540,98 @@ class AcademicWorkbenchMixin:
             raise ValueError("实际采样区间未完整覆盖匹配的过程范围")
         return materialized
 
-    def _get_authoritative_segmentation_sample_records(self):
-        """为样本级消费者统一生成当前六态结果的批量投影。"""
-        if not bool(
+    def _refresh_segmentation_sample_projection(self, *, refresh_view=False, silent=True):
+        """只刷新采样投影；无论成功与否都不重新运行过程域分类。"""
+
+        authoritative = bool(
             getattr(self, "_current_interval_ready", False)
             and str(getattr(self, "_current_interval_source", "") or "") == "segmentation"
+        )
+        if not authoritative:
+            self._set_segmentation_mapping_status(
+                "pending",
+                reason="尚无有效过程域划分",
+            )
+            return None
+        if not bool(getattr(self, "sample_data_loaded", False)):
+            self._set_segmentation_mapping_status(
+                "not_available",
+                reason="尚未导入实际采样文件",
+            )
+            return None
+
+        mapping_signature = self._build_segmentation_mapping_signature()
+        if not mapping_signature:
+            self._set_segmentation_mapping_status(
+                "failed",
+                reason="无法建立采样内容签名",
+            )
+            return None
+        if (
+            str(getattr(self, "_sample_mapping_status", "") or "") == "valid"
+            and str(getattr(self, "_current_mapping_signature", "") or "")
+            == mapping_signature
         ):
-            return []
+            cached_records = [
+                dict(record)
+                for record in (
+                    getattr(self, "_segmentation_sample_projection_records", []) or []
+                )
+                if isinstance(record, dict)
+            ]
+            if cached_records:
+                return cached_records
+
         runtime_records = self._get_current_interval_records(allow_profile_fallback=False)
-        return self._materialize_segmentation_sample_bounds(runtime_records)
+        try:
+            projected_records = self._materialize_segmentation_sample_bounds(runtime_records)
+        except Exception as exc:
+            self._authoritative_segmentation_sample_lookup_cache = None
+            self._set_segmentation_mapping_status(
+                "failed",
+                reason=str(exc),
+                signature=mapping_signature,
+            )
+            if not silent:
+                messagebox.showwarning("采样映射失败", str(exc))
+            return None
+
+        self._authoritative_segmentation_sample_lookup_cache = None
+        self._set_segmentation_mapping_status(
+            "valid",
+            signature=mapping_signature,
+            projected_records=projected_records,
+        )
+        if refresh_view and hasattr(self, "generate_plots"):
+            try:
+                self.generate_plots(
+                    save=False,
+                    silent=silent,
+                    interval_policy="reuse_current_template",
+                    refresh_prediction=False,
+                )
+            except Exception as exc:
+                if not silent:
+                    messagebox.showwarning("实际负载叠图失败", str(exc))
+        return [dict(record) for record in projected_records]
+
+    def _get_authoritative_segmentation_sample_records(self):
+        """为样本级消费者返回当前过程结果的采样投影副本。"""
+        records = self._refresh_segmentation_sample_projection(
+            refresh_view=False,
+            silent=True,
+        )
+        if records is None:
+            result = getattr(self, "_latest_segmentation_result", None)
+            diagnostics = getattr(result, "diagnostics", None)
+            projection = (
+                dict(diagnostics.get("sample_projection") or {})
+                if isinstance(diagnostics, dict)
+                else {}
+            )
+            reason = str(projection.get("reason") or "采样映射无效")
+            raise ValueError(reason)
+        return [dict(record) for record in records]
 
     def _validate_segmentation_prediction_payload_arrays(self, payload):
         """验证样本预测数组及其程序行序列，并返回统一的一维数组。"""
@@ -754,8 +940,10 @@ class AcademicWorkbenchMixin:
         raise ValueError(last_reason or "无法建立同源预测上下文")
 
     def _invalidate_segmentation_sample_projection(self, reason=""):
-        """实际采样上下文变化时清除旧投影诊断和固定导出。"""
+        """实际采样上下文变化时只清除映射，不触碰过程域划分。"""
         self._authoritative_segmentation_sample_lookup_cache = None
+        self._segmentation_sample_projection_records = []
+        self._current_mapping_signature = ""
         result = getattr(self, "_latest_segmentation_result", None)
         diagnostics = getattr(result, "diagnostics", None)
         if isinstance(diagnostics, dict):
@@ -764,14 +952,21 @@ class AcademicWorkbenchMixin:
         cleaner = getattr(self, "_clear_segmentation_output_artifacts", None)
         if callable(cleaner):
             try:
-                cleaner()
+                cleaner(scope="mapping")
+            except TypeError:
+                # 兼容尚未拆分 scope 的外部 mixin；此时宁可保留旧文件，
+                # 也不能误删仍然有效的过程域导出。
+                pass
             except OSError as exc:
-                if hasattr(self, "segmentation_status_var"):
-                    self.segmentation_status_var.set(f"六类采样投影已失效，旧导出清理失败（{exc}）")
+                status_var = getattr(self, "sample_mapping_status_var", None)
+                if status_var is not None and hasattr(status_var, "set"):
+                    status_var.set(f"采样映射已失效，旧映射导出清理失败（{exc}）")
                 return False
-        if hasattr(self, "segmentation_status_var"):
-            suffix = f"（{reason}）" if reason else ""
-            self.segmentation_status_var.set(f"全行程六类划分: 采样投影待重建{suffix}")
+        next_status = (
+            "pending" if bool(getattr(self, "sample_data_loaded", False))
+            else "not_available"
+        )
+        self._set_segmentation_mapping_status(next_status, reason=str(reason or ""))
         return True
 
     def run_full_path_segmentation(
@@ -807,48 +1002,13 @@ class AcademicWorkbenchMixin:
 
         self._segmentation_running = True
         try:
-            prediction_payload, process_prediction_context = (
-                self._prepare_segmentation_prediction_context()
-            )
-            prediction_policy = dict(
-                prediction_payload.get("segmentation_prediction_policy") or {}
-            )
-            if not bool(prediction_policy.get("allowed", False)):
-                raise ValueError(
-                    "六态划分缺少可追溯的预测负载来源；请先生成临时反向"
-                    "辨识预测或加载可用 profile"
-                )
             if hasattr(self, "segmentation_status_var"):
-                self.segmentation_status_var.set("全行程六类划分: 正在计算…")
+                self.segmentation_status_var.set("过程域六类划分: 正在重算 MRR 与特征…")
+            if hasattr(self, "set_progress"):
+                self.set_progress(62, "正在重算程序 MRR 与过程域特征...")
             input_frame = self._build_segmentation_input_frame()
             if input_frame.empty:
                 raise ValueError("没有可用于六态划分的原始工艺点")
-            process_predicted = pd.to_numeric(
-                input_frame.get("P_pred"),
-                errors="coerce",
-            ).to_numpy(dtype=float)
-            process_idle = pd.to_numeric(
-                input_frame.get("P_idle"),
-                errors="coerce",
-            ).to_numpy(dtype=float)
-            if (
-                process_predicted.size != len(input_frame)
-                or process_idle.size != len(input_frame)
-                or not np.all(np.isfinite(process_predicted))
-                or not np.all(np.isfinite(process_idle))
-            ):
-                raise ValueError("过程域 P_pred/P_idle 缺失或包含非有限值")
-            synced_row_count = int(
-                process_prediction_context.get("row_count", 0) or 0
-            )
-            if (
-                str(getattr(self, "sample_data_mode", "") or "").strip()
-                == "experiment_measurement"
-                and synced_row_count != len(input_frame)
-            ):
-                raise ValueError(
-                    "过程域预测同步点数与有效 ProcessInfo 点数不一致"
-                )
             config = (
                 getattr(self, "segmentation_config", None)
                 or getattr(self, "_segmentation_config", None)
@@ -861,6 +1021,8 @@ class AcademicWorkbenchMixin:
             if not isinstance(pipeline, SegmentationPipeline) or pipeline.config is not config:
                 pipeline = SegmentationPipeline(config)
                 self.segmentation_pipeline = pipeline
+            if hasattr(self, "set_progress"):
+                self.set_progress(72, "正在执行六态过程域划分...")
             result = pipeline.run(
                 input_frame,
                 scorer=RuleSegmentScorer(config),
@@ -912,22 +1074,36 @@ class AcademicWorkbenchMixin:
                     "mrr_formula": "MRR_program = ap * ae * F_program / 60",
                     "input_mrr_columns_ignored": True,
                     "program_line_matching": line_matching,
-                    "segmentation_prediction_policy": dict(prediction_policy),
-                    "segmentation_prediction_source": str(
-                        prediction_policy.get("source") or "unknown"
-                    ),
-                    "segmentation_prediction_independent": bool(
-                        prediction_policy.get("independent", False)
-                    ),
-                    "segmentation_temporary_measurement_mode": bool(
-                        prediction_policy.get("temporary_measurement_mode", False)
-                    ),
-                    "segmentation_process_prediction": dict(
-                        process_prediction_context
-                    ),
+                    "classification_domain": "process_info",
+                    "classification_uses_actual_sample": False,
+                    "classification_uses_prediction_profile": False,
                 }
             )
             diagnostics = dict(result.diagnostics or {})
+            fallback_used = bool(diagnostics.get("fallback_used", False))
+            fallback_scope = str(diagnostics.get("fallback_scope") or "none")
+            fallback_validated = bool(
+                diagnostics.get("fallback_validated", not fallback_used)
+            )
+            if fallback_used and not (
+                fallback_scope == "local_verified" and fallback_validated
+            ):
+                fallback_reason = str(
+                    diagnostics.get("fallback_reason") or "未知解码错误"
+                )
+                if export_outputs and hasattr(
+                    self,
+                    "export_segmentation_failure_diagnostics",
+                ):
+                    try:
+                        self.export_segmentation_failure_diagnostics(result)
+                    except Exception as export_exc:
+                        result.diagnostics[
+                            "failure_diagnostics_export_error"
+                        ] = str(export_exc)
+                raise ValueError(
+                    f"解码失败/已回退（{fallback_scope}）：{fallback_reason}"
+                )
             if (
                 float(diagnostics.get("coverage_rate", 0.0)) != 1.0
                 or int(diagnostics.get("gap_count", -1)) != 0
@@ -935,80 +1111,55 @@ class AcademicWorkbenchMixin:
                 or int(diagnostics.get("illegal_transition_count", -1)) != 0
                 or not bool(diagnostics.get("postprocess_validation_passed", False))
             ):
-                raise ValueError("六态划分未满足全覆盖、功率门控或状态结构约束")
+                raise ValueError("六态划分未满足全覆盖、工艺空载门控或状态结构约束")
 
             runtime_records = self._adapt_segmentation_interval_records(result)
-            if bool(getattr(self, "sample_data_loaded", False)):
-                try:
-                    projected_records = self._materialize_segmentation_sample_bounds(runtime_records)
-                    projection_start = int(projected_records[0]["sample_start_idx"])
-                    projection_end = int(projected_records[-1]["sample_end_idx"])
-                    result.diagnostics["sample_projection"] = {
-                        "valid": True,
-                        "sample_count": int(len(self.sample_data_line_numbers)),
-                        "projected_interval_count": int(len(projected_records)),
-                        "covered_sample_count": int(sum(
-                            int(record.get("sample_count", 0) or 0)
-                            for record in projected_records
-                        )),
-                        "projected_sample_start_idx": projection_start,
-                        "projected_sample_end_idx": projection_end,
-                        "projected_start_label": str(
-                            projected_records[0].get("sample_start_label") or ""
-                        ),
-                        "projected_end_label": str(
-                            projected_records[-1].get("sample_end_label") or ""
-                        ),
-                        "coordinate_base": 0,
-                    }
-                except Exception as projection_exc:
-                    result.diagnostics["sample_projection"] = {
-                        "valid": False,
-                        "reason": str(projection_exc),
-                    }
-            prediction_source = (
-                self._get_prediction_source()
-                if hasattr(self, "_get_prediction_source") else "no_profile"
-            )
-            context_signature = str(
-                process_prediction_context.get("prediction_context") or ""
-            )
-            if not context_signature:
-                context_signature = (
-                    self._build_prediction_context_signature(
-                        prediction_source=prediction_source,
-                        measurement=getattr(self, "manual_measurement_data", None),
-                    )
-                    if hasattr(self, "_build_prediction_context_signature") else ""
+            result_diagnostics = dict(result.diagnostics or {})
+            process_signature = str(result_diagnostics.get("process_signature") or "")
+            if not process_signature:
+                repeat_diagnostics = dict(
+                    result_diagnostics.get("repeat_run_consistency") or {}
                 )
-            measurement_signature = (
-                self._get_current_measurement_case_signature()
-                if hasattr(self, "_get_current_measurement_case_signature") else ""
-            )
+                process_signature = str(
+                    repeat_diagnostics.get("input_signature") or ""
+                )
+            if not process_signature:
+                raise ValueError("过程域划分缺少可追溯的 process_signature")
+            result.diagnostics["process_signature"] = process_signature
+            result.diagnostics["coordinate_domain"] = "process_info"
+            self._current_process_signature = process_signature
             self._set_current_interval_state(
                 interval_records=runtime_records,
                 segment_records=[dict(record) for record in runtime_records],
                 point_kc_map={},
                 source="segmentation",
                 profile_locked=False,
-                context_signature=context_signature,
-                prediction_source=prediction_source,
-                measurement_case_signature=measurement_signature,
+                context_signature=process_signature,
+                prediction_source="process_info",
+                measurement_case_signature="",
             )
             self._latest_segmentation_result = result
+            self._invalidate_segmentation_sample_projection(reason="过程域划分已更新")
+            if bool(getattr(self, "sample_data_loaded", False)):
+                if hasattr(self, "set_progress"):
+                    self.set_progress(86, "过程域划分完成，正在建立实际采样映射...")
+                self._refresh_segmentation_sample_projection(
+                    refresh_view=False,
+                    silent=True,
+                )
             self.target_load_curve = []
             diagnostics_path = diagnostics.get("path", {})
             path_source = str(diagnostics_path.get("source") or "unknown")
             if hasattr(self, "segmentation_status_var"):
-                temporary_suffix = (
-                    f"，临时预测来源 {prediction_policy.get('source')}"
-                    if bool(prediction_policy.get("temporary_measurement_mode", False))
+                fallback_suffix = (
+                    "，已验证局部回退"
+                    if fallback_used and fallback_scope == "local_verified"
                     else ""
                 )
                 self.segmentation_status_var.set(
-                    f"全行程六类划分: {len(result.point_labels)} 点 / "
+                    f"过程域六类划分: {len(result.point_labels)} 点 / "
                     f"{len(result.intervals)} 段，行程来源 {path_source}"
-                    f"{temporary_suffix}"
+                    f"{fallback_suffix}"
                 )
         except Exception as exc:
             if hasattr(self, "segmentation_status_var"):
@@ -1030,23 +1181,17 @@ class AcademicWorkbenchMixin:
 
         if refresh_view and hasattr(self, "generate_plots"):
             try:
+                if hasattr(self, "set_progress"):
+                    self.set_progress(94, "正在生成过程域图表与可用的实际负载叠图...")
                 self.generate_plots(
                     save=False,
                     silent=silent,
                     interval_policy="reuse_current_template",
+                    refresh_prediction=False,
                 )
             except Exception as exc:
                 if not silent:
                     messagebox.showwarning("六类结果刷新失败", str(exc))
-        if (
-            bool(prediction_policy.get("temporary_measurement_mode", False))
-            and hasattr(self, "segmentation_status_var")
-        ):
-            current_status = str(self.segmentation_status_var.get() or "").strip()
-            source_label = str(prediction_policy.get("source") or "unknown")
-            marker = f"临时预测来源 {source_label}"
-            if marker not in current_status:
-                self.segmentation_status_var.set(f"{current_status}｜{marker}")
         return result
 
     def _on_main_prediction_config_changed(self):

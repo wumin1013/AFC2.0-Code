@@ -115,10 +115,99 @@ def _confidence_level(margin: float, config: SegmentationConfig) -> str:
     return "low"
 
 
-def _frame_signature(frame: pd.DataFrame, config: SegmentationConfig) -> str:
+PROCESS_SIGNATURE_COLUMNS: Tuple[str, ...] = (
+    "source_index",
+    "path_start",
+    "path_end",
+    "line_id",
+    "line_no_raw",
+    "N_str",
+    "line_point_index",
+    "ap",
+    "ae",
+    "F_program",
+    "MRR_program",
+)
+
+# 过程域签名只纳入会改变六态边界的固定配置。功率兼容
+# 字段、置信度显示阈值以及候选评分批量大小均不属于分类输入。
+PROCESS_SIGNATURE_CONFIG_FIELDS: Tuple[str, ...] = (
+    "path_tolerance_mm",
+    "sequential_fallback_step_mm",
+    "mrr_cutting_epsilon",
+    "steady_mrr_relative_std_max",
+    "steady_mrr_relative_slope_max",
+    "steady_min_plateau_points",
+    "local_window_points",
+    "entry_peak_window_points",
+    "entry_peak_relative_tolerance",
+    "relative_change_threshold",
+    "mrr_change_abs_mm3_min",
+    "mrr_trend_relative_per_point",
+    "min_idle_reset_mm",
+    "min_idle_mm",
+    "min_entry_mm",
+    "min_steady_mm",
+    "min_transition_mm",
+    "min_nonsteady_mm",
+    "min_exit_mm",
+    "max_idle_mm",
+    "max_entry_mm",
+    "max_steady_mm",
+    "transition_ratio",
+    "min_transition_points",
+    "max_transition_mm",
+    "max_nonsteady_mm",
+    "max_exit_mm",
+    "short_duration_penalty",
+    "idle_match_weight",
+    "cutting_match_weight",
+    "stability_weight",
+    "variation_weight",
+    "boundary_context_weight",
+    "trend_weight",
+    "state_change_penalty",
+    "tie_epsilon",
+    "initial_states",
+    "terminal_states",
+)
+
+
+def _process_signature(frame: pd.DataFrame, config: SegmentationConfig) -> str:
+    """对权威工艺输入、重算 MRR 与算法版本生成稳定签名。"""
+
+    canonical = frame.loc[:, [
+        name for name in PROCESS_SIGNATURE_COLUMNS if name != "MRR_program"
+    ]].copy()
+    canonical["MRR_program"] = (
+        canonical["ap"].to_numpy(dtype=float)
+        * canonical["ae"].to_numpy(dtype=float)
+        * canonical["F_program"].to_numpy(dtype=float)
+        / 60.0
+    )
+    canonical = canonical.loc[:, list(PROCESS_SIGNATURE_COLUMNS)]
+    effective_config = {
+        name: getattr(config, name)
+        for name in PROCESS_SIGNATURE_CONFIG_FIELDS
+    }
+    algorithm = {
+        "input_schema_version": INPUT_SCHEMA_VERSION,
+        "config_schema_version": config.config_schema_version,
+        "rule_scorer_version": RULE_SCORER_VERSION,
+        "mrr_formula": "ap*ae*F_program/60",
+        "idle_rule": "not(ap>0 and ae>0 and F_program>0 and MRR_program>epsilon)",
+    }
     digest = hashlib.sha256()
-    digest.update(pd.util.hash_pandas_object(frame, index=True).to_numpy(dtype=np.uint64).tobytes())
-    digest.update(json.dumps(config.to_dict(), sort_keys=True, ensure_ascii=False).encode("utf-8"))
+    digest.update(
+        pd.util.hash_pandas_object(canonical, index=True)
+        .to_numpy(dtype=np.uint64)
+        .tobytes()
+    )
+    digest.update(json.dumps(
+        {"algorithm": algorithm, "config": effective_config},
+        sort_keys=True,
+        ensure_ascii=False,
+    ).encode("utf-8"))
     return digest.hexdigest()
 
 
@@ -166,6 +255,110 @@ def _decoded_coverage_valid(
         previous_end_atom = segment.end_atom
         previous_end_idx = segment.end_idx
     return True
+
+
+def _entry_peak_records(features: pd.DataFrame) -> List[Dict[str, object]]:
+    """生成每个加工阶段唯一的进刀边界诊断。"""
+
+    if features.empty or "machining_segment_id" not in features:
+        return []
+    segment_ids = features["machining_segment_id"].to_numpy(dtype=np.int32)
+    segment_end_indices = features[
+        "machining_segment_end_idx"
+    ].to_numpy(dtype=np.int32)
+    entry_start_indices = features[
+        "machining_entry_start_idx"
+    ].to_numpy(dtype=np.int32)
+    entry_peak_indices = features[
+        "machining_entry_peak_idx"
+    ].to_numpy(dtype=np.int32)
+    peak_plateau_start_indices = features[
+        "machining_entry_peak_plateau_start_idx"
+    ].to_numpy(dtype=np.int32)
+    peak_plateau_end_indices = features[
+        "machining_entry_peak_plateau_end_idx"
+    ].to_numpy(dtype=np.int32)
+    entry_peak_mrr_values = features[
+        "machining_entry_peak_mrr"
+    ].to_numpy(dtype=float)
+    entry_peak_methods = features[
+        "machining_entry_peak_method"
+    ].to_numpy(dtype=object)
+    selected_entry_end_indices = features[
+        "selected_entry_end_idx"
+    ].to_numpy(dtype=np.int32)
+    first_steady_indices = features[
+        "machining_first_steady_idx"
+    ].to_numpy(dtype=np.int32)
+    entry_required_values = features["entry_required"].to_numpy(dtype=bool)
+    entry_boundary_values = features[
+        "entry_boundary_candidate"
+    ].to_numpy(dtype=bool)
+    starts = np.flatnonzero(
+        (segment_ids > 0)
+        & np.concatenate(([True], segment_ids[1:] != segment_ids[:-1]))
+    )
+    records: List[Dict[str, object]] = []
+    for segment_start in starts:
+        segment_start = int(segment_start)
+        segment_end = int(segment_end_indices[segment_start])
+        entry_start = int(entry_start_indices[segment_start])
+        peak_idx = int(entry_peak_indices[segment_start])
+        plateau_start = int(peak_plateau_start_indices[segment_start])
+        plateau_end = int(peak_plateau_end_indices[segment_start])
+        peak_mrr = float(entry_peak_mrr_values[segment_start])
+        peak_method = str(entry_peak_methods[segment_start])
+        selected_end = int(selected_entry_end_indices[segment_start])
+        steady_start = int(first_steady_indices[segment_start])
+        entry_required = bool(
+            entry_start >= 0
+            and selected_end >= entry_start
+            and np.all(entry_required_values[entry_start:selected_end + 1])
+        )
+        if peak_method == "local_turning_point":
+            local_peak_idx = peak_idx if peak_idx >= 0 else None
+            fallback_peak_idx = None
+        else:
+            local_peak_idx = None
+            fallback_peak_idx = (
+                peak_idx
+                if peak_method == "stage_first_max_fallback" and peak_idx >= 0
+                else None
+            )
+        records.append({
+            "machining_segment_id": int(segment_ids[segment_start]),
+            "segment_start_idx": segment_start,
+            "segment_end_idx": segment_end,
+            "entry_start_idx": entry_start if entry_start >= 0 else None,
+            "local_peak_idx": local_peak_idx,
+            "fallback_peak_idx": fallback_peak_idx,
+            "local_peak_mrr": peak_mrr if np.isfinite(peak_mrr) else None,
+            "local_peak_method": peak_method,
+            "peak_plateau_start_idx": (
+                plateau_start if plateau_start >= 0 else None
+            ),
+            "peak_plateau_end_idx": plateau_end if plateau_end >= 0 else None,
+            "first_steady_start_idx": steady_start if steady_start >= 0 else None,
+            "selected_entry_end_idx": (
+                selected_end
+                if entry_start >= 0 and selected_end >= entry_start - 1
+                else None
+            ),
+            # 兼容旧诊断消费方；字段值现在表示最终进刀终点，
+            # 不再必然等于局部峰值。
+            "selected_peak_idx": (
+                selected_end if entry_required else None
+            ),
+            "entry_required": entry_required,
+            "entry_is_empty": bool(
+                entry_start >= 0 and selected_end == entry_start - 1
+            ),
+            "entry_follows_qualified_idle": bool(
+                entry_start >= 0
+                and bool(entry_boundary_values[entry_start])
+            ),
+        })
+    return records
 
 
 class SegmentationPipeline:
@@ -237,6 +430,21 @@ class SegmentationPipeline:
             "strict_platform_partition_violation_count": 0,
             "strict_transition_semantics_valid": True,
             "steady_anchor_candidate_point_count": 0,
+            "steady_anchor_candidate_interval_count": 0,
+            "steady_anchor_run_count": 0,
+            "steady_anchor_run_records": [],
+            "steady_anchor_local_fallback_records": [],
+            "steady_anchor_unreachable_run_count": 0,
+            "steady_candidate_batch_count": 0,
+            "max_segment_atoms_role": "candidate_scoring_batch_size",
+            "entry_precedence_anchor_excluded_point_count": 0,
+            "entry_peak_records": [],
+            "entry_expected_interval_count": 0,
+            "entry_missing_interval_count": 0,
+            "entry_peak_boundary_violation_count": 0,
+            "transition_overlaps_entry_count": 0,
+            "transition_before_entry_peak_count": 0,
+            "steady_precedence_entry_clipped_point_count": 0,
             "steady_platform_slope_rejected_point_count": 0,
             "steady_interval_count_before_normalization": 0,
             "steady_reclassified_count": 0,
@@ -269,13 +477,20 @@ class SegmentationPipeline:
             "mrr_formula": "MRR_program = ap * ae * F_program / 60",
             "input_mrr_columns_ignored": True,
             "input_schema_version": self.config.input_schema_version,
+            "process_signature": None,
             "config": self.config.to_dict(),
             "path": path.to_dict(),
             "fallback_used": False,
+            "fallback_scope": "none",
+            "fallback_validated": True,
+            "fallback_reason": "",
+            "fallback_interval_records": [],
+            "preserved_strict_steady_interval_count": 0,
             "repeat_run_consistency": {
                 "deterministic": True,
                 "comparable_to_previous": False,
                 "matches_previous": None,
+                "process_signature": None,
                 "input_signature": None,
                 "result_signature": _result_signature(intervals),
             },
@@ -498,6 +713,7 @@ class SegmentationPipeline:
         normalization_diagnostics = {
             **steady_diagnostics,
             **transition_diagnostics,
+            **dict(raw_decoded.diagnostics or {}),
             "decoded_interval_count_before_normalization": int(len(raw_decoded.segments)),
             "normalization_merge_count": int(
                 steady_diagnostics["steady_normalization_merge_count"]
@@ -552,11 +768,33 @@ class SegmentationPipeline:
             "provisional_steady_without_candidate_reclassified_count",
             int(steady_diagnostics.get("steady_without_core_reclassified_count", 0)),
         )
+        entry_peak_records = _entry_peak_records(features)
+        scorer_entry_records = {
+            int(record["machining_segment_id"]): dict(record)
+            for record in (
+                getattr(selected_scorer, "entry_boundary_records", []) or []
+            )
+            if record.get("machining_segment_id") is not None
+        }
+        for record in entry_peak_records:
+            scorer_record = scorer_entry_records.get(
+                int(record["machining_segment_id"])
+            )
+            if scorer_record:
+                record.update({
+                    "boundary_decision": scorer_record.get("decision"),
+                    "entry_is_empty": bool(
+                        scorer_record.get("entry_is_empty", False)
+                    ),
+                })
         decoded = DecodeResult(
             segments=normalized_segments,
             total_score=raw_decoded.total_score,
             used_fallback=raw_decoded.used_fallback,
             failure_reason=raw_decoded.failure_reason,
+            fallback_scope=raw_decoded.fallback_scope,
+            fallback_validated=raw_decoded.fallback_validated,
+            diagnostics=dict(raw_decoded.diagnostics or {}),
         )
         structural_coverage_valid = _decoded_coverage_valid(
             decoded.segments,
@@ -623,7 +861,7 @@ class SegmentationPipeline:
         point_labels["review_required"] = review_required
         point_labels = point_labels.loc[:, POINT_LABEL_COLUMNS]
 
-        input_signature = _frame_signature(standardized, self.config)
+        input_signature = _process_signature(standardized, self.config)
         result_signature = _result_signature(intervals)
         comparable = self._last_input_signature == input_signature
         matches_previous = (
@@ -645,11 +883,9 @@ class SegmentationPipeline:
         )
         idle_label = segment_types == SegmentState.IDLE.value
         idle_gate_mismatch_count = int(np.sum(idle_label != idle_gate))
-        power_gate_invalid_point_count = (
-            int((~features["power_gate_valid"].astype(bool)).sum())
-            if "power_gate_valid" in features
-            else 0
-        )
+        # 预测功率已不是六态输入；兼容列缺失或为 NaN 不得被
+        # 报成过程域门控失败。保留该诊断键仅为上层兼容。
+        power_gate_invalid_point_count = 0
         postprocess_coverage_valid = bool(
             structural_coverage_valid
             and gap_count == 0
@@ -741,6 +977,32 @@ class SegmentationPipeline:
             entry_without_qualified_idle_predecessor_count
             + exit_without_qualified_idle_successor_count
         )
+        expected_entries = {
+            (
+                int(record["entry_start_idx"]),
+                int(record["selected_entry_end_idx"]),
+            )
+            for record in entry_peak_records
+            if bool(record.get("entry_required"))
+            and record.get("entry_start_idx") is not None
+            and record.get("selected_entry_end_idx") is not None
+        }
+        final_entries = {
+            (int(segment.start_idx), int(segment.end_idx))
+            for segment in decoded.segments
+            if segment.state is SegmentState.ENTRY
+        }
+        entry_missing_interval_count = int(len(expected_entries - final_entries))
+        entry_peak_boundary_violation_count = int(len(final_entries - expected_entries))
+        transition_overlaps_entry_count = int(sum(
+            segment.state is SegmentState.TRANSITION
+            and any(
+                segment.start_idx <= entry_end
+                and segment.end_idx >= entry_start
+                for entry_start, entry_end in expected_entries
+            )
+            for segment in decoded.segments
+        ))
         selected_state_score_invalid_count = int(sum(
             not np.isfinite(float(selected_scorer.score_final_segment(
                 segment.start_atom,
@@ -770,8 +1032,18 @@ class SegmentationPipeline:
             and entry_without_idle_predecessor_count == 0
             and exit_without_idle_successor_count == 0
             and qualified_idle_boundary_violation_count == 0
+            and entry_missing_interval_count == 0
+            and entry_peak_boundary_violation_count == 0
+            and transition_overlaps_entry_count == 0
             and idle_gate_mismatch_count == 0
             and selected_state_score_invalid_count == 0
+            and (
+                not decoded.used_fallback
+                or (
+                    decoded.fallback_scope == "local_verified"
+                    and decoded.fallback_validated
+                )
+            )
         )
         short_steady_count = int(
             (
@@ -814,6 +1086,26 @@ class SegmentationPipeline:
             state.value: int((intervals["segment_type"] == state.value).sum())
             for state in SegmentState
         }
+        state_point_counts = {
+            state.value: int(np.sum(segment_types == state.value))
+            for state in SegmentState
+        }
+        anchor_run_records = [
+            dict(record)
+            for record in (
+                getattr(selected_scorer, "steady_anchor_run_records", []) or []
+            )
+        ]
+        anchor_local_fallback_records = [
+            dict(record)
+            for record in (
+                getattr(
+                    selected_scorer,
+                    "steady_anchor_local_fallback_records",
+                    [],
+                ) or []
+            )
+        ]
         diagnostics = {
             "input_point_count": int(len(features)),
             "atomic_segment_count": int(len(atoms)),
@@ -838,6 +1130,18 @@ class SegmentationPipeline:
             "qualified_idle_boundary_violation_count": (
                 qualified_idle_boundary_violation_count
             ),
+            "entry_peak_records": entry_peak_records,
+            "entry_expected_interval_count": int(len(expected_entries)),
+            "entry_missing_interval_count": entry_missing_interval_count,
+            "entry_peak_boundary_violation_count": (
+                entry_peak_boundary_violation_count
+            ),
+            "transition_overlaps_entry_count": transition_overlaps_entry_count,
+            # 兼容旧诊断键；复核对象现在是最终 entry，而非
+            # 未经稳态优先级裁剪的峰值范围。
+            "transition_before_entry_peak_count": (
+                transition_overlaps_entry_count
+            ),
             "idle_gate_mismatch_count": idle_gate_mismatch_count,
             "power_gate_invalid_point_count": power_gate_invalid_point_count,
             "selected_state_score_invalid_count": (
@@ -860,6 +1164,36 @@ class SegmentationPipeline:
                 )
                 or 0
             ),
+            "steady_anchor_candidate_interval_count": int(
+                getattr(
+                    selected_scorer,
+                    "steady_anchor_candidate_interval_count",
+                    0,
+                ) or 0
+            ),
+            "steady_anchor_run_count": int(len(anchor_run_records)),
+            "steady_anchor_run_records": anchor_run_records,
+            "steady_anchor_local_fallback_records": (
+                anchor_local_fallback_records
+            ),
+            "steady_anchor_unreachable_run_count": int(sum(
+                not bool(record.get("coverage_reachable", False))
+                for record in anchor_run_records
+            )),
+            "steady_candidate_batch_count": int(
+                getattr(selected_scorer, "steady_candidate_batch_count", 0) or 0
+            ),
+            "max_segment_atoms_role": str(
+                normalization_diagnostics.get("max_segment_atoms_role")
+                or "candidate_scoring_batch_size"
+            ),
+            "entry_precedence_anchor_excluded_point_count": int(
+                getattr(
+                    selected_scorer,
+                    "entry_precedence_anchor_excluded_point_count",
+                    0,
+                ) or 0
+            ),
             "steady_platform_slope_rejected_point_count": int(
                 getattr(
                     selected_scorer,
@@ -868,14 +1202,38 @@ class SegmentationPipeline:
                 )
                 or 0
             ),
+            "steady_precedence_entry_clipped_point_count": int(
+                getattr(
+                    selected_scorer,
+                    "steady_precedence_entry_clipped_point_count",
+                    0,
+                )
+                or 0
+            ),
             "state_interval_counts": state_counts,
+            "state_point_counts": state_point_counts,
             "mrr_formula": "MRR_program = ap * ae * F_program / 60",
             "input_mrr_columns_ignored": True,
             "input_schema_version": self.config.input_schema_version,
+            "process_signature": input_signature,
             "config": self.config.to_dict(),
             "path": path_diagnostics.to_dict(),
             "fallback_used": bool(raw_decoded.used_fallback),
+            "fallback_scope": str(raw_decoded.fallback_scope or "none"),
+            "fallback_validated": bool(
+                raw_decoded.fallback_validated
+                and postprocess_validation_passed
+            ),
             "fallback_reason": raw_decoded.failure_reason,
+            "fallback_interval_records": list(
+                normalization_diagnostics.get("fallback_interval_records", []) or []
+            ),
+            "preserved_strict_steady_interval_count": int(
+                normalization_diagnostics.get(
+                    "preserved_strict_steady_interval_count",
+                    strict_steady_platform_interval_count,
+                ) or 0
+            ),
             "decoder_total_score": float(raw_decoded.total_score),
             "scorer_type": str(getattr(selected_scorer, "scorer_type", selected_scorer.__class__.__name__)),
             "model_version": getattr(selected_scorer, "model_version", None),
@@ -884,6 +1242,7 @@ class SegmentationPipeline:
                 "tie_break_rule": "分数优先，并列时优先更早起点与固定状态顺序",
                 "comparable_to_previous": bool(comparable),
                 "matches_previous": matches_previous,
+                "process_signature": input_signature,
                 "input_signature": input_signature,
                 "result_signature": result_signature,
             },
