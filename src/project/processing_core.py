@@ -15,6 +15,19 @@ PROCESS_LAYOUT_EXPORT_NO_SEQ_NO_MRR = "export_no_seq_no_mrr"
 PROCESS_LAYOUT_LEGACY_SEQ = "legacy_seq"
 PROCESS_LAYOUT_LEGACY_NO_SEQ = "legacy_no_seq"
 
+PROCESS_LAYOUT_GCODE_INDEX = {
+    PROCESS_LAYOUT_DIRECT_SEQ: 8,
+    PROCESS_LAYOUT_DIRECT_NO_SEQ: 7,
+    PROCESS_LAYOUT_EXPORT_SEQ: 8,
+    PROCESS_LAYOUT_EXPORT_NO_SEQ: 7,
+    PROCESS_LAYOUT_DIRECT_SEQ_NO_MRR: 7,
+    PROCESS_LAYOUT_DIRECT_NO_SEQ_NO_MRR: 6,
+    PROCESS_LAYOUT_EXPORT_SEQ_NO_MRR: 7,
+    PROCESS_LAYOUT_EXPORT_NO_SEQ_NO_MRR: 6,
+    PROCESS_LAYOUT_LEGACY_SEQ: 6,
+    PROCESS_LAYOUT_LEGACY_NO_SEQ: 5,
+}
+
 PROCESS_HEADER_MAP = {
     ("序号", "N", "ap(mm)", "ae(mm)", "F(mm/min)", "MRR(mm3/min)", "s(mm)", "S(r/min)", "G"): PROCESS_LAYOUT_DIRECT_SEQ,
     ("N", "ap(mm)", "ae(mm)", "F(mm/min)", "MRR(mm3/min)", "s(mm)", "S(r/min)", "G"): PROCESS_LAYOUT_DIRECT_NO_SEQ,
@@ -48,11 +61,42 @@ class ProcessingCoreMixin:
             return "ae(mm)"
         if lowered in {"f", "f(mm/min)", "feed", "feedrate", "feed_rate", "进给", "进给率", "进给速度"}:
             return "F(mm/min)"
-        if lowered in {"mrr", "mrr(mm3/min)", "mrr(mm^3/min)", "材料去除率", "materialremovalrate"}:
+        if lowered in {
+            "mrr",
+            "mrr(mm3/min)",
+            "mrr(mm^3/min)",
+            "mrr(mm3/s)",
+            "mrr(mm^3/s)",
+            "材料去除率",
+            "materialremovalrate",
+        }:
+            # 布局键保留旧名仅为兼容；该输入列不参与 MRR 计算。
             return "MRR(mm3/min)"
         if normalized == "S" or "rpm" in lowered or "r/min" in lowered or "转速" in normalized:
             return "S(r/min)"
-        if normalized == "s" or lowered in {"s(mm)", "path", "pathlength", "行程", "累计行程", "路径长度"}:
+        if normalized == "s" or lowered in {
+            "s(mm)",
+            "path",
+            "pathlength",
+            "input_path_cumulative",
+            "inputpathcumulative",
+            "s_cumulative",
+            "scumulative",
+            "path_cumulative",
+            "pathcumulative",
+            "行程",
+            "累计行程",
+            "累计路径",
+            "cumulativepath",
+            "cumulativedistance",
+            "accumulatedpath",
+            "增量行程",
+            "逐行行程",
+            "当前行行程",
+            "incrementalpath",
+            "perrowpath",
+            "路径长度",
+        }:
             return "s(mm)"
         if lowered in {"g", "gcode", "nc", "程序段", "代码"}:
             return "G"
@@ -85,6 +129,27 @@ class ProcessingCoreMixin:
         """判断是否为工艺信息表头行。"""
         return self._detect_process_header_layout(tokens) is not None
 
+    def _detect_process_path_semantics_hint(self, tokens):
+        """按表头契约区分逐行行程与显式累计行程。"""
+        for token in tokens or []:
+            if self._canonicalize_process_header_token(token) != "s(mm)":
+                continue
+            normalized = str(token or "").strip().lower().replace(" ", "")
+            if "累计" in normalized or "cumulative" in normalized or "accumulated" in normalized:
+                return "cumulative"
+            if (
+                "增量" in normalized
+                or "逐行" in normalized
+                or "当前行" in normalized
+                or "increment" in normalized
+                or "perrow" in normalized
+            ):
+                return "incremental"
+            # 普通 s / s(mm) 的固定契约是当前行增量，不再根据数值
+            # 是否恰好单调来猜测累计语义。
+            return "incremental"
+        return None
+
     def _parse_process_numeric(self, token, prefix=""):
         return self._parse_prefixed_numeric_token(token, prefix)
 
@@ -102,42 +167,41 @@ class ProcessingCoreMixin:
         mrr_token=None,
     ):
         gcode_content = " ".join(gcode_tokens).replace(",", " ").strip()
-        if not gcode_content:
-            return None
 
         line_no_val = self._parse_process_numeric(line_token, "N")
         ap_val = self._parse_process_numeric(ap_token)
         ae_val = self._parse_process_numeric(ae_token)
         feed_val = self._parse_process_numeric(feed_token)
-        if line_no_val is None or ap_val is None or ae_val is None or feed_val is None:
+        if ap_val is None or ae_val is None or feed_val is None:
             return None
         if ap_val < 0 or ae_val < 0 or feed_val < 0:
             return None
 
-        path_length_val = None
-        if s_token is not None:
-            path_length_val = self._parse_process_numeric(s_token)
-            if path_length_val is None or path_length_val < 0:
-                return None
+        path_value = None
+        if s_token is not None and str(s_token).strip():
+            path_value = self._parse_process_numeric(s_token)
 
         spindle_val = None
-        if spindle_token is not None:
+        if spindle_token is not None and str(spindle_token).strip():
             spindle_val = self._parse_process_numeric(spindle_token, "S")
             if spindle_val is None:
                 spindle_val = self._parse_process_numeric(spindle_token)
             if spindle_val is None or spindle_val < 0:
                 return None
 
-        mrr_val = None
-        if mrr_token is not None:
-            mrr_val = self._parse_process_numeric(mrr_token)
-            if mrr_val is None:
-                return None
-
-        try:
-            line_number = int(round(float(line_no_val))) - 1
-        except Exception:
-            line_number = None
+        line_number = None
+        if line_no_val is not None:
+            try:
+                numeric_line = float(line_no_val)
+                rounded_line = int(round(numeric_line))
+                if (
+                    math.isfinite(numeric_line)
+                    and rounded_line >= 1
+                    and abs(numeric_line - rounded_line) <= 1e-9
+                ):
+                    line_number = rounded_line - 1
+            except Exception:
+                line_number = None
 
         score = 0.0
         if line_number is not None and line_number >= 0:
@@ -154,10 +218,8 @@ class ProcessingCoreMixin:
             score += 1.0
         if spindle_val is not None and spindle_val >= 100:
             score += 1.0
-        if path_length_val is not None and path_length_val > 0:
+        if path_value is not None and path_value > 0:
             score += 1.0
-        if mrr_val is not None and mrr_val >= 0:
-            score += 0.5
 
         return {
             "layout": layout_name,
@@ -167,8 +229,12 @@ class ProcessingCoreMixin:
             "feed_rate": float(feed_val),
             "gcode_content": gcode_content,
             "spindle_speed": float(spindle_val) if spindle_val is not None else None,
-            "path_cumulative": float(path_length_val) if path_length_val is not None else None,
-            "mrr": float(mrr_val) if mrr_val is not None else None,
+            # 普通 s(mm) 固定是逐行增量；只有显式 cumulative 表头
+            # 才使用累计语义。这里先保留原始数值，稍后统一生成路径。
+            "path_value": float(path_value) if path_value is not None else None,
+            "path_column_present": s_token is not None,
+            # MRR 列只参与布局定位。其单元格既不解析、也不校验，业务 MRR
+            # 始终在派生列回填阶段由 ap * ae * F / 60 重新计算。
             "score": float(score),
         }
 
@@ -262,7 +328,8 @@ class ProcessingCoreMixin:
 
     def _parse_process_tokens(self, tokens, layout_hint=None):
         """兼容旧格式与新格式工艺信息行。"""
-        cleaned = [str(token).strip() for token in tokens if str(token).strip()]
+        # CSV 空单元格具有列定位语义，尤其是允许为空的 N、s 和 G 列，不能删除。
+        cleaned = [str(token).strip() for token in tokens]
         if len(cleaned) < 5:
             return None, layout_hint
 
@@ -270,7 +337,10 @@ class ProcessingCoreMixin:
         if detected_layout:
             return None, detected_layout
 
-        numeric_tokens, gcode_tokens = self._split_numeric_and_gcode_tokens(cleaned)
+        numeric_tokens, gcode_tokens = self._split_numeric_and_gcode_tokens(
+            cleaned,
+            layout_hint=layout_hint,
+        )
         if not numeric_tokens or not gcode_tokens or len(numeric_tokens) < 4:
             return None, layout_hint
 
@@ -388,7 +458,9 @@ class ProcessingCoreMixin:
                 gcode_tokens=gcode_tokens,
             )
 
-        if result is None:
+        # 已有表头时列语义是确定的；该布局下缺少必要字段的行应跳过，
+        # 不能再用其他布局猜测，否则会把 S=5000 等值错读为 ap。
+        if result is None and layout_hint is None:
             result = self._infer_process_layout_record(numeric_tokens, gcode_tokens)
             if result:
                 effective_layout = result.get("layout")
@@ -405,13 +477,27 @@ class ProcessingCoreMixin:
             return None
         return numeric_tokens[2], numeric_tokens[3], numeric_tokens[4]
 
-    def _split_numeric_and_gcode_tokens(self, tokens):
+    def _split_numeric_and_gcode_tokens(self, tokens, layout_hint=None):
         """拆分工艺信息行：数值列与G代码列"""
+        gcode_column = PROCESS_LAYOUT_GCODE_INDEX.get(layout_hint)
+        if gcode_column is not None and len(tokens) >= gcode_column:
+            return tokens[:gcode_column], tokens[gcode_column:]
+
         gcode_start_idx = None
         for idx, token in enumerate(tokens):
-            if re.match(r'^[A-Za-z]', token):
+            # 无表头时只把“字母地址 + 数值”识别为 G 指令起点；这样 MRR
+            # 占位单元格即使是任意非数值文本，也不会改变列拆分结果。
+            if re.match(
+                r'^(?:N\s*[+-]?(?:\d+(?:\.\d*)?|\.\d+)\s*)?'
+                r'(?:G|M|X|Y|Z|I|J|K|F|S|T|L|R|P|Q)\s*'
+                r'[+-]?(?:\d+(?:\.\d*)?|\.\d+)',
+                str(token).strip(),
+                flags=re.IGNORECASE,
+            ):
                 gcode_start_idx = idx
                 break
+        if gcode_start_idx is None and tokens and not str(tokens[-1]).strip():
+            gcode_start_idx = len(tokens) - 1
         if gcode_start_idx is None or gcode_start_idx == 0:
             return None, None
         return tokens[:gcode_start_idx], tokens[gcode_start_idx:]
@@ -584,7 +670,13 @@ class ProcessingCoreMixin:
         helix_delta = end_coords[helix_axis] - start_coords[helix_axis]
         return math.hypot(planar_length, helix_delta)
 
-    def compute_gcode_motion_info(self, gcode_content, prev_coords=None, prev_state=None):
+    def compute_gcode_motion_info(
+        self,
+        gcode_content,
+        prev_coords=None,
+        prev_state=None,
+        calculate_segment_length=True,
+    ):
         """计算当前行的模态状态、终点坐标和运动长度。"""
         state, word_values = self._resolve_modal_gcode_state(gcode_content, prev_state)
         has_prev_coords = prev_coords is not None
@@ -592,7 +684,7 @@ class ProcessingCoreMixin:
         end_coords = self._resolve_gcode_end_coords(start_coords, word_values, state.get("distance_mode", "G90"))
         has_motion_words = any(axis in word_values for axis in ("X", "Y", "Z", "I", "J", "K"))
 
-        if not has_prev_coords or not has_motion_words or state.get("motion") is None:
+        if not calculate_segment_length or not has_prev_coords or not has_motion_words or state.get("motion") is None:
             segment_length = 0.0
         elif state["motion"] in {"G2", "G3"}:
             segment_length = self._calculate_arc_distance(start_coords, end_coords, word_values, state)
@@ -613,15 +705,386 @@ class ProcessingCoreMixin:
             "motion_type": motion_type,
         }
 
+    def _process_instruction_group_key(self, row):
+        """返回连续指令分组键，优先使用真实文件行号。"""
+        raw_line = row.get("line_no_raw")
+        if raw_line is not None:
+            return "raw", raw_line
+        aligned_line = row.get("line_no_aligned")
+        if aligned_line is not None:
+            return "aligned", aligned_line
+        return "gcode", str(row.get("gcode_content", "") or "")
+
+    def _normalize_gcode_for_nc_line_match(self, gcode_content):
+        """规范化普通字地址指令，用于 ProcessInfo 与 NC 原文的严格顺序匹配。"""
+        text = self._strip_gcode_comments(gcode_content).upper().strip()
+        if not text:
+            return ""
+        text = re.sub(r"^N\s*[+-]?(?:\d+(?:\.\d*)?|\.\d+)\s*", "", text)
+        word_pattern = re.compile(r"([A-Z])\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))")
+        words = list(word_pattern.finditer(text))
+        residual = word_pattern.sub("", text)
+        if words and not re.sub(r"[\s,]", "", residual):
+            normalized_words = []
+            for match in words:
+                number = float(match.group(2))
+                if abs(number) <= 1e-15:
+                    number = 0.0
+                normalized_words.append(f"{match.group(1)}{number:.15g}")
+            return "".join(normalized_words)
+        return re.sub(r"[\s,]", "", text)
+
+    def _collect_process_gcode_groups(self, rows):
+        """按规范化后的连续 G 指令收集工艺点组。"""
+        groups = []
+        for row in rows:
+            if bool(row.get("_is_synthetic_fill")):
+                continue
+            normalized = self._normalize_gcode_for_nc_line_match(row.get("gcode_content", ""))
+            if not groups or normalized != groups[-1]["normalized"]:
+                groups.append({"normalized": normalized, "rows": [row]})
+            else:
+                groups[-1]["rows"].append(row)
+        return groups
+
+    def _restore_missing_line_numbers_from_nc_profile(self, rows):
+        """按已有 N 锚点和 NC 指令顺序补全缺失的真实文件行号。"""
+        process_rows = [row for row in rows if not bool(row.get("_is_synthetic_fill"))]
+        groups = self._collect_process_gcode_groups(process_rows)
+        diagnostics = {
+            "line_number_source": "missing",
+            "nc_process_group_count": len(groups),
+            "nc_matched_group_count": 0,
+        }
+        if not process_rows:
+            self.process_line_number_diagnostics = diagnostics
+            return diagnostics
+
+        missing_flags = [row.get("line_no_raw") is None for row in process_rows]
+        if not any(missing_flags):
+            diagnostics["line_number_source"] = "input"
+            for row in process_rows:
+                row["line_number_source"] = "input"
+            self.process_line_number_diagnostics = diagnostics
+            return diagnostics
+
+        profile = getattr(self, "gcode_profile", None) or {}
+        states = sorted(
+            (
+                state for state in profile.get("states", [])
+                if state.get("file_line_index") is not None
+            ),
+            key=lambda state: int(state.get("file_line_index")),
+        )
+        if not states or not groups or any(not group["normalized"] for group in groups):
+            diagnostics["line_number_source"] = "missing_nc_match_unavailable"
+            for row in process_rows:
+                row["line_number_source"] = diagnostics["line_number_source"]
+            self.process_line_number_diagnostics = diagnostics
+            return diagnostics
+
+        normalized_states = [
+            (self._normalize_gcode_for_nc_line_match(state.get("line_text", "")), state)
+            for state in states
+        ]
+        group_known_lines = []
+        for group in groups:
+            known_lines = {
+                int(row.get("line_no_raw"))
+                for row in group["rows"]
+                if row.get("line_no_raw") is not None
+            }
+            if len(known_lines) > 1:
+                diagnostics["line_number_source"] = "partial_nc_anchor_conflict"
+                for row in process_rows:
+                    row["line_number_source"] = diagnostics["line_number_source"]
+                self.process_line_number_diagnostics = diagnostics
+                return diagnostics
+            group_known_lines.append(next(iter(known_lines), None))
+
+        state_position_by_line = {
+            int(state.get("file_line_index")): index
+            for index, (_normalized, state) in enumerate(normalized_states)
+        }
+        candidate_positions = []
+        for group_index, group in enumerate(groups):
+            known_line = group_known_lines[group_index]
+            if known_line is not None:
+                candidate_index = state_position_by_line.get(int(known_line))
+                candidates = []
+                if (
+                    candidate_index is not None
+                    and normalized_states[candidate_index][0] == group["normalized"]
+                ):
+                    candidates = [int(candidate_index)]
+            else:
+                candidates = [
+                    state_index
+                    for state_index, (normalized, _state) in enumerate(normalized_states)
+                    if normalized == group["normalized"]
+                ]
+            if not candidates:
+                source_prefix = "partial" if not all(missing_flags) else "missing"
+                diagnostics["line_number_source"] = f"{source_prefix}_nc_match_failed"
+                for row in process_rows:
+                    row["line_number_source"] = diagnostics["line_number_source"]
+                self.process_line_number_diagnostics = diagnostics
+                return diagnostics
+            candidate_positions.append(candidates)
+
+        earliest_positions = []
+        previous_position = -1
+        for candidates in candidate_positions:
+            match_index = next(
+                (candidate for candidate in candidates if candidate > previous_position),
+                None,
+            )
+            if match_index is None:
+                break
+            earliest_positions.append(match_index)
+            previous_position = match_index
+
+        latest_positions = []
+        next_position = len(normalized_states)
+        for candidates in reversed(candidate_positions):
+            match_index = next(
+                (candidate for candidate in reversed(candidates) if candidate < next_position),
+                None,
+            )
+            if match_index is None:
+                break
+            latest_positions.append(match_index)
+            next_position = match_index
+        latest_positions.reverse()
+
+        source_prefix = "partial" if not all(missing_flags) else "missing"
+        if (
+            len(earliest_positions) != len(groups)
+            or len(latest_positions) != len(groups)
+        ):
+            diagnostics["line_number_source"] = f"{source_prefix}_nc_match_failed"
+            for row in process_rows:
+                row["line_number_source"] = diagnostics["line_number_source"]
+            self.process_line_number_diagnostics = diagnostics
+            return diagnostics
+        if earliest_positions != latest_positions:
+            diagnostics["line_number_source"] = f"{source_prefix}_nc_match_ambiguous"
+            for row in process_rows:
+                row["line_number_source"] = diagnostics["line_number_source"]
+            self.process_line_number_diagnostics = diagnostics
+            return diagnostics
+
+        assignments = [
+            (group, normalized_states[match_index][1])
+            for group, match_index in zip(groups, earliest_positions)
+        ]
+
+        # 只有所有连续指令组均匹配成功后才一次性写回，避免部分匹配污染行号。
+        completed_partial = not all(missing_flags)
+        overall_source = "input_with_nc_completion" if completed_partial else "nc_profile_line_text"
+        for group, state in assignments:
+            file_line_index = int(state.get("file_line_index"))
+            for row in group["rows"]:
+                had_input_line = row.get("line_no_raw") is not None
+                row["line_no_raw"] = file_line_index
+                row["line_number_source"] = "input" if had_input_line else "nc_profile_line_text"
+        diagnostics.update({
+            "line_number_source": overall_source,
+            "nc_matched_group_count": len(assignments),
+        })
+        self.process_line_number_diagnostics = diagnostics
+        return diagnostics
+
+    def _get_segmentation_config_value(self, name, default):
+        """读取当前集中分割配置；尚未初始化界面时使用配置类默认值。"""
+        config = getattr(self, "segmentation_config", None)
+        if config is None:
+            config = getattr(self, "_segmentation_config", None)
+        if config is None:
+            pipeline = getattr(self, "segmentation_pipeline", None)
+            config = getattr(pipeline, "config", None)
+        if config is None:
+            try:
+                from .segmentation.schemas import SegmentationConfig
+
+                config = SegmentationConfig()
+            except Exception:
+                config = None
+        if isinstance(config, dict):
+            return config.get(name, default)
+        return getattr(config, name, default)
+
+    def _validate_input_path(self, rows):
+        """按列契约全局验证行程；普通 s 默认是逐点增量。"""
+        try:
+            path_tolerance = max(float(self._get_segmentation_config_value("path_tolerance_mm", 1e-8)), 0.0)
+        except (TypeError, ValueError):
+            path_tolerance = 1e-8
+        process_rows = [row for row in rows if not bool(row.get("_is_synthetic_fill"))]
+        path_present = bool(process_rows) and any(
+            bool(row.get("_input_path_column_present")) for row in process_rows
+        )
+        result = {
+            "present": path_present,
+            "valid": False,
+            "reason": "missing",
+            "span": 0.0,
+            "semantics": "unknown",
+        }
+        if not path_present:
+            return result
+        if not all(bool(row.get("_input_path_column_present")) for row in process_rows):
+            result["reason"] = "missing_or_invalid_value"
+            return result
+
+        values = []
+        for row in process_rows:
+            try:
+                value = float(row.get("_input_path_value"))
+            except (TypeError, ValueError):
+                result["reason"] = "missing_or_invalid_value"
+                return result
+            if not math.isfinite(value):
+                result["reason"] = "non_finite"
+                return result
+            values.append(value)
+
+        semantics_hints = {
+            str(row.get("_input_path_semantics_hint") or "").strip().lower()
+            for row in process_rows
+            if str(row.get("_input_path_semantics_hint") or "").strip()
+        }
+        if len(semantics_hints) > 1:
+            result["reason"] = "conflicting_semantics_hints"
+            return result
+        semantics_hint = next(iter(semantics_hints), "")
+
+        if any(value < -path_tolerance for value in values):
+            result["reason"] = "negative_value"
+            return result
+
+        cumulative_monotonic = all(
+            current >= previous - path_tolerance * max(1.0, abs(previous), abs(current))
+            for previous, current in zip(values, values[1:])
+        )
+        cumulative_span = float(max(values[-1], 0.0)) if values else 0.0
+        incremental_values = [max(value, 0.0) for value in values]
+        incremental_total = float(sum(incremental_values))
+
+        if semantics_hint == "cumulative":
+            if not cumulative_monotonic or cumulative_span <= path_tolerance:
+                result["reason"] = "invalid_cumulative"
+                return result
+            result.update({
+                "valid": True,
+                "reason": "valid_cumulative",
+                "span": cumulative_span,
+                "semantics": "cumulative",
+            })
+            return result
+
+        if semantics_hint not in {"", "incremental"}:
+            result["reason"] = "unknown_semantics_hint"
+            return result
+        result["span"] = incremental_total
+        if incremental_total <= path_tolerance:
+            result["reason"] = "no_positive_span"
+            return result
+
+        result.update({
+            "valid": True,
+            "reason": "valid_incremental",
+            "span": incremental_total,
+            "semantics": "incremental",
+        })
+        return result
+
+    def _path_positions_are_physical(self, rows):
+        """检查已回填的逐点行程是否有限、非回退且具有正物理长度。"""
+        try:
+            path_tolerance = max(float(self._get_segmentation_config_value("path_tolerance_mm", 1e-8)), 0.0)
+        except (TypeError, ValueError):
+            path_tolerance = 1e-8
+        previous_end = None
+        total_length = 0.0
+        for row in rows:
+            try:
+                start_value = float(row.get("path_start"))
+                end_value = float(row.get("path_end"))
+            except (TypeError, ValueError):
+                return False
+            if not math.isfinite(start_value) or not math.isfinite(end_value):
+                return False
+            bound_tolerance = path_tolerance * max(1.0, abs(start_value), abs(end_value))
+            if end_value < start_value - bound_tolerance:
+                return False
+            if previous_end is not None:
+                sequence_tolerance = path_tolerance * max(1.0, abs(previous_end), abs(start_value))
+            else:
+                sequence_tolerance = path_tolerance
+            if previous_end is not None and start_value < previous_end - sequence_tolerance:
+                return False
+            total_length += max(end_value - start_value, 0.0)
+            previous_end = end_value
+        return total_length > path_tolerance
+
+    def _apply_gcode_geometry_positions(self, rows, origin, calculate_path=True):
+        """每个连续指令只计算一次几何，并确定性分配到该指令的工艺点。"""
+        previous_coords = tuple(origin)
+        modal_state = self._create_modal_gcode_state()
+        cumulative_total = 0.0
+        row_index = 0
+        while row_index < len(rows):
+            group_key = self._process_instruction_group_key(rows[row_index])
+            group_end = row_index + 1
+            while (
+                group_end < len(rows)
+                and self._process_instruction_group_key(rows[group_end]) == group_key
+            ):
+                group_end += 1
+
+            group_rows = rows[row_index:group_end]
+            motion_info = self.compute_gcode_motion_info(
+                group_rows[0].get("gcode_content", ""),
+                prev_coords=previous_coords,
+                prev_state=modal_state,
+                calculate_segment_length=calculate_path,
+            )
+            modal_state = motion_info["state"]
+            start_coords = tuple(motion_info["start_coords"])
+            end_coords = tuple(motion_info["end_coords"])
+            group_length = float(motion_info["segment_length"]) if calculate_path else 0.0
+            group_count = len(group_rows)
+            group_step = group_length / group_count if group_count else 0.0
+
+            for offset, row in enumerate(group_rows):
+                ratio = (offset + 1) / group_count if group_count else 1.0
+                row["x"] = start_coords[0] + (end_coords[0] - start_coords[0]) * ratio
+                row["y"] = start_coords[1] + (end_coords[1] - start_coords[1]) * ratio
+                row["z"] = start_coords[2] + (end_coords[2] - start_coords[2]) * ratio
+                if motion_info["motion_type"] is not None:
+                    row["type"] = motion_info["motion_type"]
+                if calculate_path:
+                    row["s"] = group_step
+                    row["path_start"] = cumulative_total
+                    cumulative_total += group_step
+                    row["path_end"] = cumulative_total
+                    row["path_cumulative"] = cumulative_total
+            previous_coords = end_coords
+            row_index = group_end
+
     def _assign_group_distributed_path_positions(self, rows):
         """基于连续相同行号，将累计行程均匀分布到每一行。"""
         cumulative_total = 0.0
         row_index = 0
         while row_index < len(rows):
-            group_key = rows[row_index].get("line_no_raw")
+            group_key = self._process_instruction_group_key(rows[row_index])
             group_end = row_index
             group_total = 0.0
-            while group_end < len(rows) and rows[group_end].get("line_no_raw") == group_key:
+            while (
+                group_end < len(rows)
+                and self._process_instruction_group_key(rows[group_end]) == group_key
+            ):
                 try:
                     group_total += float(rows[group_end].get("s", 0.0))
                 except Exception:
@@ -630,109 +1093,261 @@ class ProcessingCoreMixin:
             group_count = group_end - row_index
             group_step = group_total / group_count if group_count else 0.0
             for offset in range(row_index, group_end):
+                rows[offset]["s"] = group_step
                 rows[offset]["path_start"] = cumulative_total
                 cumulative_total += group_step
                 rows[offset]["path_end"] = cumulative_total
                 rows[offset]["path_cumulative"] = cumulative_total
             row_index = group_end
 
-    def _apply_input_path_positions(self, rows):
-        """直接使用输入文件中的累计行程生成 path_start/path_end。"""
+    def _apply_input_path_positions(self, rows, semantics):
+        """按已判定的累计/增量语义生成统一累计 path_start/path_end。"""
+        if semantics == "incremental":
+            for row in rows:
+                if bool(row.get("_is_synthetic_fill")):
+                    row["s"] = 0.0
+                    continue
+                try:
+                    segment_length = float(row.get("_input_path_value", 0.0) or 0.0)
+                except Exception:
+                    segment_length = 0.0
+                row["s"] = max(segment_length, 0.0)
+            # 同一指令含多个工艺点时，把该指令总行程确定性地均分到各点。
+            self._assign_group_distributed_path_positions(rows)
+            return
+
         previous_end = 0.0
         for row in rows:
-            if bool(row.get("_has_input_path_bounds")):
-                try:
-                    start_val = float(row.get("_input_path_start", previous_end) or previous_end)
-                except Exception:
-                    start_val = previous_end
-                try:
-                    end_val = float(row.get("_input_path_end", start_val) or start_val)
-                except Exception:
-                    end_val = start_val
-                if end_val < start_val:
-                    end_val = start_val
+            if bool(row.get("_is_synthetic_fill")):
+                end_val = previous_end
             else:
-                start_val = previous_end
                 try:
-                    segment_length = float(row.get("s", 0.0) or 0.0)
-                except Exception:
-                    segment_length = 0.0
-                if segment_length < 0:
-                    segment_length = 0.0
-                end_val = start_val + segment_length
-            row["path_start"] = start_val
-            row["path_end"] = end_val
-            row["path_cumulative"] = end_val
+                    end_val = float(row.get("_input_path_value"))
+                except (TypeError, ValueError):
+                    end_val = previous_end
+                if end_val < previous_end:
+                    end_val = previous_end
+            row["s"] = max(end_val - previous_end, 0.0)
             previous_end = end_val
+        # 累计值先转换为逐点增量，再按同一指令的全部工艺点均分。
+        self._assign_group_distributed_path_positions(rows)
 
-    def _apply_nc_profile_to_process_rows(self, rows):
-        """导入 NC 后，按 NC 状态回填每行转速与累计行程。"""
+    def _resolve_exact_nc_state_for_process_row(self, raw_line_number, gcode_content):
+        """以已验证文件行号为锚点，并用显式 N 做一致性校验。"""
+        profile = getattr(self, "gcode_profile", None)
+        if not isinstance(profile, dict) or not profile or raw_line_number is None:
+            return None
+
+        try:
+            line_index = int(raw_line_number)
+        except (TypeError, ValueError):
+            return None
+        line_state = profile.get("state_by_line_index", {}).get(line_index)
+        if not line_state:
+            return None
+
+        n_value = self.extract_n_value(str(gcode_content or ""))
+        n_int = self.extract_n_integer(n_value)
+        if n_int is not None:
+            n_state = profile.get("state_by_n", {}).get(int(n_int))
+            if not n_state:
+                return None
+            try:
+                n_line_index = int(n_state.get("file_line_index"))
+                exact_line_index = int(line_state.get("file_line_index"))
+            except (TypeError, ValueError):
+                return None
+            if n_line_index != exact_line_index:
+                return None
+        return dict(line_state)
+
+    def _apply_bound_nc_profile_positions(self, rows):
+        """尝试使用已绑定 NC profile；不完整或无正跨度时返回 False。"""
+        try:
+            path_tolerance = max(float(self._get_segmentation_config_value("path_tolerance_mm", 1e-8)), 0.0)
+        except (TypeError, ValueError):
+            path_tolerance = 1e-8
+        cumulative_total = 0.0
+        all_required_groups_matched = True
+        row_index = 0
+        while row_index < len(rows):
+            group_key = self._process_instruction_group_key(rows[row_index])
+            group_end = row_index + 1
+            while (
+                group_end < len(rows)
+                and self._process_instruction_group_key(rows[group_end]) == group_key
+            ):
+                group_end += 1
+
+            group_rows = rows[row_index:group_end]
+            anchor_state = self._resolve_exact_nc_state_for_process_row(
+                group_rows[0].get("line_no_raw"),
+                group_rows[0].get("gcode_content"),
+            )
+            requires_match = any(
+                not bool(row.get("_is_synthetic_fill"))
+                and bool(str(row.get("gcode_content", "") or "").strip())
+                for row in group_rows
+            )
+            if anchor_state is None and requires_match:
+                all_required_groups_matched = False
+
+            if anchor_state:
+                try:
+                    anchor_start = float(anchor_state.get("path_start", 0.0) or 0.0)
+                    anchor_end = float(anchor_state.get("path_end", anchor_start) or anchor_start)
+                except (TypeError, ValueError):
+                    anchor_start = 0.0
+                    anchor_end = 0.0
+                    all_required_groups_matched = False
+                if not math.isfinite(anchor_start) or not math.isfinite(anchor_end):
+                    anchor_start = 0.0
+                    anchor_end = 0.0
+                    all_required_groups_matched = False
+                anchor_tolerance = path_tolerance * max(1.0, abs(anchor_start), abs(anchor_end))
+                if anchor_end < anchor_start - anchor_tolerance:
+                    all_required_groups_matched = False
+                group_length = max(anchor_end - anchor_start, 0.0)
+                speed_value = float(anchor_state.get("command_speed", 0.0) or 0.0)
+                motion_type = anchor_state.get("motion_type")
+                start_coords = (
+                    float(anchor_state.get("start_x", anchor_state.get("x", 0.0)) or 0.0),
+                    float(anchor_state.get("start_y", anchor_state.get("y", 0.0)) or 0.0),
+                    float(anchor_state.get("start_z", anchor_state.get("z", 0.0)) or 0.0),
+                )
+                end_coords = (
+                    float(anchor_state.get("x", start_coords[0]) or start_coords[0]),
+                    float(anchor_state.get("y", start_coords[1]) or start_coords[1]),
+                    float(anchor_state.get("z", start_coords[2]) or start_coords[2]),
+                )
+            else:
+                group_length = 0.0
+                speed_value = 0.0
+                motion_type = None
+                if row_index > 0:
+                    previous = rows[row_index - 1]
+                    start_coords = (
+                        float(previous.get("x", 0.0) or 0.0),
+                        float(previous.get("y", 0.0) or 0.0),
+                        float(previous.get("z", 0.0) or 0.0),
+                    )
+                else:
+                    start_coords = (0.0, 0.0, 0.0)
+                end_coords = start_coords
+
+            group_count = len(group_rows)
+            group_step = group_length / group_count if group_count else 0.0
+            for offset, row in enumerate(group_rows):
+                row["path_start"] = cumulative_total
+                cumulative_total += group_step
+                row["path_end"] = cumulative_total
+                row["path_cumulative"] = cumulative_total
+                row["s"] = group_step
+                if speed_value > 0 and not bool(row.get("_has_input_spindle_speed")):
+                    row["S"] = speed_value
+                if motion_type:
+                    row["type"] = motion_type
+                ratio = (offset + 1) / group_count if group_count else 1.0
+                row["x"] = start_coords[0] + (end_coords[0] - start_coords[0]) * ratio
+                row["y"] = start_coords[1] + (end_coords[1] - start_coords[1]) * ratio
+                row["z"] = start_coords[2] + (end_coords[2] - start_coords[2]) * ratio
+            row_index = group_end
+
+        return all_required_groups_matched and self._path_positions_are_physical(rows)
+
+    def _get_sequential_fallback_step(self):
+        """从分割配置读取非物理顺序回退步长，未初始化时使用配置默认值。"""
+        step = self._get_segmentation_config_value("sequential_fallback_step_mm", 1.0)
+        try:
+            step = float(step)
+        except (TypeError, ValueError):
+            step = 1.0
+        return step if math.isfinite(step) and step > 0.0 else 1.0
+
+    def _apply_sequential_fallback_positions(self, rows):
+        """所有物理来源无效时生成确定性顺序轴，并明确标记为非物理。"""
+        step = self._get_sequential_fallback_step()
+        cumulative_total = 0.0
+        for row in rows:
+            row["s"] = step
+            row["path_start"] = cumulative_total
+            cumulative_total += step
+            row["path_end"] = cumulative_total
+            row["path_cumulative"] = cumulative_total
+
+    def _mark_process_path_source(self, rows, source, is_physical, input_validation):
+        for row in rows:
+            row["path_source"] = source
+            row["path_is_physical"] = bool(is_physical)
+            row["input_path_valid"] = bool(input_validation.get("valid"))
+            row["input_path_validity_reason"] = input_validation.get("reason", "unknown")
+        diagnostics = {
+            "path_source": source,
+            "path_is_physical": bool(is_physical),
+            "used_nonphysical_fallback": not bool(is_physical),
+            "input_path_present": bool(input_validation.get("present")),
+            "input_path_valid": bool(input_validation.get("valid")),
+            "input_path_validity_reason": input_validation.get("reason", "unknown"),
+            "input_path_span": float(input_validation.get("span", 0.0) or 0.0),
+            "input_path_semantics": input_validation.get("semantics", "unknown"),
+        }
+        diagnostics.update(dict(getattr(self, "process_input_diagnostics", {}) or {}))
+        diagnostics.update(dict(getattr(self, "process_line_number_diagnostics", {}) or {}))
+        self.process_path_diagnostics = diagnostics
+        self.process_path_source = source
+        self.process_path_is_physical = bool(is_physical)
+
+    def _apply_nc_profile_to_process_rows(self, rows, origin=None):
+        """按输入行程、NC、G 几何、顺序回退的优先级统一建立行程轴。"""
         if not rows:
             return
-        has_input_path_bounds = any(bool(row.get("_has_input_path_bounds")) for row in rows)
-        if has_input_path_bounds:
-            self._apply_input_path_positions(rows)
-        elif not getattr(self, "gcode_profile", None):
-            self._assign_group_distributed_path_positions(rows)
-        else:
-            row_index = 0
-            while row_index < len(rows):
-                group_key = rows[row_index].get("line_no_raw")
-                group_end = row_index
-                while group_end < len(rows) and rows[group_end].get("line_no_raw") == group_key:
-                    group_end += 1
+        if origin is None:
+            try:
+                origin = (self.origin_x.get(), self.origin_y.get(), self.origin_z.get())
+            except Exception:
+                origin = (0.0, 0.0, 0.0)
 
-                group_rows = rows[row_index:group_end]
-                anchor_state = self._resolve_nc_state_for_process_row(
-                    group_rows[0].get("line_no_raw"),
-                    group_rows[0].get("gcode_content"),
-                )
-                if anchor_state:
-                    group_start = float(anchor_state.get("path_start", 0.0) or 0.0)
-                    group_end_pos = float(anchor_state.get("path_end", group_start) or group_start)
-                    group_count = len(group_rows)
-                    group_step = (group_end_pos - group_start) / group_count if group_count else 0.0
-                    speed_value = float(anchor_state.get("command_speed", 0.0) or 0.0)
-                    feed_value = float(anchor_state.get("feed", 0.0) or 0.0)
-                    motion_type = anchor_state.get("motion_type")
-                    start_coords = (
-                        float(anchor_state.get("start_x", anchor_state.get("x", 0.0)) or 0.0),
-                        float(anchor_state.get("start_y", anchor_state.get("y", 0.0)) or 0.0),
-                        float(anchor_state.get("start_z", anchor_state.get("z", 0.0)) or 0.0),
-                    )
-                    end_coords = (
-                        float(anchor_state.get("x", start_coords[0]) or start_coords[0]),
-                        float(anchor_state.get("y", start_coords[1]) or start_coords[1]),
-                        float(anchor_state.get("z", start_coords[2]) or start_coords[2]),
-                    )
-                    for offset, row in enumerate(group_rows):
-                        row["path_start"] = group_start + group_step * offset
-                        row["path_end"] = group_start + group_step * (offset + 1)
-                        row["path_cumulative"] = row["path_end"]
-                        row["s"] = group_step
-                        if speed_value > 0 and not bool(row.get("_has_input_spindle_speed")):
-                            row["S"] = speed_value
-                        if (float(row.get("feed_effective", 0.0) or 0.0) <= 0.0) and feed_value > 0:
-                            row["feed_effective"] = feed_value
-                        if motion_type:
-                            row["type"] = motion_type
-                        if group_count > 0:
-                            interp_ratio = (offset + 1) / group_count
-                        else:
-                            interp_ratio = 1.0
-                        row["x"] = start_coords[0] + (end_coords[0] - start_coords[0]) * interp_ratio
-                        row["y"] = start_coords[1] + (end_coords[1] - start_coords[1]) * interp_ratio
-                        row["z"] = start_coords[2] + (end_coords[2] - start_coords[2]) * interp_ratio
+        # 行号补齐完成后才按精确文件行回填缺失转速；不使用旧的最近行匹配。
+        for row in rows:
+            if bool(row.get("_has_input_spindle_speed")):
+                continue
+            exact_state = self._resolve_exact_nc_state_for_process_row(
+                row.get("line_no_raw"),
+                row.get("gcode_content"),
+            )
+            if not exact_state:
+                continue
+            try:
+                exact_speed = float(exact_state.get("command_speed", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                exact_speed = 0.0
+            if math.isfinite(exact_speed) and exact_speed > 0.0:
+                row["S"] = exact_speed
+
+        input_validation = self._validate_input_path(rows)
+        if input_validation["valid"]:
+            # 有效输入行程绝对优先；这里只解析坐标/模态，不计算 G 几何长度。
+            self._apply_gcode_geometry_positions(rows, origin, calculate_path=False)
+            path_semantics = str(input_validation.get("semantics") or "unknown")
+            self._apply_input_path_positions(rows, path_semantics)
+            path_source = f"input_{path_semantics}"
+            path_is_physical = True
+        else:
+            used_nc_profile = bool(getattr(self, "gcode_profile", None)) and self._apply_bound_nc_profile_positions(rows)
+            if used_nc_profile:
+                path_source = "nc_profile"
+                path_is_physical = True
+            else:
+                self._apply_gcode_geometry_positions(rows, origin, calculate_path=True)
+                if self._path_positions_are_physical(rows):
+                    path_source = "gcode_geometry"
+                    path_is_physical = True
                 else:
-                    previous_end = 0.0
-                    if row_index > 0:
-                        previous_end = float(rows[row_index - 1].get("path_end", 0.0) or 0.0)
-                    for row in group_rows:
-                        row["s"] = 0.0
-                        row["path_start"] = previous_end
-                        row["path_end"] = previous_end
-                        row["path_cumulative"] = previous_end
-                row_index = group_end
+                    self._apply_sequential_fallback_positions(rows)
+                    path_source = "sequential_fallback"
+                    path_is_physical = False
+
+        self._mark_process_path_source(rows, path_source, path_is_physical, input_validation)
 
         s_base = self.s_base.get()
         k_base = self.k_base.get()
@@ -938,6 +1553,16 @@ class ProcessingCoreMixin:
         """清理工艺信息表处理与预览状态"""
         self.data = []
         self._clear_current_interval_state()
+        self._latest_segmentation_result = None
+        cleaner = getattr(self, "_clear_segmentation_output_artifacts", None)
+        if callable(cleaner):
+            try:
+                cleaner()
+            except OSError as exc:
+                if hasattr(self, "segmentation_status_var"):
+                    self.segmentation_status_var.set(f"全行程六类划分: 旧导出清理失败（{exc}）")
+        if hasattr(self, "segmentation_status_var"):
+            self.segmentation_status_var.set("全行程六类划分: 未运行")
         if hasattr(self, "_clear_runtime_identified_profile_state"):
             self._clear_runtime_identified_profile_state(clear_active=True, reason="reset_processing_state")
         self.processed_file_path = ""
@@ -950,7 +1575,9 @@ class ProcessingCoreMixin:
         self.current_figure_index = 0
         self._process_point_lookup_cache = None
         self._process_point_lookup_cache_key = None
+        self._process_point_metadata_cache_key = None
         self._sample_line_point_context_cache = None
+        self._authoritative_segmentation_sample_lookup_cache = None
         self._smif_source_cache = None
         self._smif_dashboard_payload = None
         self._smif_focus_bounds = None
@@ -1237,29 +1864,44 @@ class ProcessingCoreMixin:
             # 只读取文件，不写入输出
             input_encoding = self.detect_file_encoding(input_file)
             with open(input_file, 'r', encoding=input_encoding, errors='ignore') as infile:
-                prev_coords = origin
                 current_coords = origin
-                modal_gcode_state = self._create_modal_gcode_state()
                 data = []
                 s_base = self.s_base.get()
                 k_base = self.k_base.get()
                 current_s = float(self.current_program_speed.get() or s_base)
                 fallback_speed = float(current_s if current_s > 0 else s_base)
                 current_feed = 0.0
-                current_move_type = "rapid"  # 从机床原点开始，初始为快速移动
                 process_layout = None
-                prev_input_path_cumulative = None
+                process_path_semantics_hint = None
                 kc_value = self.get_kc_value()
                 ke_value = self.get_ke_value()
                 idle_power_predict = self._create_idle_power_predictor() if hasattr(self, "_create_idle_power_predictor") else self.predict_idle_power
+                source_file_line_count = 0
+                raw_nonempty_row_count = 0
+                header_row_count = 0
                  
                 prev_aligned_line = None
                 prev_gcode_content = None  # 跟踪上一行的G代码内容（第六列之后）
                 current_n_group_line = None  # 当前G代码组的重构行号
-                prev_raw_line = None  # 跟踪上一行的原始行号，用于检测行号缺失
                 for line_num, line in enumerate(infile):
+                    source_file_line_count += 1
+                    if str(line).strip():
+                        raw_nonempty_row_count += 1
+                    raw_csv_line = str(line or "").strip().lstrip("\ufeff")
+                    if raw_csv_line and "," in raw_csv_line:
+                        try:
+                            header_tokens = next(csv.reader([raw_csv_line]))
+                        except Exception:
+                            header_tokens = []
+                        if self._detect_process_header_layout(header_tokens):
+                            process_path_semantics_hint = (
+                                self._detect_process_path_semantics_hint(header_tokens)
+                            )
+                    previous_layout = process_layout
                     parsed, process_layout = self.parse_gcode_line(line, layout_hint=process_layout, return_layout=True)
                     if not parsed:
+                        if previous_layout is None and process_layout is not None:
+                            header_row_count += 1
                         continue
                     
                     ap = float(parsed.get("ap", 0.0) or 0.0)
@@ -1267,70 +1909,15 @@ class ProcessingCoreMixin:
                     feed_rate = float(parsed.get("feed_rate", 0.0) or 0.0)
                     gcode_content = str(parsed.get("gcode_content", "") or "")
                     spindle_speed = parsed.get("spindle_speed")
-                    input_path_cumulative = parsed.get("path_cumulative")
+                    input_path_value = parsed.get("path_value")
                     raw_line_number = parsed.get("line_number")
-                    direct_path_length = None
-                    input_path_start = None
-                    input_path_end = None
-                    if input_path_cumulative is not None:
-                        try:
-                            input_path_end = float(input_path_cumulative)
-                        except Exception:
-                            input_path_end = None
-                        if input_path_end is not None:
-                            if prev_input_path_cumulative is None:
-                                input_path_start = 0.0
-                            else:
-                                input_path_start = float(prev_input_path_cumulative)
-                            if input_path_end < input_path_start:
-                                input_path_end = input_path_start
-                            direct_path_length = input_path_end - input_path_start
-                            prev_input_path_cumulative = input_path_end
-                    else:
-                        prev_input_path_cumulative = None
-                    nc_state = self._resolve_nc_state_for_process_row(raw_line_number, gcode_content)
-                    nc_speed = float(nc_state.get("command_speed", 0.0)) if nc_state else 0.0
-                    nc_feed = float(nc_state.get("feed", 0.0)) if nc_state else 0.0
-                    
-                    # === 行号缺失补齐：检测raw_line_number跳跃，用P=0占位 ===
-                    if raw_line_number is not None and prev_raw_line is not None and raw_line_number > prev_raw_line + 1:
-                        for missing_raw in range(prev_raw_line + 1, raw_line_number):
-                            fill_aligned = current_n_group_line + 1 if current_n_group_line is not None else missing_raw
-                            current_n_group_line = fill_aligned
-                            prev_aligned_line = fill_aligned
-                            prev_gcode_content = None  # 补齐行没有G代码内容
-                            fill_speed = current_s if current_s > 0 else fallback_speed
-                            fill_idle = idle_power_predict(fill_speed)
-                            data.append({
-                                's': 0, 't': 0,
-                                'ap': 0, 'ae': 0,
-                                'dMRV': 0, 'MRR': 0,
-                                'S': current_s, 'K': kc_value,
-                                'T': 0, 'P': fill_idle,
-                                'P_idle': fill_idle,
-                                'P_edge': 0.0,
-                                'K_c': kc_value,
-                                'K_e': ke_value,
-                                'type': 'rapid',
-                                'N_str': None,
-                                'x': float(current_coords[0]),
-                                'y': float(current_coords[1]),
-                                'z': float(current_coords[2]),
-                                'line_no_raw': missing_raw,
-                                'line_no_aligned': fill_aligned
-                            })
-                    
+
                     # 更新转速
                     if spindle_speed is not None:
                         current_s = float(spindle_speed)
-                    elif nc_speed > 0:
-                        current_s = nc_speed
-                    
-                    # 更新进给速度
-                    if feed_rate > 0:
-                        current_feed = feed_rate
-                    elif nc_feed > 0:
-                        current_feed = nc_feed
+
+                    # ProcessInfo 的 F 是当前行原始编程进给；显式 0 不能沿用上一行。
+                    current_feed = float(feed_rate)
                     
                     n_value = self.extract_n_value(gcode_content)
                     
@@ -1356,30 +1943,13 @@ class ProcessingCoreMixin:
                             prev_gcode_content = gcode_content
                     
                     prev_aligned_line = aligned_line
-                    # 更新上一行的原始行号
-                    if raw_line_number is not None:
-                        prev_raw_line = raw_line_number
                     
-                    motion_info = self.compute_gcode_motion_info(
-                        gcode_content,
-                        prev_coords=prev_coords,
-                        prev_state=modal_gcode_state
-                    )
-                    modal_gcode_state = motion_info["state"]
-                    current_coords = motion_info["end_coords"]
-                    computed_path_length = motion_info["segment_length"]
-                    if direct_path_length is not None:
-                        s = float(direct_path_length)
-                    else:
-                        s = float(computed_path_length)
-                    if motion_info["motion_type"] is not None:
-                        current_move_type = motion_info["motion_type"]
                     effective_speed = current_s if current_s > 0 else fallback_speed
                     p_idle = idle_power_predict(effective_speed)
                     
                     # 收集基础数据，派生功率列在最终回填阶段统一计算，避免重复计算两遍
                     data.append({
-                        's': s,
+                        's': 0.0,
                         't': 0.0,
                         'ap': ap,
                         'ae': ae,
@@ -1393,7 +1963,7 @@ class ProcessingCoreMixin:
                         'P_edge': 0.0,
                         'K_c': kc_value,
                         'K_e': ke_value,
-                        'type': current_move_type,
+                        'type': 'rapid',
                         'N_str': n_value,  # 存储N列字符串值
                         'x': float(current_coords[0]),
                         'y': float(current_coords[1]),
@@ -1402,19 +1972,30 @@ class ProcessingCoreMixin:
                         'line_no_aligned': aligned_line,
                         'gcode_content': gcode_content,
                         'feed_effective': float(current_feed),
-                        '_has_input_path_bounds': input_path_start is not None and input_path_end is not None,
-                        '_input_path_start': input_path_start,
-                        '_input_path_end': input_path_end,
+                        '_has_input_path_bounds': False,
+                        '_input_path_column_present': bool(parsed.get('path_column_present')),
+                        '_input_path_value': input_path_value,
+                        '_input_path_semantics_hint': process_path_semantics_hint,
                         '_has_input_spindle_speed': spindle_speed is not None,
+                        '_is_synthetic_fill': False,
                     })
-                    
-                    # 更新上一行坐标
-                    prev_coords = current_coords
-                
-                self._apply_nc_profile_to_process_rows(data)
+
+                raw_data_row_count = max(raw_nonempty_row_count - header_row_count, 0)
+                self.process_input_diagnostics = {
+                    "source_file_line_count": int(source_file_line_count),
+                    "raw_nonempty_row_count": int(raw_nonempty_row_count),
+                    "header_row_count": int(header_row_count),
+                    "raw_data_row_count": int(raw_data_row_count),
+                    "valid_process_point_count": int(len(data)),
+                    "discarded_data_row_count": int(max(raw_data_row_count - len(data), 0)),
+                }
+                self._restore_missing_line_numbers_from_nc_profile(data)
+                self._apply_nc_profile_to_process_rows(data, origin=origin)
                 self.data = data
                 self._process_point_lookup_cache = None
                 self._process_point_lookup_cache_key = None
+                self._process_point_metadata_cache_key = None
+                self._authoritative_segmentation_sample_lookup_cache = None
 
             self.build_raw_to_aligned_line_map()
             if self.sample_data_loaded:

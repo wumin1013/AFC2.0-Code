@@ -1,11 +1,366 @@
 from __future__ import annotations
 
 import csv
+from pathlib import Path
+
+from matplotlib.collections import PolyCollection
 
 from .shared import *
 
 
 class AnalysisExportMixin:
+    def _clear_segmentation_output_artifacts(self, output_dir=None):
+        """清理固定六态导出及其临时文件，避免旧结果冒充当前结果。"""
+        target_dir = Path(output_dir) if output_dir is not None else OUTPUT_DIR / "segmentation"
+        if not target_dir.exists():
+            return
+        file_names = (
+            "intervals.csv",
+            "overview.png",
+            "diagnostics.json",
+            "point_labels.csv",
+            ".intervals.tmp.csv",
+            ".overview.tmp.png",
+            ".diagnostics.tmp.json",
+            ".intervals.bak.csv",
+            ".overview.bak.png",
+            ".diagnostics.bak.json",
+        )
+        errors = []
+        for file_name in file_names:
+            path = target_dir / file_name
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                errors.append(f"{file_name}: {exc}")
+        if errors:
+            raise OSError("；".join(errors))
+
+    def _coerce_segmentation_dataframe(self, result, attribute_name):
+        payload = getattr(result, attribute_name, None)
+        if isinstance(payload, pd.DataFrame):
+            return payload.copy()
+        if isinstance(payload, (list, tuple)):
+            return pd.DataFrame(list(payload))
+        if isinstance(payload, dict):
+            return pd.DataFrame(payload)
+        raise TypeError(f"SegmentationResult.{attribute_name} must be a pandas DataFrame")
+
+    def _normalize_segmentation_json_value(self, value):
+        if isinstance(value, dict):
+            return {
+                str(key): self._normalize_segmentation_json_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple, set)):
+            return [self._normalize_segmentation_json_value(item) for item in value]
+        if isinstance(value, np.ndarray):
+            return [self._normalize_segmentation_json_value(item) for item in value.tolist()]
+        if isinstance(value, (np.bool_, bool)):
+            return bool(value)
+        if isinstance(value, (np.integer, int)):
+            return int(value)
+        if isinstance(value, (np.floating, float)):
+            numeric = float(value)
+            return numeric if np.isfinite(numeric) else None
+        if isinstance(value, Path):
+            return str(value)
+        if value is None or isinstance(value, str):
+            return value
+        return str(value)
+
+    def _save_segmentation_overview(
+        self,
+        predicted_load,
+        interval_records,
+        output_path,
+        *,
+        predicted_idle_power=None,
+        background_payload=None,
+    ):
+        """绘制实际采样级预测负载及六态背景，不显示其他工艺量。"""
+        predicted = np.asarray(predicted_load, dtype=float)
+        if predicted.size == 0 or not np.any(np.isfinite(predicted)):
+            raise ValueError("样本级预测负载为空，无法生成 overview.png")
+        if background_payload is None:
+            background_payload = self.build_segmentation_sample_background_masks(
+                predicted,
+                predicted_idle_power,
+                interval_records,
+            )
+
+        x_values = np.arange(predicted.size, dtype=float)
+        fig, ax = plt.subplots(1, 1, figsize=(16, 5.8), dpi=120)
+        try:
+            fig.patch.set_facecolor(PLOT_FIG_BG)
+            self.apply_plot_style(ax, grid=True)
+            boundaries = set()
+            state_masks = dict(background_payload.get("state_masks", {}) or {})
+            for segment_type, mask in state_masks.items():
+                style = self.get_segmentation_state_style(segment_type)
+                blocks = self.compute_contiguous_blocks(np.asarray(mask, dtype=bool))
+                for block_index, (start_idx, end_idx) in enumerate(blocks):
+                    ax.axvspan(
+                        float(start_idx) - 0.5,
+                        float(end_idx) + 0.5,
+                        facecolor=style["color"],
+                        edgecolor="none",
+                        alpha=0.30,
+                        label=style["label"] if block_index == 0 else None,
+                        zorder=0,
+                    )
+                    boundaries.add(float(start_idx) - 0.5)
+                    boundaries.add(float(end_idx) + 0.5)
+            for boundary in sorted(boundaries):
+                ax.axvline(
+                    float(boundary),
+                    color="#263238",
+                    linewidth=0.45,
+                    alpha=0.45,
+                    zorder=1,
+                )
+
+            finite_mask = np.asarray(
+                background_payload.get("valid_mask", np.zeros(predicted.size, dtype=bool)),
+                dtype=bool,
+            )
+            if finite_mask.size != predicted.size:
+                raise ValueError("六态背景有效掩码与预测负载数量不一致")
+            ax.plot(
+                x_values[finite_mask],
+                predicted[finite_mask],
+                color=self.get_segmentation_predicted_line_color(),
+                linewidth=1.05,
+                label="预测负载",
+                zorder=3,
+            )
+            ax.set_title("预测负载与六态区间", fontsize=14, fontweight="bold")
+            ax.set_xlabel("实际负载采样点索引（0 基）", fontsize=11)
+            ax.set_ylabel("预测负载", fontsize=11)
+            ax.set_xlim(-0.5, float(max(predicted.size, 1)) - 0.5)
+            ax.margins(x=0)
+            handles, labels = ax.get_legend_handles_labels()
+            if handles:
+                ax.legend(
+                    handles,
+                    labels,
+                    loc="upper center",
+                    bbox_to_anchor=(0.5, 1.18),
+                    ncol=7,
+                    frameon=False,
+                    fontsize=9,
+                )
+            fig.subplots_adjust(left=0.075, right=0.985, top=0.82, bottom=0.14)
+            fig.savefig(output_path, dpi=180, bbox_inches="tight", facecolor=fig.get_facecolor())
+        finally:
+            plt.close(fig)
+
+    def export_latest_segmentation_result(self, result=None, output_dir=None):
+        """独立导出最近一次六态结果，并原子更新固定导出文件。"""
+        resolved_result = result or getattr(self, "_latest_segmentation_result", None)
+        if resolved_result is None:
+            raise ValueError("当前没有可导出的全行程六类划分结果")
+
+        target_dir = Path(output_dir) if output_dir is not None else OUTPUT_DIR / "segmentation"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        self._clear_segmentation_output_artifacts(target_dir)
+        paths = {
+            "intervals": target_dir / "intervals.csv",
+            "overview": target_dir / "overview.png",
+            "diagnostics": target_dir / "diagnostics.json",
+        }
+
+        point_labels = self._coerce_segmentation_dataframe(resolved_result, "point_labels")
+        intervals = self._coerce_segmentation_dataframe(resolved_result, "intervals")
+        required_point_columns = {
+            "point_id", "s", "interval_id", "segment_type", "state_code",
+            "review_required",
+        }
+        required_interval_columns = {
+            "interval_id", "start_s", "end_s", "segment_type", "state_code",
+            "review_required",
+        }
+        missing_point_columns = sorted(required_point_columns.difference(point_labels.columns))
+        missing_interval_columns = sorted(required_interval_columns.difference(intervals.columns))
+        if missing_point_columns or missing_interval_columns:
+            details = []
+            if missing_point_columns:
+                details.append(f"point_labels 缺少 {missing_point_columns}")
+            if missing_interval_columns:
+                details.append(f"intervals 缺少 {missing_interval_columns}")
+            raise ValueError("；".join(details))
+
+        point_codes = pd.to_numeric(point_labels["state_code"], errors="coerce")
+        interval_codes = pd.to_numeric(intervals["state_code"], errors="coerce")
+        if not point_codes.isin(range(6)).all() or not interval_codes.isin(range(6)).all():
+            raise ValueError("六态结构化输出包含 0..5 之外的 state_code")
+
+        runtime_records = self._adapt_segmentation_interval_records(resolved_result)
+        projected_records = self._materialize_segmentation_sample_bounds(runtime_records)
+        prediction_payload = self._get_segmentation_prediction_payload()
+        predicted_load = np.asarray(prediction_payload["predicted_load"], dtype=float)
+        predicted_idle_power = np.asarray(
+            prediction_payload.get("predicted_idle_power", []),
+            dtype=float,
+        )
+        program_lines = np.asarray(prediction_payload["program_line"], dtype=int)
+        if predicted_load.size != program_lines.size:
+            raise ValueError("预测负载与实际采样行号数量不一致")
+        sample_lines = self._get_segmentation_sample_lines()
+        if program_lines.size != sample_lines.size or not np.array_equal(program_lines, sample_lines):
+            raise ValueError("预测负载的程序行序列与实际采样文件不一致")
+        background_payload = self.build_segmentation_sample_background_masks(
+            predicted_load,
+            predicted_idle_power,
+            projected_records,
+        )
+
+        state_rows = {code: [] for code in range(6)}
+        for record in projected_records:
+            state_code = int(record.get("state_code"))
+            interval_range = str(record.get("sample_interval_range") or "").strip()
+            if state_code not in state_rows or not interval_range:
+                raise ValueError("六态区间缺少有效的实际采样坐标")
+            state_rows[state_code].append(interval_range)
+
+        diagnostics = dict(getattr(resolved_result, "diagnostics", {}) or {})
+        config = getattr(resolved_result, "config", None)
+        if hasattr(config, "to_dict"):
+            config_payload = config.to_dict()
+        elif isinstance(config, dict):
+            config_payload = dict(config)
+        else:
+            config_payload = dict(getattr(config, "__dict__", {}) or {})
+        diagnostics["config"] = config_payload
+        covered_sample_count = int(sum(
+            int(record.get("sample_count", 0) or 0)
+            for record in projected_records
+        ))
+        projection_start = int(projected_records[0]["sample_start_idx"])
+        projection_end = int(projected_records[-1]["sample_end_idx"])
+        diagnostics["sample_projection"] = {
+            **dict(diagnostics.get("sample_projection", {}) or {}),
+            "valid": True,
+            "sample_count": int(predicted_load.size),
+            "interval_count": int(len(projected_records)),
+            "covered_sample_count": covered_sample_count,
+            "projected_sample_start_idx": projection_start,
+            "projected_sample_end_idx": projection_end,
+            "projected_start_label": str(
+                projected_records[0].get("sample_start_label") or ""
+            ),
+            "projected_end_label": str(
+                projected_records[-1].get("sample_end_label") or ""
+            ),
+            "coordinate_format": "line.zero_based_point-line.zero_based_point",
+            "endpoint_inclusive": True,
+        }
+        diagnostics["sample_visualization"] = {
+            "valid_sample_count": int(background_payload["valid_sample_count"]),
+            "process_projected_sample_count": int(
+                background_payload["process_projected_sample_count"]
+            ),
+            "external_idle_sample_count": int(
+                background_payload["external_idle_sample_count"]
+            ),
+            "external_nonsteady_sample_count": int(
+                background_payload["external_nonsteady_sample_count"]
+            ),
+            "idle_power_tolerance": float(background_payload["idle_power_tolerance"]),
+            "display_only": True,
+        }
+        diagnostics["interval_csv"] = {
+            "row_count": 6,
+            "export_state_codes": {
+                "1": "idle",
+                "2": "entry",
+                "3": "steady",
+                "4": "transition",
+                "5": "nonsteady",
+                "6": "exit",
+            },
+        }
+        for attribute_name in ("input_schema_version", "scorer_type", "model_version"):
+            diagnostics[attribute_name] = getattr(resolved_result, attribute_name, None)
+        diagnostics_payload = self._normalize_segmentation_json_value(diagnostics)
+
+        temporary_paths = {
+            key: path.with_name(f".{path.stem}.tmp{path.suffix}")
+            for key, path in paths.items()
+        }
+        backup_paths = {
+            key: path.with_name(f".{path.stem}.bak{path.suffix}")
+            for key, path in paths.items()
+        }
+        try:
+            with temporary_paths["intervals"].open(
+                "w",
+                encoding="utf-8",
+                newline="",
+            ) as stream:
+                writer = csv.writer(stream, lineterminator="\n")
+                for state_code in range(6):
+                    writer.writerow([state_code + 1, *state_rows[state_code]])
+            self._save_segmentation_overview(
+                predicted_load,
+                projected_records,
+                temporary_paths["overview"],
+                predicted_idle_power=predicted_idle_power,
+                background_payload=background_payload,
+            )
+            with temporary_paths["diagnostics"].open(
+                "w",
+                encoding="utf-8",
+                newline="\n",
+            ) as stream:
+                json.dump(
+                    diagnostics_payload,
+                    stream,
+                    ensure_ascii=False,
+                    indent=2,
+                    allow_nan=False,
+                )
+                stream.write("\n")
+            backed_up_keys = []
+            replaced_keys = []
+            try:
+                for key, target_path in paths.items():
+                    backup_paths[key].unlink(missing_ok=True)
+                    if target_path.exists():
+                        target_path.replace(backup_paths[key])
+                        backed_up_keys.append(key)
+                for key, target_path in paths.items():
+                    temporary_paths[key].replace(target_path)
+                    replaced_keys.append(key)
+            except Exception as replace_exc:
+                for key in reversed(replaced_keys):
+                    paths[key].unlink(missing_ok=True)
+                rollback_errors = []
+                for key in reversed(backed_up_keys):
+                    try:
+                        backup_paths[key].replace(paths[key])
+                    except Exception as rollback_exc:
+                        rollback_errors.append(f"{key}: {rollback_exc}")
+                if rollback_errors:
+                    raise RuntimeError(
+                        "六态导出替换失败，且旧文件回滚不完整："
+                        + "；".join(rollback_errors)
+                    ) from replace_exc
+                raise
+            else:
+                for backup_path in backup_paths.values():
+                    backup_path.unlink(missing_ok=True)
+        finally:
+            for temporary_path in temporary_paths.values():
+                temporary_path.unlink(missing_ok=True)
+
+        if hasattr(self, "segmentation_status_var"):
+            self.segmentation_status_var.set(
+                f"全行程六类划分: 已导出 {len(projected_records)} 段 / "
+                f"覆盖 {covered_sample_count} 个实际采样点（文件共 {predicted_load.size} 点）"
+            )
+        return paths
+
     def _format_interval_point_range(self, interval):
         """按“行号.点号-行号.点号”格式返回区间边界。"""
         start_label = str(interval.get("start_label") or "").strip()
@@ -302,7 +657,7 @@ class AnalysisExportMixin:
             return artist
 
     def _draw_curve_background_blocks(self, ax, x_values, y_values, blocks, color, alpha, label, zorder):
-        """按连续分块绘制贴着预测负载的背景带，避免整轴铺满。"""
+        """按完整横坐标的共享单元边界绘制互斥背景块。"""
         x_arr = np.asarray(x_values, dtype=float)
         y_arr = np.asarray(y_values, dtype=float)
         if x_arr.size == 0 or y_arr.size != x_arr.size:
@@ -312,45 +667,67 @@ class AnalysisExportMixin:
         if not normalized_blocks:
             return []
 
-        finite_x = x_arr[np.isfinite(x_arr)]
-        default_step = float(np.nanmedian(np.diff(finite_x))) if finite_x.size > 1 else 1.0
-        if not np.isfinite(default_step) or default_step <= 0.0:
-            default_step = 1.0
+        # 每个采样点占用相邻中心中点之间的单元。所有状态都从完整 x 序列
+        # 计算同一组边界，因此非均匀间距和重复坐标都不会产生正宽度重叠。
+        finite_indices = np.flatnonzero(np.isfinite(x_arr))
+        if finite_indices.size == 0:
+            return []
+        finite_centers = x_arr[finite_indices]
+        cell_left = np.full(x_arr.size, np.nan, dtype=float)
+        cell_right = np.full(x_arr.size, np.nan, dtype=float)
+        if finite_indices.size == 1:
+            only_idx = int(finite_indices[0])
+            cell_left[only_idx] = float(finite_centers[0])
+            cell_right[only_idx] = float(finite_centers[0])
+        else:
+            shared_edges = finite_centers[:-1] + np.diff(finite_centers) * 0.5
+            cell_right[finite_indices[:-1]] = shared_edges
+            cell_left[finite_indices[1:]] = shared_edges
+            first_step = float(finite_centers[1] - finite_centers[0])
+            last_step = float(finite_centers[-1] - finite_centers[-2])
+            cell_left[int(finite_indices[0])] = float(finite_centers[0] - first_step * 0.5)
+            cell_right[int(finite_indices[-1])] = float(finite_centers[-1] + last_step * 0.5)
 
-        artists = []
-        first = True
+        polygons = []
         for start_idx, end_idx in normalized_blocks:
-            segment_x = x_arr[start_idx:end_idx + 1]
-            segment_y = np.maximum(y_arr[start_idx:end_idx + 1], 0.0)
-            finite_mask = np.isfinite(segment_x) & np.isfinite(segment_y)
-            if not np.any(finite_mask):
+            valid_mask = (
+                np.isfinite(x_arr[start_idx:end_idx + 1])
+                & np.isfinite(y_arr[start_idx:end_idx + 1])
+            )
+            valid_offsets = np.flatnonzero(valid_mask)
+            if valid_offsets.size == 0:
                 continue
-            segment_x = segment_x[finite_mask]
-            segment_y = segment_y[finite_mask]
-            if segment_x.size == 0:
-                continue
-            if segment_x.size == 1:
-                center_x = float(segment_x[0])
-                local_step = default_step
-                if start_idx > 0 and np.isfinite(x_arr[start_idx - 1]):
-                    local_step = max(local_step, abs(center_x - float(x_arr[start_idx - 1])))
-                if end_idx + 1 < x_arr.size and np.isfinite(x_arr[end_idx + 1]):
-                    local_step = max(local_step, abs(float(x_arr[end_idx + 1]) - center_x))
-                half_step = max(local_step * 0.5, 1e-9)
-                segment_x = np.asarray([center_x - half_step, center_x + half_step], dtype=float)
-                segment_y = np.asarray([segment_y[0], segment_y[0]], dtype=float)
-            fill_kwargs = {
-                "facecolor": color,
-                "edgecolor": "none",
-                "alpha": alpha,
-                "zorder": zorder,
-                "linewidth": 0.0,
-            }
-            if first and label:
-                fill_kwargs["label"] = label
-            artists.append(ax.fill_between(segment_x, 0.0, segment_y, **fill_kwargs))
-            first = False
-        return artists
+
+            # 异常值造成的洞必须拆开，不能跨洞连接成一个多边形。
+            split_points = np.flatnonzero(np.diff(valid_offsets) > 1) + 1
+            for offset_run in np.split(valid_offsets, split_points):
+                run_start = int(start_idx + offset_run[0])
+                run_end = int(start_idx + offset_run[-1])
+                left_edge = float(cell_left[run_start])
+                right_edge = float(cell_right[run_end])
+                if not np.isfinite(left_edge) or not np.isfinite(right_edge):
+                    continue
+
+                segment_x = x_arr[run_start:run_end + 1]
+                segment_y = np.maximum(y_arr[run_start:run_end + 1], 0.0)
+                top_x = np.concatenate(([left_edge], segment_x, [right_edge]))
+                top_y = np.concatenate(([segment_y[0]], segment_y, [segment_y[-1]]))
+                top_vertices = np.column_stack((top_x, top_y))
+                bottom_vertices = np.column_stack((top_x[::-1], np.zeros(top_x.size)))
+                polygons.append(np.vstack((top_vertices, bottom_vertices)))
+        if not polygons:
+            return []
+        collection = PolyCollection(
+            polygons,
+            facecolors=color,
+            edgecolors="none",
+            linewidths=0.0,
+            alpha=alpha,
+            zorder=zorder,
+            label=label,
+        )
+        ax.add_collection(collection)
+        return [collection]
 
     def _get_process_path_bounds(self):
         """返回工艺信息每一行的累计行程区间。"""
@@ -673,7 +1050,7 @@ class AnalysisExportMixin:
             return None
 
         output_path = os.path.join(save_dir, "ProcessInfo.csv")
-        header = ["N", "S(r/min)", "ap(mm)", "ae(mm)", "F(mm/min)", "s(mm)", "MRR(mm3/min)", "G"]
+        header = ["N", "S(r/min)", "ap(mm)", "ae(mm)", "F(mm/min)", "s(mm)", "MRR(mm3/s)", "G"]
 
         def _as_csv_value(value):
             if value is None:
@@ -684,18 +1061,38 @@ class AnalysisExportMixin:
                 return f"{value:.6f}".rstrip("0").rstrip(".")
             return value
 
+        def _export_line_number(row):
+            try:
+                raw_line = float(row.get("line_no_raw"))
+            except (TypeError, ValueError):
+                raw_line = float("nan")
+            if np.isfinite(raw_line):
+                return f"N{int(round(raw_line)) + 1}"
+            return _as_csv_value(row.get("N_str"))
+
+        def _calculated_mrr(row):
+            try:
+                ap_value = max(float(row.get("ap", 0.0) or 0.0), 0.0)
+                ae_value = max(float(row.get("ae", 0.0) or 0.0), 0.0)
+                feed_value = max(float(row.get("feed_effective", 0.0) or 0.0), 0.0)
+            except (TypeError, ValueError):
+                return ""
+            if not all(np.isfinite(value) for value in (ap_value, ae_value, feed_value)):
+                return ""
+            return ap_value * ae_value * feed_value / 60.0
+
         with open(output_path, 'w', encoding='utf-8-sig', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(header)
             for row in self.data:
                 writer.writerow([
-                    _as_csv_value(row.get("N_str")),
+                    _export_line_number(row),
                     _as_csv_value(row.get("S")),
                     _as_csv_value(row.get("ap")),
                     _as_csv_value(row.get("ae")),
                     _as_csv_value(row.get("feed_effective")),
                     _as_csv_value(row.get("s")),
-                    _as_csv_value(row.get("MRR")),
+                    _as_csv_value(_calculated_mrr(row)),
                     _as_csv_value(row.get("gcode_content")),
                 ])
         return output_path
@@ -1739,6 +2136,31 @@ class AnalysisExportMixin:
             )
         
         try:
+            segmentation_authoritative = bool(
+                getattr(self, "_current_interval_ready", False)
+                and str(getattr(self, "_current_interval_source", "") or "") == "segmentation"
+            )
+            if not segmentation_authoritative:
+                runner = getattr(self, "run_full_path_segmentation", None)
+                if not callable(runner):
+                    raise RuntimeError("全行程六类划分入口不可用")
+                runner(
+                    export_outputs=False,
+                    refresh_view=False,
+                    silent=True,
+                )
+                segmentation_authoritative = bool(
+                    getattr(self, "_current_interval_ready", False)
+                    and str(getattr(self, "_current_interval_source", "") or "") == "segmentation"
+                )
+                if not segmentation_authoritative:
+                    if hasattr(self, "segmentation_status_var"):
+                        self.segmentation_status_var.set("全行程六类划分: 失败，未执行旧区间划分")
+                    self.status_var_data.set("全行程六类划分失败，图表未生成")
+                    if not silent:
+                        messagebox.showerror("区间划分失败", "未得到有效六类结果，已停止生成图表。")
+                    return False
+
             model_ready = self.has_prediction_model_ready() if hasattr(self, "has_prediction_model_ready") else self.has_identified_kc_ke()
             self.figures = []
             self.refresh_pit_button_state()
@@ -1752,7 +2174,7 @@ class AnalysisExportMixin:
             )
             if resolved_policy not in {"use_active_profile", "reuse_current_template", "recompute_current", "fresh_or_empty"}:
                 raise ValueError(f"Unsupported interval_policy: {interval_policy}")
-            if imported_forward_lock:
+            if imported_forward_lock and not segmentation_authoritative:
                 resolved_policy = "use_active_profile"
             if (
                 current_sample_mode == "experiment_measurement"
@@ -1824,21 +2246,26 @@ class AnalysisExportMixin:
                     break
             cumulative_s = np.asarray(path_end_values, dtype=float) if use_path_end_values and path_end_values else np.cumsum(s_values)
 
-            resolved_intervals = self._resolve_pred_power_intervals(
-                P_values,
-                s_values,
-                cumulative_s,
-                n_values,
-                line_numbers,
-                model_ready=model_ready,
-                debug_line_range=debug_line_range,
-                interval_policy=resolved_policy,
-                materialize_reused_current_template=not bool(
-                    current_sample_mode == "experiment_measurement"
-                    and measurement_display_mode == "posterior"
-                ),
-            )
+            if segmentation_authoritative:
+                resolved_intervals = self._get_current_interval_records(allow_profile_fallback=False)
+            else:
+                resolved_intervals = self._resolve_pred_power_intervals(
+                    P_values,
+                    s_values,
+                    cumulative_s,
+                    n_values,
+                    line_numbers,
+                    model_ready=model_ready,
+                    debug_line_range=debug_line_range,
+                    interval_policy=resolved_policy,
+                    materialize_reused_current_template=not bool(
+                        current_sample_mode == "experiment_measurement"
+                        and measurement_display_mode == "posterior"
+                    ),
+                )
             should_materialize_measurement_runtime_intervals = bool(
+                not segmentation_authoritative
+                and
                 current_sample_mode == "experiment_measurement"
                 and getattr(self, "manual_measurement_data", None)
                 and resolved_intervals
@@ -1862,7 +2289,7 @@ class AnalysisExportMixin:
 
             # 需求6：最大区间数500限制，对原始区间按sample_count从小到大删减
             MAX_INTERVALS = 500
-            if len(resolved_intervals) > MAX_INTERVALS:
+            if not segmentation_authoritative and len(resolved_intervals) > MAX_INTERVALS:
                 original_count = len(resolved_intervals)
                 # 按sample_count（SampleData点数）降序排序，保留点数最多的区间
                 intervals_sorted = sorted(resolved_intervals, key=lambda x: x.get('sample_count', 0), reverse=True)
@@ -1879,7 +2306,12 @@ class AnalysisExportMixin:
                 self.set_status(f"区间数超过{MAX_INTERVALS}，已删减{original_count - MAX_INTERVALS}个点数较少的区间", 5000)
 
             used_compact_runtime_intervals = False
-            if resolved_policy == "use_active_profile":
+            if segmentation_authoritative:
+                resolved_segments = self._get_current_segment_records(allow_profile_fallback=False)
+                resolved_point_kc_map = dict(getattr(self, "current_interval_point_kc_map", {}) or {})
+                current_source = "segmentation"
+                profile_locked = bool(getattr(self, "_profile_intervals_locked", False))
+            elif resolved_policy == "use_active_profile":
                 if imported_forward_lock:
                     active_profile = getattr(self, "imported_kc_profile", None)
                     if not isinstance(active_profile, dict):
@@ -1955,6 +2387,8 @@ class AnalysisExportMixin:
                         used_compact_runtime_intervals = True
 
             if (
+                not segmentation_authoritative
+                and
                 current_sample_mode == "experiment_measurement"
                 and measurement_display_mode == "posterior"
                 and resolved_intervals
@@ -1965,7 +2399,7 @@ class AnalysisExportMixin:
                     base_point_kc_map=resolved_point_kc_map,
                 )
 
-            if hasattr(self, "_debug_interval_state_event"):
+            if not segmentation_authoritative and hasattr(self, "_debug_interval_state_event"):
                 self._debug_interval_state_event(
                     "write_current_state",
                     write_source="generate_plots",
@@ -1974,19 +2408,27 @@ class AnalysisExportMixin:
                     segment_count=len(resolved_segments),
                 )
             current_prediction_source = "imported_profile" if imported_forward_lock else self._get_prediction_source()
-            self._set_current_interval_state(
-                interval_records=resolved_intervals,
-                segment_records=resolved_segments,
-                point_kc_map=resolved_point_kc_map,
-                source=current_source,
-                profile_locked=profile_locked,
-                context_signature=self._build_prediction_context_signature(
+            if not segmentation_authoritative:
+                self._set_current_interval_state(
+                    interval_records=resolved_intervals,
+                    segment_records=resolved_segments,
+                    point_kc_map=resolved_point_kc_map,
+                    source=current_source,
+                    profile_locked=profile_locked,
+                    context_signature=self._build_prediction_context_signature(
+                        prediction_source=current_prediction_source,
+                        measurement=getattr(self, "manual_measurement_data", None),
+                    ),
                     prediction_source=current_prediction_source,
-                    measurement=getattr(self, "manual_measurement_data", None),
-                ),
-                prediction_source=current_prediction_source,
-                measurement_case_signature=self._get_current_measurement_case_signature(),
-            )
+                    measurement_case_signature=self._get_current_measurement_case_signature(),
+                )
+            elif hasattr(self, "_debug_interval_state_event"):
+                self._debug_interval_state_event(
+                    "reuse_segmentation_state",
+                    write_source="generate_plots",
+                    interval_count=len(resolved_intervals),
+                    segment_count=len(resolved_segments),
+                )
             if (
                 current_sample_mode == "experiment_measurement"
                 and getattr(self, "manual_measurement_data", None)
@@ -1999,7 +2441,37 @@ class AnalysisExportMixin:
             if used_compact_runtime_intervals and hasattr(self, "_apply_interval_kc_records_to_current_data"):
                 self._apply_interval_kc_records_to_current_data(resolved_intervals)
                 P_values = [d['P'] for d in self.data]
+            if segmentation_authoritative and hasattr(
+                self,
+                "_refresh_authoritative_segmentation_interval_descriptors",
+            ):
+                self._refresh_authoritative_segmentation_interval_descriptors()
             current_intervals = self._get_current_interval_records(allow_profile_fallback=False)
+            sample_background_intervals = current_intervals
+            if segmentation_authoritative:
+                try:
+                    sample_background_intervals = self._get_authoritative_segmentation_sample_records()
+                except Exception as projection_exc:
+                    # None 是“投影无效”哨兵；不能用空区间降级，
+                    # 否则全部采样点会被误当作过程域外补色。
+                    sample_background_intervals = None
+                    projection_reason = str(projection_exc)
+                    latest_result = getattr(self, "_latest_segmentation_result", None)
+                    latest_diagnostics = getattr(latest_result, "diagnostics", None)
+                    if isinstance(latest_diagnostics, dict):
+                        latest_diagnostics["sample_projection"] = {
+                            "valid": False,
+                            "reason": projection_reason,
+                        }
+                        latest_diagnostics["sample_visualization"] = {
+                            "valid": False,
+                            "reason": projection_reason,
+                            "display_suppressed": True,
+                        }
+                    if hasattr(self, "segmentation_status_var"):
+                        self.segmentation_status_var.set(
+                            f"全行程六类划分: 采样投影失败，已停止背景补色（{projection_reason}）"
+                        )
             if (
                 current_sample_mode == "experiment_measurement"
                 and getattr(self, "manual_measurement_data", None)
@@ -2265,64 +2737,45 @@ class AnalysisExportMixin:
                     sample_display_x_all is None
                     or sample_context_mask is None
                     or sample_prediction_curve is None
+                    or sample_background_intervals is None
+                ):
+                    return None
+                independent_checker = getattr(
+                    self,
+                    "_has_independent_segmentation_sample_prediction",
+                    None,
+                )
+                if (
+                    callable(independent_checker)
+                    and not independent_checker(
+                        getattr(self, "manual_measurement_data", None)
+                    )
                 ):
                     return None
                 x_values = np.asarray(sample_display_x_all, dtype=float)
                 prediction_values = np.asarray(sample_prediction_curve, dtype=float)
                 if len(x_values) != len(prediction_values):
                     return None
-                fill_values = prediction_values.copy()
-                if sample_values_all is not None and len(sample_values_all) == len(fill_values):
-                    actual_values = np.asarray(sample_values_all, dtype=float)
-                    actual_fill_mask = (~np.isfinite(fill_values)) & np.isfinite(actual_values)
-                    fill_values[actual_fill_mask] = actual_values[actual_fill_mask]
-                if sample_idle_power_all is not None and len(sample_idle_power_all) == len(fill_values):
-                    idle_values = np.asarray(sample_idle_power_all, dtype=float)
-                    idle_fill_mask = (~np.isfinite(fill_values)) & np.isfinite(idle_values)
-                    fill_values[idle_fill_mask] = idle_values[idle_fill_mask]
-                fill_values = np.maximum(fill_values, 0.0)
+                fill_values = np.maximum(prediction_values, 0.0)
                 context_mask = np.asarray(sample_context_mask, dtype=bool) & np.isfinite(x_values)
-                draw_mask = context_mask & np.isfinite(fill_values)
+                draw_mask = context_mask & np.isfinite(prediction_values)
                 if not np.any(draw_mask):
                     return None
 
-                idle_mask = np.zeros(len(fill_values), dtype=bool)
-                measurement = getattr(self, "manual_measurement_data", None)
-                if isinstance(measurement, dict):
-                    measurement_idle_mask = np.asarray(measurement.get("idle_point_mask", []), dtype=bool)
-                    if measurement_idle_mask.size == len(fill_values):
-                        idle_mask |= measurement_idle_mask
-                if sample_idle_power_all is not None and len(sample_idle_power_all) == len(fill_values):
-                    finite_idle_mask = np.isfinite(sample_idle_power_all)
-                    idle_mask |= finite_idle_mask & np.isfinite(prediction_values) & (prediction_values <= sample_idle_power_all + 1e-9)
-
-                cutting_mask = np.zeros(len(fill_values), dtype=bool)
-                for interval in current_intervals or []:
-                    if not isinstance(interval, dict):
-                        continue
-                    sample_bounds = self._get_interval_sample_index_span(interval)
-                    if not sample_bounds:
-                        continue
-                    seg_start, seg_end = sample_bounds
-                    safe_start = max(0, seg_start)
-                    safe_end = min(len(fill_values) - 1, seg_end)
-                    if safe_end < safe_start:
-                        continue
-                    is_idle_segment = bool(interval.get("is_idle_interval")) or str(interval.get("kc_source", "")).strip().lower() == "idle"
-                    if is_idle_segment:
-                        idle_mask[safe_start:safe_end + 1] = True
-                    else:
-                        cutting_mask[safe_start:safe_end + 1] = True
-
-                idle_mask &= draw_mask
-                cutting_mask &= draw_mask & (~idle_mask)
-                nonsteady_mask = draw_mask & (~idle_mask) & (~cutting_mask)
+                background_payload = self.build_segmentation_sample_background_masks(
+                    prediction_values,
+                    sample_idle_power_all,
+                    sample_background_intervals,
+                    valid_mask=context_mask,
+                )
+                state_masks = background_payload["state_masks"]
                 return {
                     "x_values": x_values,
                     "fill_values": fill_values,
-                    "steady_idle_blocks": self.compute_contiguous_blocks(idle_mask),
-                    "steady_cutting_blocks": self.compute_contiguous_blocks(cutting_mask),
-                    "nonsteady_blocks": self.compute_contiguous_blocks(nonsteady_mask),
+                    "state_blocks": {
+                        segment_type: self.compute_contiguous_blocks(mask)
+                        for segment_type, mask in state_masks.items()
+                    },
                 }
 
             def _draw_sample_background(ax):
@@ -2330,39 +2783,20 @@ class AnalysisExportMixin:
                 if not payload:
                     return
                 artists = []
-                idle_artists = self._draw_curve_background_blocks(
-                    ax,
-                    payload.get("x_values"),
-                    payload.get("fill_values"),
-                    payload.get("steady_idle_blocks"),
-                    color="#D3D7DC",
-                    alpha=0.28,
-                    label="空载段",
-                    zorder=1,
-                )
-                artists.extend(idle_artists or [])
-                steady_artists = self._draw_curve_background_blocks(
-                    ax,
-                    payload.get("x_values"),
-                    payload.get("fill_values"),
-                    payload.get("steady_cutting_blocks"),
-                    color="#1E88E5",
-                    alpha=0.18,
-                    label="稳态区间",
-                    zorder=1,
-                )
-                artists.extend(steady_artists or [])
-                nonsteady_artists = self._draw_curve_background_blocks(
-                    ax,
-                    payload.get("x_values"),
-                    payload.get("fill_values"),
-                    payload.get("nonsteady_blocks"),
-                    color="#4A4A4A",
-                    alpha=0.24,
-                    label="非稳态区间",
-                    zorder=1,
-                )
-                artists.extend(nonsteady_artists or [])
+                state_blocks = payload.get("state_blocks", {})
+                for segment_type in ("idle", "entry", "steady", "transition", "nonsteady", "exit"):
+                    style = self.get_segmentation_state_style(segment_type)
+                    state_artists = self._draw_curve_background_blocks(
+                        ax,
+                        payload.get("x_values"),
+                        payload.get("fill_values"),
+                        state_blocks.get(segment_type),
+                        color=style["color"],
+                        alpha=0.30,
+                        label=f"{style['label']} [{style['state_code']}]",
+                        zorder=1,
+                    )
+                    artists.extend(state_artists or [])
                 self._interval_background_artists.extend(artists)
             
             # 预测负载 + 实测负载图
@@ -2607,7 +3041,7 @@ class AnalysisExportMixin:
                         sample_prediction_curve,
                         sample_prediction_blocks,
                         max_points=preview_plot_max_points,
-                        color="#F97316",
+                        color=self.get_segmentation_predicted_line_color(),
                         linewidth=1.5,
                         linestyle="--",
                         alpha=0.95,
@@ -2943,9 +3377,9 @@ class AnalysisExportMixin:
                 self.save_all_plots(silent=True)
             self.show_current_figure(default_index)
             
-            # 更新区间数量显示（使用 interval_meta 长度，与图表绘制的区间数量完全一致）
+            # 六态结果覆盖全行程，数量显示始终使用权威区间总数。
             if hasattr(self, 'interval_count_var'):
-                interval_count = len(interval_meta) if interval_meta else 0
+                interval_count = len(current_intervals)
                 self.interval_count_var.set(str(interval_count))
             if hasattr(self, "refresh_prediction_metrics_summary"):
                 try:
@@ -3089,7 +3523,7 @@ class AnalysisExportMixin:
                     fig.savefig(svg_path, bbox_inches='tight', format='svg')
             
             # 如果有预测功率稳态区间，保存区间数据
-            interval_records = self._get_current_interval_records(allow_profile_fallback=False)
+            interval_records = self._get_steady_interval_records()
             if interval_records:
                 intervals_txt_path = os.path.join(save_dir, "P_pred_steady_intervals.txt")
                 try:
@@ -3105,7 +3539,7 @@ class AnalysisExportMixin:
                     f.write("#" + "="*80 + "\n")
                     f.write("# 区间\t区间范围\t采样点数\tP_pred(W)\tP_pref(W)\n")
                     for i, interval in enumerate(interval_records, 1):
-                        p_pred = interval['p_pred']
+                        p_pred = float(interval.get('p_pred', 0.0) or 0.0)
                         p_pref = p_pred * adjustment_ratio
                         sample_count = interval.get('sample_count', interval['end_idx'] - interval['start_idx'] + 1)
                         interval_range = self._format_interval_point_range(interval)

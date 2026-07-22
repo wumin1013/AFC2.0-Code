@@ -1165,15 +1165,28 @@ class SampleManagerMixin:
         finally:
             self._loading_sample_data = False
 
+    def _clear_process_context_for_measurement_reimport(self, program_name):
+        """重新导入实测文件时清空当前工艺信息及其派生缓存。"""
+        self.set_input_files([])
+        if program_name:
+            self.program_process_file_map.pop(program_name, None)
+            self.program_prompt_skip.pop(program_name, None)
+
     def load_experiment_measurement_file(self, file_path, silent=False):
         """加载手动导入的实验实测文件。"""
         if not file_path or not os.path.exists(file_path):
+            if hasattr(self, "reset_sample_data_state"):
+                self.reset_sample_data_state()
+            reason = "未提供实验实测文件" if not file_path else "实验实测文件不存在"
+            if hasattr(self, "sample_auto_status_var"):
+                self.sample_auto_status_var.set(f"{reason}，旧采样状态已清空")
+            if hasattr(self, "status_var_data"):
+                self.status_var_data.set(f"{reason}，旧采样状态已清空")
             return False
 
+        is_measurement_reimport = bool(getattr(self, "sample_data_loaded", False))
         self._loading_sample_data = True
         try:
-            if hasattr(self, "_invalidate_measurement_runtime_state"):
-                self._invalidate_measurement_runtime_state(keep_profile_lock=True)
             if hasattr(self, "sample_auto_status_var"):
                 self.sample_auto_status_var.set("正在导入实验实测文件...")
             if hasattr(self, "status_var_data"):
@@ -1195,6 +1208,10 @@ class SampleManagerMixin:
 
             program_name = os.path.splitext(os.path.basename(file_path))[0].strip() or "实验实测"
             program_numbers = np.asarray(["__manual__"] * len(line_numbers), dtype=object)
+            if is_measurement_reimport:
+                self._clear_process_context_for_measurement_reimport(program_name)
+            if hasattr(self, "_invalidate_measurement_runtime_state"):
+                self._invalidate_measurement_runtime_state(keep_profile_lock=True)
 
             self.sample_programs = self._build_manual_measurement_programs(file_path, line_numbers)
             self.sample_csv_path = None
@@ -1231,8 +1248,8 @@ class SampleManagerMixin:
             model_status = "none"
             if self.data and hasattr(self, "_ensure_prediction_model_for_current_process"):
                 model_status = self._ensure_prediction_model_for_current_process(
-                    auto_identify_missing=True,
-                    save_strategy="prompt",
+                    auto_identify_missing=False,
+                    save_strategy="none",
                 )
             elif self.data:
                 self._refresh_manual_measurement_prediction()
@@ -1258,6 +1275,8 @@ class SampleManagerMixin:
             )
             if corrected_count > 0:
                 status_text += f" | 负载负值已取绝对值 {corrected_count} 点"
+            if is_measurement_reimport:
+                status_text += " | 原工艺信息及页面缓存已清空，请重新导入工艺信息"
             if hasattr(self, "sample_auto_status_var"):
                 self.sample_auto_status_var.set(status_text)
             if hasattr(self, "status_var_data"):
@@ -1268,6 +1287,33 @@ class SampleManagerMixin:
                 self.show_sample_preview()
             return True
         except Exception as e:
+            # 失败后不得继续暴露上一文件或半写入的采样上下文，避免后续
+            # 六态投影/导出误用陈旧端点。解析和派生状态统一回到空状态。
+            try:
+                self.reset_sample_data_state()
+            except Exception:
+                self.sample_data_loaded = False
+                self.sample_data_mode = "sampledata"
+                self.manual_measurement_path = None
+                self.manual_measurement_data = None
+                self.sample_programs = {}
+                self.sample_data_values = None
+                self.sample_data_values_raw = None
+                self.sample_data_line_numbers = None
+                self.sample_data_line_numbers_raw = None
+                self.sample_data_program_numbers = None
+                self.sample_data_program_numbers_raw = None
+                self.sample_data_x_positions = None
+                self.sample_data_point_indices = None
+                self.sample_data_time_indices = None
+                self.sample_data_base_blocks = []
+                invalidator = getattr(
+                    self,
+                    "_invalidate_segmentation_sample_projection",
+                    None,
+                )
+                if callable(invalidator):
+                    invalidator(reason="实验实测文件导入失败")
             if not silent:
                 messagebox.showerror("加载失败", f"读取实验实测文件时发生错误:\n{str(e)}")
             if hasattr(self, "sample_auto_status_var"):

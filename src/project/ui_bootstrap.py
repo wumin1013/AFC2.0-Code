@@ -145,6 +145,7 @@ class BootstrapUiMixin:
         self.sigma_idle_var = tk.StringVar(value="未计算")
         self.delta_mrr_var = tk.StringVar(value="未计算")
         self.steady_gate_status_var = tk.StringVar(value="稳态门控: 未计算")
+        self.segmentation_status_var = tk.StringVar(value="全行程六类划分: 未运行")
         self.model_detail_collapsed = tk.BooleanVar(value=True)
         self.model_detail_toggle_text = tk.StringVar(value="展开详情")
         self.interval_detail_collapsed = tk.BooleanVar(value=True)
@@ -363,14 +364,10 @@ class BootstrapUiMixin:
         self.notebook.add(self.data_processing_tab, text="工艺信息分析")
         self.smif_pit_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.smif_pit_tab, text="PIT / SMIF")
-        self.data_analysis_tab = ttk.Frame(self.notebook)
-        self.notebook.add(self.data_analysis_tab, text="数据分析表")
 
         # 创建界面
         self.create_data_processing_tab()
         self.create_smif_pit_tab()
-        if hasattr(self, "create_data_analysis_tab"):
-            self.create_data_analysis_tab()
         # self.create_steady_state_tab()  # 已合并到工艺信息分析页
         
         # 初始化图表
@@ -909,24 +906,33 @@ class BootstrapUiMixin:
         )
         self.interval_detail_toggle_btn.grid(row=0, column=4, padx=(0, 8), sticky="e")
 
+        self.run_segmentation_btn = ttk.Button(
+            interval_frame,
+            text="🧭 全行程六类划分",
+            command=lambda: self.run_full_path_segmentation(),
+            width=18,
+            style='Tech.TButton',
+        )
+        self.run_segmentation_btn.grid(row=0, column=5, padx=(0, 8), sticky="e")
+
         # 导入工艺信息文件按钮（支持多选合并）
         self.choose_process_btn = ttk.Button(
             interval_frame, text="📂 导入工艺信息文件",
             command=self.choose_process_file_for_current_program,
             width=20, style='Orange.TButton'
         )
-        self.choose_process_btn.grid(row=0, column=5, padx=(0, 8), sticky="e")
+        self.choose_process_btn.grid(row=0, column=6, padx=(0, 8), sticky="e")
 
         # 保存结果按钮（橙色强调）- 移到最右边
         self.export_i_code_btn = ttk.Button(interval_frame, text="💾 保存结果", 
                                             command=self.save_interval_info, width=12,
                                             style='Orange.TButton',
                                             state="disabled")
-        self.export_i_code_btn.grid(row=0, column=6, sticky="e")
+        self.export_i_code_btn.grid(row=0, column=7, sticky="e")
 
         # 第二行：显示方式切换按钮
         plot_switch_frame = ttk.Frame(interval_frame)
-        plot_switch_frame.grid(row=1, column=0, columnspan=7, pady=(8, 0), sticky="ew")
+        plot_switch_frame.grid(row=1, column=0, columnspan=8, pady=(8, 0), sticky="ew")
         plot_switch_frame.grid_columnconfigure(0, weight=1)
         plot_mode_row = ttk.Frame(plot_switch_frame)
         plot_mode_row.grid(row=0, column=0, sticky="w")
@@ -1055,6 +1061,20 @@ class BootstrapUiMixin:
         )
         self.show_ae_overlay_btn.pack(side=tk.LEFT, padx=(0, 6))
 
+        self.segmentation_status_label = ttk.Label(
+            interval_frame,
+            textvariable=self.segmentation_status_var,
+            font=UI_FONT_SMALL,
+            foreground=UI_COLOR_TEXT_MUTED,
+        )
+        self.segmentation_status_label.grid(
+            row=2,
+            column=0,
+            columnspan=8,
+            sticky="w",
+            pady=(6, 0),
+        )
+
         # 默认选择叠加显示
         self.overlay_btn.state(['pressed'])
         self.stacked_btn.state(['!pressed'])
@@ -1065,8 +1085,8 @@ class BootstrapUiMixin:
             plot_switch_frame,
         ]
 
-        # ===== 右侧：稳态区间详情 =====
-        ideal_frame = ttk.LabelFrame(controls, text="📌 稳态区间详情", padding=6, style='Tech.TLabelframe')
+        # ===== 右侧：全行程六类区间详情 =====
+        ideal_frame = ttk.LabelFrame(controls, text="📌 全行程六类区间详情", padding=6, style='Tech.TLabelframe')
         ideal_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
         ideal_frame.configure(width=900)
         ideal_frame.grid_rowconfigure(1, weight=1)
@@ -1079,7 +1099,7 @@ class BootstrapUiMixin:
         detail_toolbar.grid_columnconfigure(0, weight=1)
         ttk.Label(
             detail_toolbar,
-            text="按 process / sample / x / Kc-P 分列显示；双击可查看完整详情。",
+            text="按类别 / process / sample / x / Kc-P 显示；双击可查看完整详情。",
             font=UI_FONT_SMALL,
             foreground=UI_COLOR_TEXT_MUTED,
         ).grid(row=0, column=0, sticky="w")
@@ -1126,6 +1146,7 @@ class BootstrapUiMixin:
         self.sample_control_widgets.append(self.show_ae_overlay_btn)
         self.sample_control_widgets.append(self.sample_program_combo)
         self.sample_control_widgets.append(self.sample_tool_combo)
+        self.sample_control_widgets.append(self.run_segmentation_btn)
         self.sample_control_widgets.append(self.choose_process_btn)
         self.sample_control_widgets.append(self.export_i_code_btn)
         if hasattr(self, "_refresh_import_order_controls"):

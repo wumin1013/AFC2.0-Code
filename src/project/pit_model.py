@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 
+from .segmentation import STATE_CODE_BY_TYPE
 from .shared import *
 from matplotlib.collections import LineCollection
 from mpl_toolkits.mplot3d.art3d import Line3DCollection
@@ -9,6 +10,16 @@ from mpl_toolkits.mplot3d import proj3d
 
 
 class PitModelMixin:
+    _SEGMENTATION_PREDICTION_PROVENANCE_KEYS = (
+        "segmentation_prediction_source",
+        "segmentation_prediction_independent",
+        "segmentation_temporary_measurement_mode",
+        "segmentation_sample_prediction_context_signature",
+        "segmentation_process_prediction_context_signature",
+        "segmentation_process_prediction_source",
+        "segmentation_process_prediction_row_count",
+    )
+
     def _reset_smif_runtime_cache(self):
         self._smif_interaction_points = np.empty((0, 3), dtype=float)
         self._smif_bounds = None
@@ -679,15 +690,7 @@ class PitModelMixin:
             return None
 
         if self._get_smif_scope_mode() == "steady":
-            steady_records = []
-            for record in self._get_current_segment_records(allow_profile_fallback=False):
-                if isinstance(record, dict) and int(record.get("state_code", -1)) == 2:
-                    steady_records.append(record)
-            if not steady_records:
-                steady_records = [
-                    record for record in self._get_current_interval_records(allow_profile_fallback=False)
-                    if self._record_represents_steady_interval(record)
-                ]
+            steady_records = self._get_steady_interval_records()
             steady_spans = [span for span in (_resolve_path_span(record) for record in steady_records) if span is not None]
             if steady_spans:
                 focus_segments = []
@@ -1110,7 +1113,23 @@ class PitModelMixin:
         self.active_kc_profile_path = ""
         self.profile_origin = "no_profile"
         self.prediction_source = "no_profile"
-        self._clear_current_interval_state()
+        if self._has_authoritative_segmentation_state():
+            preserved_intervals = self._get_current_interval_records(allow_profile_fallback=False)
+            for record in preserved_intervals:
+                for key in ("K_c_hat", "sigma_Kc", "K_c_UCB", "kc_hat", "sigma_kc"):
+                    record.pop(key, None)
+                if str(record.get("segment_type") or "").strip().lower() != "idle":
+                    record["kc_source"] = ""
+            self._set_current_interval_state(
+                interval_records=preserved_intervals,
+                segment_records=self._get_current_segment_records(allow_profile_fallback=False),
+                point_kc_map={},
+                source="segmentation",
+                profile_locked=False,
+                prediction_source="no_profile",
+            )
+        else:
+            self._clear_current_interval_state()
         self._invalidate_process_alignment_caches(reason="clear_kc_ke_state")
         self.refresh_pit_button_state()
         self.refresh_smif_view()
@@ -1182,11 +1201,30 @@ class PitModelMixin:
                 "clear_runtime_profile",
                 reason=str(reason or ""),
             )
+        if str(reason or "") == "switch_to_sampledata":
+            invalidator = getattr(self, "_invalidate_segmentation_sample_projection", None)
+            if callable(invalidator):
+                invalidator(reason="切换实际负载文件")
 
-    def _activate_profile_state(self, profile, *, origin="no_profile", file_path="", case_signature=""):
+    def _activate_profile_state(
+        self,
+        profile,
+        *,
+        origin="no_profile",
+        file_path="",
+        case_signature="",
+        normalize=True,
+    ):
         normalized_origin = self._normalize_profile_origin(origin)
         normalized_profile = (
-            self._normalize_loaded_kc_profile(profile, source_path=str(file_path or ""))
+            (
+                self._normalize_loaded_kc_profile(
+                    profile,
+                    source_path=str(file_path or ""),
+                )
+                if normalize
+                else dict(profile)
+            )
             if isinstance(profile, dict)
             else None
         )
@@ -1210,19 +1248,89 @@ class PitModelMixin:
             return ""
         template_context = self._resolve_profile_template_context(source_profile)
         point_count = len((source_profile or {}).get("point_kc_map", {}) or {})
-        interval_count = len(
-            self._extract_profile_interval_records(source_profile)
-        )
+        prediction_payload = {
+            key: source_profile.get(key)
+            for key in (
+                "global_kc",
+                "kc_sigma",
+                "ke_value",
+                "global_ke",
+                "global_idle",
+                "idle_power_model",
+                "idle_model_signature",
+                "line_kc_map",
+                "point_kc_map",
+                "sample_kc_profile",
+            )
+            if key in source_profile
+        }
+        content_signature = self._build_stable_prediction_digest(prediction_payload)
         return "|".join(
             [
-                str(source_profile.get("updated_at") or ""),
                 str(source_profile.get("source") or ""),
                 str(point_count),
-                str(interval_count),
                 str(template_context.get("process_hash") or ""),
                 str(template_context.get("gcode_hash") or ""),
                 self._normalize_profile_binding_path(profile_path or source_profile.get("profile_path")),
+                content_signature,
             ]
+        )
+
+    @staticmethod
+    def _build_stable_prediction_digest(payload):
+        """对预测相关内容生成与字典插入顺序无关的稳定摘要。"""
+
+        import hashlib
+
+        def _normalize(value):
+            if isinstance(value, np.generic):
+                value = value.item()
+            if isinstance(value, np.ndarray):
+                return _normalize(value.tolist())
+            if isinstance(value, dict):
+                return {
+                    str(key): _normalize(item)
+                    for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+                }
+            if isinstance(value, (list, tuple)):
+                return [_normalize(item) for item in value]
+            if isinstance(value, float):
+                return float(value) if np.isfinite(value) else None
+            if isinstance(value, (int, str, bool)) or value is None:
+                return value
+            return str(value)
+
+        normalized = _normalize(payload)
+        encoded = json.dumps(
+            normalized,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _build_current_prediction_model_signature(self):
+        def _read_var(name, default=None):
+            value = getattr(self, name, default)
+            if hasattr(value, "get"):
+                try:
+                    value = value.get()
+                except Exception:
+                    value = default
+            return value
+
+        return self._build_stable_prediction_digest(
+            {
+                "idle_model_signature": str(getattr(self, "idle_model_signature", "") or ""),
+                "idle_power_model": getattr(self, "idle_power_model", None),
+                "step_feed_model_signature": str(
+                    getattr(self, "step_feed_model_signature", "") or ""
+                ),
+                "global_kc": _read_var("kc_coeff"),
+                "global_ke": _read_var("ke_coeff"),
+                "global_idle": _read_var("p_idle_var"),
+                "program_idle": _read_var("current_program_idle_power"),
+            }
         )
 
     def _get_current_measurement_case_signature(self, measurement=None):
@@ -1266,13 +1374,20 @@ class PitModelMixin:
                 normalized_prediction_source,
                 profile_signature,
                 str(getattr(self, "step_feed_model_signature", "") or ""),
+                str(getattr(self, "idle_model_signature", "") or ""),
+                self._build_current_prediction_model_signature(),
             ]
         )
 
     def _invalidate_process_alignment_caches(self, reason=""):
         self._process_point_lookup_cache = None
         self._process_point_lookup_cache_key = None
+        self._process_point_metadata_cache_key = None
         self._sample_line_point_context_cache = None
+        self._authoritative_segmentation_sample_lookup_cache = None
+        self._segmentation_process_prediction_context_signature = ""
+        self._segmentation_process_prediction_source = ""
+        self._segmentation_process_prediction_row_count = 0
         if hasattr(self, "_smif_source_cache"):
             self._smif_source_cache = None
         self._process_model_state_version = int(getattr(self, "_process_model_state_version", 0) or 0) + 1
@@ -1282,6 +1397,43 @@ class PitModelMixin:
                 reason=str(reason),
                 kc_map_source="current_rows",
             )
+
+    def _invalidate_segmentation_for_prediction_context_change(
+        self,
+        expected_context_signature,
+        *,
+        reason="预测模型发生变化",
+    ):
+        if not self._has_authoritative_segmentation_state():
+            return False
+
+        current_signature = str(
+            getattr(self, "_current_interval_context_signature", "") or ""
+        )
+        expected_signature = str(expected_context_signature or "")
+        if current_signature and expected_signature and current_signature == expected_signature:
+            return False
+
+        self._clear_current_interval_state(keep_profile_lock=False)
+        self._latest_segmentation_result = None
+        cleaner = getattr(self, "_clear_segmentation_output_artifacts", None)
+        cleanup_error = ""
+        if callable(cleaner):
+            try:
+                cleaner()
+            except OSError as exc:
+                cleanup_error = str(exc)
+        if hasattr(self, "segmentation_status_var"):
+            suffix = f"；旧导出清理失败（{cleanup_error}）" if cleanup_error else ""
+            self.segmentation_status_var.set(f"全行程六类划分: 待重算（{reason}）{suffix}")
+        self._debug_interval_state_event(
+            "invalidate_segmentation_prediction_context",
+            reason=str(reason or ""),
+            previous_context_signature=current_signature or "none",
+            expected_context_signature=expected_signature or "none",
+            cleanup_error=cleanup_error or "none",
+        )
+        return True
 
     def _sync_measurement_case_state(self, measurement=None, reason=""):
         current_case_signature = self._get_current_measurement_case_signature(measurement)
@@ -1396,7 +1548,8 @@ class PitModelMixin:
             getattr(self, "_current_interval_prediction_source", "no_profile")
         )
         previous_case_signature = str(getattr(self, "_current_interval_measurement_case_signature", "") or "")
-        self.current_interval_records = []
+        empty_intervals = []
+        self.current_interval_records = empty_intervals
         self.current_segment_records = []
         self.current_interval_point_kc_map = {}
         self._current_interval_ready = False
@@ -1404,12 +1557,13 @@ class PitModelMixin:
         self._current_interval_context_signature = ""
         self._current_interval_prediction_source = "no_profile"
         self._current_interval_measurement_case_signature = ""
+        self._authoritative_segmentation_sample_lookup_cache = None
         if not keep_profile_lock:
             self._profile_intervals_locked = False
 
         # 兼容旧变量，禁止其他位置直接写入
-        self.pred_power_intervals = []
-        self.pit_records = []
+        self.pred_power_intervals = empty_intervals
+        self.pit_records = empty_intervals
         self._cached_steady_intervals = {}
         if previous_ready or previous_source or previous_locked:
             self._debug_interval_state_event(
@@ -1442,6 +1596,19 @@ class PitModelMixin:
         if point_kc_map is not None and not isinstance(point_kc_map, dict):
             raise TypeError("point_kc_map must be a dict")
 
+        source_text = str(source or "")
+        has_authoritative_segmentation = bool(
+            getattr(self, "_current_interval_ready", False)
+            and str(getattr(self, "_current_interval_source", "") or "") == "segmentation"
+        )
+        if has_authoritative_segmentation and source_text != "segmentation":
+            self._debug_interval_state_event(
+                "skip_non_authoritative_interval_write",
+                attempted_source=source_text or "none",
+                preserved_source="segmentation",
+            )
+            return False
+
         previous_source = str(getattr(self, "_current_interval_source", "") or "")
         previous_locked = bool(getattr(self, "_profile_intervals_locked", False))
         previous_ready = bool(getattr(self, "_current_interval_ready", False))
@@ -1461,7 +1628,6 @@ class PitModelMixin:
         self.current_segment_records = normalized_segments
         self.current_interval_point_kc_map = normalized_point_map
         self._current_interval_ready = True
-        source_text = str(source or "")
         locked_flag = bool(profile_locked)
         self._current_interval_source = source_text
         self._profile_intervals_locked = locked_flag
@@ -1470,10 +1636,11 @@ class PitModelMixin:
         self._current_interval_measurement_case_signature = str(
             measurement_case_signature or self._get_current_measurement_case_signature()
         )
+        self._authoritative_segmentation_sample_lookup_cache = None
 
         # 兼容旧代码读取，禁止其他位置直接写入
-        self.pred_power_intervals = [dict(record) for record in normalized_intervals]
-        self.pit_records = [dict(record) for record in normalized_intervals]
+        self.pred_power_intervals = self.current_interval_records
+        self.pit_records = self.current_interval_records
         self._cached_steady_intervals = {
             "pit_records": [dict(record) for record in normalized_intervals],
             "segment_records": [dict(record) for record in normalized_segments],
@@ -1494,6 +1661,7 @@ class PitModelMixin:
             segment_count=len(normalized_segments),
             point_kc_count=len(normalized_point_map),
         )
+        return True
 
     def _sync_current_interval_state_prediction_context(self, prediction_source=None, measurement=None):
         if not bool(getattr(self, "_current_interval_ready", False)):
@@ -1566,6 +1734,9 @@ class PitModelMixin:
         return int(bounds["sample_start_idx"]), int(bounds["sample_end_idx"])
 
     def _invalidate_measurement_runtime_state(self, keep_profile_lock=True, clear_interval_state=True):
+        preserve_segmentation = bool(
+            clear_interval_state and self._has_authoritative_segmentation_state()
+        )
         measurement = getattr(self, "manual_measurement_data", None)
         runtime_keys = (
             "mapped_ap",
@@ -1600,16 +1771,23 @@ class PitModelMixin:
             "measurement_runtime",
             "fit_df",
             "prediction_cache",
-        )
+        ) + self._SEGMENTATION_PREDICTION_PROVENANCE_KEYS
         if isinstance(measurement, dict):
             for key in runtime_keys:
                 measurement.pop(key, None)
 
         self._sample_line_point_context_cache = None
-        if clear_interval_state:
+        self._smif_source_cache = None
+        self._smif_dashboard_payload = None
+        if clear_interval_state and not preserve_segmentation:
             self._clear_current_interval_state(
                 keep_profile_lock=bool(keep_profile_lock and getattr(self, "_profile_intervals_locked", False))
             )
+        elif preserve_segmentation:
+            invalidator = getattr(self, "_invalidate_segmentation_sample_projection", None)
+            if callable(invalidator):
+                invalidator(reason="实际负载上下文变化")
+            self._debug_interval_state_event("preserve_segmentation_on_measurement_invalidation")
 
     def _resolve_measurement_gate_reference_kc(self):
         measurement = getattr(self, "manual_measurement_data", None)
@@ -2039,8 +2217,6 @@ class PitModelMixin:
         runtime_profile = getattr(self, "runtime_identified_kc_profile", None)
         if not isinstance(runtime_profile, dict):
             return None
-        runtime_profile = self._normalize_loaded_kc_profile(runtime_profile)
-        self.runtime_identified_kc_profile = runtime_profile
         if not self._profile_has_saved_payload(runtime_profile):
             return None
         if not self._profile_matches_current_context(runtime_profile, process_path=process_path):
@@ -2103,15 +2279,13 @@ class PitModelMixin:
         profile = self._get_saved_kc_profile_for_input(process_path)
         if not profile:
             return ""
-        updated_at = str(profile.get("updated_at") or "")
-        profile_source = str(profile.get("source") or "")
-        point_count = len(profile.get("point_kc_map", {}) or {})
-        interval_count = len(self._extract_profile_interval_records(profile))
-        active_path = str(getattr(self, "active_kc_profile_path", "") or "")
-        template_context = self._resolve_profile_template_context(profile)
-        return (
-            f"{updated_at}|{profile_source}|{point_count}|{interval_count}|"
-            f"{template_context.get('process_hash', '')}|{template_context.get('gcode_hash', '')}|{active_path}"
+        return self._build_profile_runtime_signature(
+            profile,
+            profile_path=str(
+                getattr(self, "imported_kc_profile_path", "")
+                or getattr(self, "active_kc_profile_path", "")
+                or ""
+            ),
         )
 
     def _normalize_profile_binding_path(self, path):
@@ -2279,6 +2453,11 @@ class PitModelMixin:
             ) or {}
         )
         has_process_data = bool(getattr(self, "data", None))
+        raw_segment_records = [
+            dict(record)
+            for record in (source_profile.get("segment_records", []) or [])
+            if isinstance(record, dict)
+        ]
         raw_pit_records = [
             dict(record)
             for record in (source_profile.get("pit_records", []) or [])
@@ -2289,27 +2468,22 @@ class PitModelMixin:
             for record in (source_profile.get("interval_templates", []) or [])
             if isinstance(record, dict)
         ]
-        if raw_pit_records:
-            pit_records = self._materialize_profile_pit_records(raw_pit_records) if has_process_data else []
-            if not pit_records:
-                pit_records = raw_pit_records
-            interval_templates = (
-                raw_template_records
-                if raw_template_records
-                else self._build_interval_templates_for_profile(pit_records)
-            )
+
+        if raw_segment_records:
+            segment_records = self._extract_profile_segment_records(source_profile)
+            steady_records = self._get_steady_interval_records(segment_records)
+            pit_records = self._materialize_profile_pit_records(steady_records) if has_process_data else steady_records
+            interval_templates = self._build_interval_templates_for_profile(pit_records)
         else:
-            pit_records = self._materialize_profile_pit_records(raw_template_records) if has_process_data else []
+            legacy_records = raw_pit_records if raw_pit_records else raw_template_records
+            pit_records = self._materialize_profile_pit_records(legacy_records) if has_process_data else legacy_records
             if not pit_records:
-                pit_records = raw_template_records
-            interval_templates = (
-                raw_template_records
-                if raw_template_records
-                else self._build_interval_templates_for_profile(pit_records)
-            )
-        segment_records = self._extract_profile_segment_records(source_profile)
-        if not segment_records and pit_records and has_process_data:
-            segment_records = self._build_profile_segment_records(interval_records=pit_records)
+                pit_records = legacy_records
+            pit_records = self._get_steady_interval_records(pit_records)
+            interval_templates = self._build_interval_templates_for_profile(pit_records)
+            segment_records = self._extract_profile_segment_records(source_profile)
+            if not segment_records and pit_records and has_process_data:
+                segment_records = self._build_profile_segment_records(interval_records=pit_records)
 
         template_context = self._resolve_profile_template_context(source_profile)
         normalized = {
@@ -2548,8 +2722,10 @@ class PitModelMixin:
     def _serialize_record_list(self, records):
         serialized = []
         for record in records or []:
+            if not isinstance(record, dict):
+                continue
             item = {}
-            for key, value in dict(record).items():
+            for key, value in record.items():
                 item[str(key)] = self._json_safe_value(value)
             start_label = str(item.get("start_label") or "").strip()
             end_label = str(item.get("end_label") or "").strip()
@@ -2766,12 +2942,37 @@ class PitModelMixin:
             "time_positions": sample_time_positions,
             "point_widths": point_widths,
         }
+        # 样本通常远多于工艺点。按程序行预建索引后，区间端点投影只需
+        # 检查目标行内的少量样本，避免每个区间反复扫描整份实测数据。
+        sort_order = np.argsort(sample_lines, kind="stable")
+        sorted_lines = sample_lines[sort_order]
+        unique_lines, first_positions = np.unique(sorted_lines, return_index=True)
+        end_positions = np.append(first_positions[1:], sorted_lines.size)
+        context["line_index_lookup"] = {
+            int(line_no): sort_order[int(start_pos):int(end_pos)]
+            for line_no, start_pos, end_pos in zip(
+                unique_lines,
+                first_positions,
+                end_positions,
+            )
+        }
         if context_cache_key is not None:
             self._sample_line_point_context_cache = {
                 "key": context_cache_key,
                 "value": context,
             }
         return context
+
+    @staticmethod
+    def _get_process_row_sample_line(row, fallback=0):
+        """返回与实际负载文件一致的程序行号口径。"""
+        value = row.get("line_no_raw") if isinstance(row, dict) else None
+        if value is None and isinstance(row, dict):
+            value = row.get("line_no_aligned")
+        try:
+            return int(value)
+        except Exception:
+            return int(fallback)
 
     def _get_process_point_anchor_x(self, line_no, point_no, process_rows=None):
         try:
@@ -2781,23 +2982,37 @@ class PitModelMixin:
         if point_no is None:
             return float(line_value)
 
-        rows = list(process_rows if process_rows is not None else (self.data or []))
+        source_rows = process_rows if process_rows is not None else (self.data or [])
+        rows = source_rows if isinstance(source_rows, list) else list(source_rows)
         if not rows:
             return float("nan")
         if process_rows is None and hasattr(self, "_ensure_process_point_metadata"):
             try:
                 self._ensure_process_point_metadata()
-                rows = list(self.data or [])
+                rows = self.data or []
             except Exception:
-                rows = list(self.data or [])
+                rows = self.data or []
 
         target_point_idx = max(int(point_no) - 1, 0)
+        if process_rows is None or rows is getattr(self, "data", None):
+            try:
+                bucket = self._build_process_point_lookup().get(line_value)
+            except Exception:
+                bucket = None
+            if isinstance(bucket, dict):
+                point_indices = np.asarray(bucket.get("process_point_index", []), dtype=int)
+                anchor_values = np.asarray(bucket.get("process_anchor_x", []), dtype=float)
+                exact = np.flatnonzero(point_indices == target_point_idx)
+                if exact.size and anchor_values.size == point_indices.size:
+                    return float(anchor_values[int(exact[0])])
+                point_count = int(bucket.get("point_count", point_indices.size) or point_indices.size)
+                if point_count > 0:
+                    safe_point_idx = max(0, min(target_point_idx, point_count - 1))
+                    return float(line_value) + float(safe_point_idx) / float(point_count)
+
         same_line_rows = []
         for row_idx, row in enumerate(rows):
-            try:
-                row_line = int(row.get("line_no_aligned", row.get("line_no_raw", row_idx)))
-            except Exception:
-                row_line = int(row_idx)
+            row_line = self._get_process_row_sample_line(row, fallback=row_idx)
             if row_line != line_value:
                 continue
             try:
@@ -2859,7 +3074,8 @@ class PitModelMixin:
         if not resolved_bounds:
             return None
 
-        rows = list(process_rows if process_rows is not None else (self.data or []))
+        source_rows = process_rows if process_rows is not None else (self.data or [])
+        rows = source_rows if isinstance(source_rows, list) else list(source_rows)
         if not rows:
             return None
 
@@ -2873,21 +3089,31 @@ class PitModelMixin:
         except Exception:
             return None
 
-        process_start_x = self._get_process_point_anchor_x(start_line, start_point_idx + 1, process_rows=rows)
-        process_end_x = self._get_process_point_anchor_x(end_line, end_point_idx + 1, process_rows=rows)
+        def _anchor_from_row(row_idx, line_no, point_idx):
+            try:
+                point_count = int(rows[int(row_idx)].get("process_point_count", 0) or 0)
+            except Exception:
+                point_count = 0
+            if point_count > 0:
+                return float(line_no) + float(max(int(point_idx), 0)) / float(point_count)
+            return self._get_process_point_anchor_x(
+                line_no,
+                int(point_idx) + 1,
+                process_rows=rows,
+            )
+
+        process_start_x = _anchor_from_row(start_idx, start_line, start_point_idx)
+        process_end_x = _anchor_from_row(end_idx, end_line, end_point_idx)
 
         process_display_end_x = float("nan")
         if 0 <= end_idx + 1 < len(rows):
             next_row = rows[end_idx + 1]
-            try:
-                next_line = int(next_row.get("line_no_aligned", next_row.get("line_no_raw", end_idx + 1)))
-            except Exception:
-                next_line = end_line
+            next_line = self._get_process_row_sample_line(next_row, fallback=end_line)
             try:
                 next_point_idx = int(next_row.get("process_point_index", end_point_idx + 1))
             except Exception:
                 next_point_idx = end_point_idx + 1
-            process_display_end_x = self._get_process_point_anchor_x(next_line, next_point_idx + 1, process_rows=rows)
+            process_display_end_x = _anchor_from_row(end_idx + 1, next_line, next_point_idx)
         if not np.isfinite(process_display_end_x):
             try:
                 point_count = int(rows[end_idx].get("process_point_count", 0) or 0)
@@ -2942,13 +3168,22 @@ class PitModelMixin:
         if not np.isfinite(process_x):
             return None
 
-        candidate_mask = np.isfinite(sample_x)
-        if np.isfinite(lower_x):
-            candidate_mask &= sample_x >= float(lower_x) - 1e-9
-        if np.isfinite(upper_x):
-            candidate_mask &= sample_x <= float(upper_x) + 1e-9
-        same_line_mask = candidate_mask & (sample_lines == int(process_line))
-        candidate_indices = np.flatnonzero(same_line_mask)
+        line_index_lookup = sample_context.get("line_index_lookup")
+        if isinstance(line_index_lookup, dict):
+            candidate_indices = np.asarray(
+                line_index_lookup.get(int(process_line), []),
+                dtype=int,
+            )
+        else:
+            candidate_indices = np.flatnonzero(sample_lines == int(process_line))
+        if candidate_indices.size:
+            candidate_x = sample_x[candidate_indices]
+            candidate_mask = np.isfinite(candidate_x)
+            if np.isfinite(lower_x):
+                candidate_mask &= candidate_x >= float(lower_x) - 1e-9
+            if np.isfinite(upper_x):
+                candidate_mask &= candidate_x <= float(upper_x) + 1e-9
+            candidate_indices = candidate_indices[candidate_mask]
         if candidate_indices.size == 0:
             return None
 
@@ -3072,6 +3307,42 @@ class PitModelMixin:
         return int(candidate_indices[0] if prefer != "end" else candidate_indices[-1])
 
     def _resolve_interval_sample_bounds(self, interval, line_numbers=None):
+        if self._has_authoritative_segmentation_state():
+            interval_id = str(
+                interval.get("interval_id") or interval.get("zone_id") or ""
+            ).strip()
+            current_records = getattr(self, "current_interval_records", None) or []
+            sample_lines_source = getattr(self, "sample_data_line_numbers", None)
+            cache_key = (
+                id(current_records),
+                len(current_records),
+                id(sample_lines_source),
+                len(sample_lines_source) if sample_lines_source is not None else 0,
+                id(getattr(self, "_latest_segmentation_result", None)),
+            )
+            cached = getattr(
+                self,
+                "_authoritative_segmentation_sample_lookup_cache",
+                None,
+            )
+            if not isinstance(cached, dict) or cached.get("key") != cache_key:
+                try:
+                    projected_records = self._get_authoritative_segmentation_sample_records()
+                except Exception:
+                    return None
+                projected_lookup = {}
+                for projected in projected_records:
+                    projected_id = str(
+                        projected.get("interval_id") or projected.get("zone_id") or ""
+                    ).strip()
+                    if projected_id and projected_id not in projected_lookup:
+                        projected_lookup[projected_id] = dict(projected)
+                cached = {"key": cache_key, "value": projected_lookup}
+                self._authoritative_segmentation_sample_lookup_cache = cached
+            projected_lookup = cached.get("value") or {}
+            projected = projected_lookup.get(interval_id)
+            return dict(projected) if isinstance(projected, dict) else None
+
         context = self._get_current_sample_line_point_context(line_numbers=line_numbers)
         if not context:
             return None
@@ -3210,38 +3481,44 @@ class PitModelMixin:
 
     def _resolve_interval_process_bounds(self, interval, process_rows=None):
         # process 边界只能来自 process 侧字段/行号，禁止再用 sample 标签反推 process row。
-        rows = list(process_rows if process_rows is not None else (getattr(self, "data", None) or []))
+        source_rows = process_rows if process_rows is not None else (getattr(self, "data", None) or [])
+        rows = source_rows if isinstance(source_rows, list) else list(source_rows)
         if not rows:
             return None
 
         if process_rows is None and hasattr(self, "_ensure_process_point_metadata"):
             try:
                 self._ensure_process_point_metadata()
-                rows = list(getattr(self, "data", None) or [])
+                rows = getattr(self, "data", None) or []
             except Exception:
-                rows = list(getattr(self, "data", None) or [])
+                rows = getattr(self, "data", None) or []
 
-        process_lines = []
-        process_points = []
-        for row_idx, row in enumerate(rows):
-            try:
-                line_no = int(row.get("line_no_aligned", row.get("line_no_raw", row_idx)))
-            except Exception:
-                line_no = int(row_idx)
-            try:
-                point_idx = int(row.get("process_point_index", 0))
-            except Exception:
-                point_idx = 0
-            process_lines.append(int(line_no))
-            process_points.append(max(int(point_idx), 0))
+        process_line_arr = None
+        process_point_arr = None
 
-        process_line_arr = np.asarray(process_lines, dtype=int)
-        process_point_arr = np.asarray(process_points, dtype=int)
-        if process_line_arr.size == 0 or process_point_arr.size != process_line_arr.size:
-            return None
+        def _ensure_process_arrays():
+            nonlocal process_line_arr, process_point_arr
+            if process_line_arr is not None and process_point_arr is not None:
+                return True
+            process_lines = []
+            process_points = []
+            for row_idx, row in enumerate(rows):
+                line_no = self._get_process_row_sample_line(row, fallback=row_idx)
+                try:
+                    point_idx = int(row.get("process_point_index", 0))
+                except Exception:
+                    point_idx = 0
+                process_lines.append(int(line_no))
+                process_points.append(max(int(point_idx), 0))
+            process_line_arr = np.asarray(process_lines, dtype=int)
+            process_point_arr = np.asarray(process_points, dtype=int)
+            return bool(
+                process_line_arr.size > 0
+                and process_point_arr.size == process_line_arr.size
+            )
 
         def _pick_start(line_no, point_no=None):
-            if line_no is None:
+            if line_no is None or not _ensure_process_arrays():
                 return None
             candidates = np.flatnonzero(process_line_arr == int(line_no))
             if candidates.size == 0:
@@ -3256,7 +3533,7 @@ class PitModelMixin:
             return int(candidates[nearest])
 
         def _pick_end(line_no, point_no=None):
-            if line_no is None:
+            if line_no is None or not _ensure_process_arrays():
                 return None
             candidates = np.flatnonzero(process_line_arr == int(line_no))
             if candidates.size == 0:
@@ -3307,7 +3584,11 @@ class PitModelMixin:
             except Exception:
                 start_line = None
                 end_line = None
-            if start_line is not None and end_line is not None:
+            if (
+                start_line is not None
+                and end_line is not None
+                and _ensure_process_arrays()
+            ):
                 line_mask = (
                     (process_line_arr >= min(start_line, end_line))
                     & (process_line_arr <= max(start_line, end_line))
@@ -3331,10 +3612,16 @@ class PitModelMixin:
 
         start_row = rows[safe_start]
         end_row = rows[safe_end]
-        start_line = int(process_line_arr[safe_start])
-        end_line = int(process_line_arr[safe_end])
-        start_point_idx = int(process_point_arr[safe_start])
-        end_point_idx = int(process_point_arr[safe_end])
+        start_line = self._get_process_row_sample_line(start_row, fallback=safe_start)
+        end_line = self._get_process_row_sample_line(end_row, fallback=safe_end)
+        try:
+            start_point_idx = max(int(start_row.get("process_point_index", 0)), 0)
+        except Exception:
+            start_point_idx = 0
+        try:
+            end_point_idx = max(int(end_row.get("process_point_index", 0)), 0)
+        except Exception:
+            end_point_idx = 0
 
         try:
             start_s = float(start_row.get("path_start"))
@@ -3420,10 +3707,14 @@ class PitModelMixin:
         return materialized
 
     def _resolve_profile_segment_state_code(self, record):
+        segment_type = str(record.get("segment_type") or "").strip().lower()
+        fixed_codes = dict(STATE_CODE_BY_TYPE)
+        fixed_codes["steady_cutting"] = fixed_codes["steady"]
+        if segment_type in fixed_codes:
+            return int(fixed_codes[segment_type])
         try:
             return int(record.get("state_code"))
         except Exception:
-            segment_type = str(record.get("segment_type") or "").strip().lower()
             steady_subtype = str(record.get("steady_subtype") or "").strip().lower()
             is_idle_interval = bool(record.get("is_idle_interval")) or str(record.get("kc_source", "")).strip().lower() == "idle"
             if segment_type == "nonsteady" or steady_subtype == "nonsteady":
@@ -3431,6 +3722,20 @@ class PitModelMixin:
             if segment_type == "idle" or steady_subtype == "idle" or is_idle_interval:
                 return 1
             return 2
+
+    def _resolve_smif_state_code(self, record):
+        """将六态记录投影到 SMIF 现有的非稳态/空载/稳态三种显示语义。"""
+        if not isinstance(record, dict):
+            return 0
+        segment_type = str(record.get("segment_type") or "").strip().lower()
+        if segment_type in {"steady", "steady_cutting"}:
+            return 2
+        if segment_type == "idle":
+            return 1
+        if segment_type in {"entry", "transition", "nonsteady", "exit"}:
+            return 0
+        state_code = int(self._resolve_profile_segment_state_code(record))
+        return state_code if state_code in {0, 1, 2} else 0
 
     def _extract_profile_interval_records(self, profile=None, include_nonsteady=False):
         source_profile = profile if isinstance(profile, dict) else None
@@ -3442,19 +3747,31 @@ class PitModelMixin:
             if segment_records:
                 return [dict(record) for record in segment_records if isinstance(record, dict)]
 
+        raw_segment_records = [
+            dict(record)
+            for record in (source_profile.get("segment_records", []) or [])
+            if isinstance(record, dict)
+        ]
+        if raw_segment_records:
+            segment_records = self._extract_profile_segment_records(source_profile)
+            materialized = self._materialize_profile_pit_records(segment_records)
+            candidates = materialized if materialized else segment_records
+            return self._get_steady_interval_records(candidates)
+
+        def _materialize_steady_records(records):
+            materialized = self._materialize_profile_pit_records(records)
+            candidates = materialized if materialized else records
+            return self._get_steady_interval_records(
+                [dict(record) for record in candidates if isinstance(record, dict)]
+            )
+
         raw_pit_records = [
             dict(record)
             for record in (source_profile.get("pit_records", []) or [])
             if isinstance(record, dict)
         ]
         if raw_pit_records:
-            materialized = self._materialize_profile_pit_records(raw_pit_records)
-            records = materialized if materialized else raw_pit_records
-            return [
-                dict(record)
-                for record in records
-                if isinstance(record, dict) and self._record_represents_steady_interval(record)
-            ]
+            return _materialize_steady_records(raw_pit_records)
 
         raw_template_records = [
             dict(record)
@@ -3462,33 +3779,8 @@ class PitModelMixin:
             if isinstance(record, dict)
         ]
         if raw_template_records:
-            materialized = self._materialize_profile_pit_records(raw_template_records)
-            records = materialized if materialized else raw_template_records
-            return [
-                dict(record)
-                for record in records
-                if isinstance(record, dict) and self._record_represents_steady_interval(record)
-            ]
-
-        raw_segment_records = [
-            dict(record)
-            for record in (source_profile.get("segment_records", []) or [])
-            if isinstance(record, dict)
-        ]
-        if not raw_segment_records:
-            return []
-
-        filtered_records = []
-        for record in raw_segment_records:
-            state_code = self._resolve_profile_segment_state_code(record)
-            if not include_nonsteady and int(state_code) == 0:
-                continue
-            filtered_records.append(record)
-        if not filtered_records:
-            return []
-
-        materialized = self._materialize_profile_pit_records(filtered_records)
-        return materialized if materialized else filtered_records
+            return _materialize_steady_records(raw_template_records)
+        return []
 
     def _extract_profile_segment_records(self, profile=None):
         if not isinstance(profile, dict):
@@ -3536,11 +3828,108 @@ class PitModelMixin:
     def _record_represents_steady_interval(self, record):
         if not isinstance(record, dict):
             return False
-        state_code = self._resolve_profile_segment_state_code(record)
+        segment_type = str(record.get("segment_type") or "").strip().lower()
         is_idle_interval = bool(record.get("is_idle_interval")) or str(record.get("kc_source", "")).strip().lower() == "idle"
-        if int(state_code) == 0 or is_idle_interval:
+        if is_idle_interval:
             return False
-        return True
+        if segment_type:
+            return segment_type in {"steady", "steady_cutting"}
+        return int(self._resolve_profile_segment_state_code(record)) == 2
+
+    def _refresh_interval_process_descriptors(self, record):
+        """按当前工艺点刷新区间兼容描述值，不改动任何区间边界或状态字段。"""
+        current = dict(record) if isinstance(record, dict) else {}
+        rows = getattr(self, "data", None) or []
+        if not current or not rows:
+            return current
+        try:
+            start_idx = int(current.get("start_idx"))
+            end_idx = int(current.get("end_idx"))
+        except (TypeError, ValueError):
+            return current
+        if end_idx < start_idx:
+            start_idx, end_idx = end_idx, start_idx
+        if start_idx < 0 or end_idx >= len(rows):
+            return current
+        interval_rows = [row for row in rows[start_idx:end_idx + 1] if isinstance(row, dict)]
+
+        def _mean_value(*keys):
+            values = []
+            for row in interval_rows:
+                value = None
+                for key in keys:
+                    if row.get(key) is not None:
+                        value = row.get(key)
+                        break
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(value):
+                    values.append(value)
+            return float(np.mean(values)) if values else None
+
+        descriptor_sources = {
+            "a_p": ("ap", "a_p"),
+            "a_e": ("ae", "a_e"),
+            "F_plan": ("feed_effective", "F_program", "F_plan"),
+            "p_idle": ("P_idle",),
+            "p_pred": ("P",),
+        }
+        for target_key, source_keys in descriptor_sources.items():
+            value = _mean_value(*source_keys)
+            if value is not None:
+                current[target_key] = value
+        return current
+
+    def _get_steady_interval_records(self, records=None):
+        if isinstance(records, list):
+            source_records = records
+        else:
+            segment_records = self._get_current_segment_records(allow_profile_fallback=False)
+            source_records = (
+                segment_records
+                if segment_records
+                else self._get_current_interval_records(allow_profile_fallback=False)
+            )
+
+        steady_records = []
+        for record in source_records or []:
+            if not isinstance(record, dict):
+                continue
+            current = dict(record)
+            if not self._record_represents_steady_interval(current):
+                continue
+            refreshed = self._refresh_interval_process_descriptors(current)
+            if refreshed:
+                steady_records.append(refreshed)
+        return steady_records
+
+    def _has_authoritative_segmentation_state(self):
+        return bool(
+            getattr(self, "_current_interval_ready", False)
+            and str(getattr(self, "_current_interval_source", "") or "") == "segmentation"
+        )
+
+    def _refresh_authoritative_segmentation_interval_descriptors(self):
+        if not self._has_authoritative_segmentation_state() or not getattr(self, "data", None):
+            return False
+        interval_records = [
+            self._refresh_interval_process_descriptors(record)
+            for record in self._get_current_interval_records(allow_profile_fallback=False)
+        ]
+        return self._set_current_interval_state(
+            interval_records=interval_records,
+            segment_records=self._get_current_segment_records(allow_profile_fallback=False),
+            point_kc_map=dict(getattr(self, "current_interval_point_kc_map", {}) or {}),
+            source="segmentation",
+            profile_locked=bool(getattr(self, "_profile_intervals_locked", False)),
+            context_signature=str(getattr(self, "_current_interval_context_signature", "") or ""),
+            prediction_source=str(getattr(self, "_current_interval_prediction_source", "no_profile") or "no_profile"),
+            measurement_case_signature=str(
+                getattr(self, "_current_interval_measurement_case_signature", "") or ""
+            ),
+        )
 
     def _profile_contains_steady_interval_records(self, profile=None, interval_records=None):
         if isinstance(interval_records, list) and interval_records:
@@ -3559,7 +3948,7 @@ class PitModelMixin:
         return False
 
     def _select_interval_records_for_profile_persistence(self):
-        return self._get_current_interval_records(allow_profile_fallback=False)
+        return self._get_steady_interval_records()
 
     def _extract_interval_template_record(self, record, process_rows=None):
         if not isinstance(record, dict):
@@ -4147,7 +4536,7 @@ class PitModelMixin:
         )
 
     def _resolve_interval_records_for_measurement_prediction(self):
-        records = self._get_current_interval_records(allow_profile_fallback=False)
+        records = self._get_steady_interval_records()
         if records and self._can_reuse_current_interval_template(
             prediction_source=self._get_prediction_source(),
             measurement=getattr(self, "manual_measurement_data", None),
@@ -4161,7 +4550,9 @@ class PitModelMixin:
             allow_autoload_imported=self._should_allow_imported_profile_autoload(),
         )
         if isinstance(profile, dict):
-            return self._extract_profile_interval_records(profile)
+            return self._get_steady_interval_records(
+                self._extract_profile_interval_records(profile)
+            )
         return []
 
     def _summarize_runtime_interval_from_sample_df(self, interval, sample_df):
@@ -4345,12 +4736,18 @@ class PitModelMixin:
         if not runtime_records:
             return False
 
-        self.current_interval_records = [dict(record) for record in runtime_records]
-        self.pred_power_intervals = [dict(record) for record in runtime_records]
-        self.pit_records = [dict(record) for record in runtime_records]
-        if isinstance(getattr(self, "_cached_steady_intervals", None), dict):
-            self._cached_steady_intervals["pit_records"] = [dict(record) for record in runtime_records]
-        return True
+        return bool(
+            self._set_current_interval_state(
+                interval_records=[dict(record) for record in runtime_records],
+                segment_records=self._get_current_segment_records(allow_profile_fallback=False),
+                point_kc_map=dict(getattr(self, "current_interval_point_kc_map", {}) or {}),
+                source=str(getattr(self, "_current_interval_source", "") or ""),
+                profile_locked=bool(getattr(self, "_profile_intervals_locked", False)),
+                context_signature=str(getattr(self, "_current_interval_context_signature", "") or ""),
+                prediction_source=str(getattr(self, "_current_interval_prediction_source", "no_profile") or "no_profile"),
+                measurement_case_signature=str(getattr(self, "_current_interval_measurement_case_signature", "") or ""),
+            )
+        )
 
     def _apply_steady_interval_kc_to_sample_df(
         self,
@@ -4427,7 +4824,7 @@ class PitModelMixin:
             entered=True,
         )
 
-        for idx, interval in enumerate(interval_records, 1):
+        for idx, interval in enumerate(self._get_steady_interval_records(interval_records), 1):
             try:
                 start_idx = int(interval.get("sample_start_idx"))
                 end_idx = int(interval.get("sample_end_idx"))
@@ -4443,7 +4840,7 @@ class PitModelMixin:
             interval_mask = np.zeros(row_count, dtype=bool)
             interval_mask[start_idx:end_idx + 1] = True
             interval_id = str(interval.get("zone_id") or interval.get("interval_id") or f"Z{idx:03d}")
-            state_code = self._resolve_profile_segment_state_code(interval)
+            state_code = self._resolve_smif_state_code(interval)
             segment_type = str(interval.get("segment_type") or "").strip().lower()
             steady_subtype = str(interval.get("steady_subtype") or "").strip().lower()
             is_idle_interval = bool(interval.get("is_idle_interval")) or str(interval.get("kc_source", "")).strip().lower() == "idle"
@@ -4583,6 +4980,9 @@ class PitModelMixin:
     def _ensure_process_point_metadata(self):
         if not self.data:
             return
+        cache_key = (id(self.data), len(self.data))
+        if getattr(self, "_process_point_metadata_cache_key", None) == cache_key:
+            return
         has_complete_metadata = True
         for row in self.data:
             try:
@@ -4595,36 +4995,33 @@ class PitModelMixin:
                 has_complete_metadata = False
                 break
         if has_complete_metadata:
+            self._process_point_metadata_cache_key = cache_key
             return
 
-        point_counts = {}
-        for row in self.data:
+        def _row_group_key(row, row_index):
             raw_line = row.get("line_no_raw")
             if raw_line is None:
-                continue
+                raw_line = row.get("line_no_aligned")
+            if raw_line is None:
+                return int(row_index)
             try:
-                raw_key = int(raw_line)
+                return int(raw_line)
             except Exception:
-                continue
+                return int(row_index)
+
+        point_counts = {}
+        for row_index, row in enumerate(self.data):
+            raw_key = _row_group_key(row, row_index)
             point_counts[raw_key] = point_counts.get(raw_key, 0) + 1
 
         point_offsets = {}
-        for row in self.data:
-            raw_line = row.get("line_no_raw")
-            if raw_line is None:
-                row["process_point_index"] = 0
-                row["process_point_count"] = 1
-                continue
-            try:
-                raw_key = int(raw_line)
-            except Exception:
-                row["process_point_index"] = 0
-                row["process_point_count"] = 1
-                continue
+        for row_index, row in enumerate(self.data):
+            raw_key = _row_group_key(row, row_index)
             point_idx = int(point_offsets.get(raw_key, 0))
             point_offsets[raw_key] = point_idx + 1
             row["process_point_index"] = point_idx
             row["process_point_count"] = int(point_counts.get(raw_key, point_idx + 1))
+        self._process_point_metadata_cache_key = cache_key
 
     def _build_full_point_kc_map_from_current_state(
         self,
@@ -4739,9 +5136,7 @@ class PitModelMixin:
         self._ensure_process_point_metadata()
         point_kc_map = dict(base_point_kc_map or {})
         default_kc = float(self.get_kc_value())
-        for interval in interval_records:
-            if not isinstance(interval, dict):
-                continue
+        for interval in self._get_steady_interval_records(interval_records):
             process_bounds = self._resolve_interval_process_bounds(interval)
             if not process_bounds:
                 continue
@@ -4817,14 +5212,8 @@ class PitModelMixin:
         ):
             start_row = self.data[int(block_start)]
             end_row = self.data[int(block_end)]
-            try:
-                start_line = int(start_row.get("line_no_aligned", start_row.get("line_no_raw", block_start)))
-            except Exception:
-                start_line = int(block_start)
-            try:
-                end_line = int(end_row.get("line_no_aligned", end_row.get("line_no_raw", block_end)))
-            except Exception:
-                end_line = int(block_end)
+            start_line = self._get_process_row_sample_line(start_row, fallback=block_start)
+            end_line = self._get_process_row_sample_line(end_row, fallback=block_end)
             try:
                 start_point_idx = int(start_row.get("process_point_index", 0))
             except Exception:
@@ -4914,7 +5303,15 @@ class PitModelMixin:
 
     def _build_profile_point_kc_map_for_segments(self, segment_records, steady_records=None):
         measurement = getattr(self, "manual_measurement_data", None)
-        if not isinstance(measurement, dict) or not isinstance(segment_records, list):
+        if not isinstance(measurement, dict):
+            return {}
+
+        candidate_records = steady_records if isinstance(steady_records, list) else segment_records
+        if not isinstance(candidate_records, list):
+            return {}
+        # profile 点级 Kc 仅使用完整稳态区间，其余五态只用于展示与追溯。
+        selected_steady_records = self._get_steady_interval_records(candidate_records)
+        if not selected_steady_records:
             return {}
 
         aligned_lines = np.asarray(measurement.get("line_no_aligned", []), dtype=int)
@@ -4936,11 +5333,13 @@ class PitModelMixin:
         ):
             return {}
 
-        grouped_values = {}
-        for segment in segment_records:
+        # 区间处于 process row 坐标。排序区间端点后，一次性计算每个实测
+        # 样本被多少个稳态区间覆盖；既保留重叠区间的重复计权语义，也避免
+        # 每个区间都扫描全部实测点。
+        interval_starts = []
+        interval_ends = []
+        for segment in selected_steady_records:
             if not isinstance(segment, dict):
-                continue
-            if int(self._resolve_profile_segment_state_code(segment)) != 0:
                 continue
             try:
                 start_idx = int(segment.get("start_idx"))
@@ -4949,27 +5348,76 @@ class PitModelMixin:
                 continue
             if end_idx < start_idx:
                 start_idx, end_idx = end_idx, start_idx
-            segment_mask = (process_row_indices >= int(start_idx)) & (process_row_indices <= int(end_idx))
-            for sample_idx in np.flatnonzero(segment_mask):
-                point_idx = int(point_indices[sample_idx]) if sample_idx < point_indices.size else -1
-                if point_idx < 0:
-                    continue
-                if bool(kc_valid[sample_idx]) and np.isfinite(kc_point[sample_idx]):
-                    kc_value = float(kc_point[sample_idx])
-                elif bool(sample_kc_valid[sample_idx]) and np.isfinite(sample_kc[sample_idx]):
-                    kc_value = float(sample_kc[sample_idx])
-                else:
-                    continue
-                line_no = int(aligned_lines[sample_idx])
-                grouped_values.setdefault((line_no, point_idx), []).append(float(kc_value))
+            interval_starts.append(int(start_idx))
+            interval_ends.append(int(end_idx))
+        if not interval_starts:
+            return {}
 
-        point_kc_map = {}
-        for (line_no, point_idx), values in grouped_values.items():
-            kc_hat, _sigma_kc, valid_values = self._summarize_interval_kc_statistics(values)
-            if not np.isfinite(kc_hat) or len(valid_values) <= 0:
-                continue
-            point_kc_map[f"{int(line_no)}:{int(point_idx)}"] = max(float(kc_hat), 0.0)
-        return point_kc_map
+        sorted_starts = np.sort(np.asarray(interval_starts, dtype=int))
+        sorted_ends = np.sort(np.asarray(interval_ends, dtype=int))
+        sample_coverage = (
+            np.searchsorted(sorted_starts, process_row_indices, side="right")
+            - np.searchsorted(sorted_ends, process_row_indices, side="left")
+        )
+
+        preferred_kc = kc_valid & np.isfinite(kc_point)
+        fallback_kc = (~preferred_kc) & sample_kc_valid & np.isfinite(sample_kc)
+        usable = (
+            (sample_coverage > 0)
+            & (point_indices >= 0)
+            & (preferred_kc | fallback_kc)
+        )
+        usable_indices = np.flatnonzero(usable)
+        if usable_indices.size == 0:
+            return {}
+
+        kc_values = np.where(preferred_kc, kc_point, sample_kc)
+        repeat_counts = sample_coverage[usable_indices].astype(int)
+        expanded_indices = np.repeat(usable_indices, repeat_counts)
+        grouped_frame = pd.DataFrame(
+            {
+                "line_no": aligned_lines[expanded_indices],
+                "point_idx": point_indices[expanded_indices],
+                "kc_value": kc_values[expanded_indices],
+            }
+        )
+        grouped_frame["rounded_kc"] = np.round(
+            grouped_frame["kc_value"].to_numpy(dtype=float),
+            6,
+        )
+        group_columns = ["line_no", "point_idx"]
+        centers = (
+            grouped_frame.groupby(group_columns, sort=True)["kc_value"]
+            .median()
+            .rename("center")
+        )
+        candidate_counts = (
+            grouped_frame.groupby(
+                [*group_columns, "rounded_kc"],
+                sort=True,
+            )
+            .size()
+            .rename("count")
+            .reset_index()
+        )
+        max_counts = candidate_counts.groupby(group_columns, sort=False)["count"].transform("max")
+        candidates = candidate_counts.loc[candidate_counts["count"] == max_counts].copy()
+        candidates = candidates.join(centers, on=group_columns)
+        candidates["distance"] = np.abs(
+            candidates["rounded_kc"].to_numpy(dtype=float)
+            - candidates["center"].to_numpy(dtype=float)
+        )
+        winners = (
+            candidates.sort_values(
+                [*group_columns, "distance", "rounded_kc"],
+                kind="mergesort",
+            )
+            .drop_duplicates(group_columns, keep="first")
+        )
+        return {
+            f"{int(row.line_no)}:{int(row.point_idx)}": max(float(row.rounded_kc), 0.0)
+            for row in winners.itertuples(index=False)
+        }
 
     def _build_current_kc_profile_snapshot(self, source="measurement"):
         process_path = self.get_primary_input_file()
@@ -4985,13 +5433,14 @@ class PitModelMixin:
                 for record in self._get_current_interval_records(allow_profile_fallback=False)
                 if isinstance(record, dict)
             ]
-        steady_pit_records = [
-            dict(record)
-            for record in current_interval_records
-            if isinstance(record, dict) and self._record_represents_steady_interval(record)
-        ]
+        steady_pit_records = self._materialize_profile_pit_records(
+            self._get_steady_interval_records()
+        )
         interval_templates = self._build_interval_templates_for_profile(steady_pit_records)
-        segment_records = self._build_profile_segment_records(interval_records=current_interval_records)
+        if self._has_authoritative_segmentation_state():
+            segment_records = self._get_current_segment_records(allow_profile_fallback=False)
+        else:
+            segment_records = self._build_profile_segment_records(interval_records=current_interval_records)
         point_kc_map = self._build_profile_point_kc_map_for_segments(
             segment_records,
             steady_records=steady_pit_records,
@@ -5040,6 +5489,7 @@ class PitModelMixin:
             origin="runtime_identified_profile",
             file_path="",
             case_signature=measurement_case_signature,
+            normalize=False,
         )
         self._sync_current_interval_state_prediction_context(
             prediction_source="runtime_identified_profile",
@@ -5134,7 +5584,452 @@ class PitModelMixin:
             except Exception:
                 row["T"] = 0.0
         self._invalidate_process_alignment_caches(reason="apply_point_kc_map")
+        self._refresh_authoritative_segmentation_interval_descriptors()
         return True
+
+    @staticmethod
+    def _measurement_content_binding_matches(expected_binding, current_binding):
+        """忽略文件位置，只按采样内容判断是否为同一份实际负载。"""
+        if not isinstance(expected_binding, dict) or not isinstance(current_binding, dict):
+            return False
+        try:
+            expected_count = int(expected_binding.get("sample_count", 0) or 0)
+            current_count = int(current_binding.get("sample_count", 0) or 0)
+        except Exception:
+            return False
+        if expected_count <= 0 or expected_count != current_count:
+            return False
+        expected_actual = str(expected_binding.get("actual_load_crc32") or "").strip().lower()
+        current_actual = str(current_binding.get("actual_load_crc32") or "").strip().lower()
+        if not expected_actual or not current_actual or expected_actual != current_actual:
+            return False
+        expected_lines = str(expected_binding.get("program_line_crc32") or "").strip().lower()
+        current_lines = str(current_binding.get("program_line_crc32") or "").strip().lower()
+        return not (
+            expected_lines
+            and current_lines
+            and expected_lines != current_lines
+        )
+
+    def _profile_is_independent_from_current_measurement(
+        self,
+        profile=None,
+        measurement=None,
+    ):
+        """判断前向 profile 是否独立于当前实际负载。"""
+        source_profile = profile if isinstance(profile, dict) else None
+        payload = (
+            measurement
+            if isinstance(measurement, dict)
+            else getattr(self, "manual_measurement_data", None)
+        )
+        if not isinstance(source_profile, dict) or not isinstance(payload, dict):
+            return True
+        if str(getattr(self, "sample_data_mode", "") or "").strip() != "experiment_measurement":
+            return True
+
+        current_binding = self._build_manual_measurement_binding(payload)
+        candidate_bindings = []
+        top_level_binding = source_profile.get("measurement_binding")
+        if isinstance(top_level_binding, dict):
+            candidate_bindings.append(top_level_binding)
+        sample_profile = source_profile.get("sample_kc_profile")
+        if isinstance(sample_profile, dict) and isinstance(sample_profile.get("binding"), dict):
+            candidate_bindings.append(sample_profile["binding"])
+        if any(
+            self._measurement_content_binding_matches(binding, current_binding)
+            for binding in candidate_bindings
+        ):
+            return False
+
+        stored_case_signature = str(
+            source_profile.get("measurement_case_signature") or ""
+        ).strip()
+        current_case_signature = self._get_current_measurement_case_signature(payload)
+        if (
+            stored_case_signature
+            and current_case_signature
+            and stored_case_signature == current_case_signature
+        ):
+            return False
+
+        source = str(source_profile.get("source") or "").strip().lower()
+        def _binding_is_verifiable(binding):
+            try:
+                sample_count = int(binding.get("sample_count", 0) or 0)
+            except Exception:
+                return False
+            return bool(
+                sample_count > 0
+                and str(binding.get("actual_load_crc32") or "").strip()
+            )
+
+        has_verifiable_training_binding = any(
+            _binding_is_verifiable(binding)
+            for binding in candidate_bindings
+        )
+        if source.startswith("measurement") and not has_verifiable_training_binding:
+            # 无训练数据绑定的实测辨识 profile 无法证明与当前验证样本独立。
+            return False
+        return True
+
+    def _apply_profile_prediction_parameters(self, profile, source_identity=""):
+        """只激活前向预测参数，不导入 profile 中保存的历史六态区间。"""
+
+        if not isinstance(profile, dict):
+            return False
+
+        idle_model = profile.get("idle_power_model")
+        if isinstance(idle_model, dict) and idle_model.get("speeds") and idle_model.get("powers"):
+            self.idle_power_model = dict(idle_model)
+            self.idle_model_signature = str(
+                profile.get("idle_model_signature")
+                or source_identity
+                or self._build_stable_prediction_digest(idle_model)
+            )
+        elif "idle_power_model" in profile:
+            self.idle_power_model = None
+            self.idle_model_signature = ""
+
+        assignments = (
+            ("global_idle", "p_idle_var", None),
+            ("global_kc", "kc_coeff", self._format_optional_model_param),
+            ("kc_sigma", "kc_sigma", None),
+        )
+        for profile_key, variable_name, formatter in assignments:
+            if profile_key not in profile:
+                continue
+            try:
+                value = float(profile.get(profile_key))
+            except Exception:
+                continue
+            target = getattr(self, variable_name, None)
+            if not np.isfinite(value) or not hasattr(target, "set"):
+                continue
+            target.set(formatter(value) if callable(formatter) else value)
+
+        ke_value = profile.get("ke_value", profile.get("global_ke"))
+        try:
+            ke_value = float(ke_value)
+        except Exception:
+            ke_value = float("nan")
+        if np.isfinite(ke_value):
+            target = getattr(self, "ke_coeff", None)
+            if hasattr(target, "set"):
+                target.set(self._format_optional_model_param(ke_value))
+        return True
+
+    def _build_profile_prediction_point_map(self, profile):
+        if not self.data or not isinstance(profile, dict):
+            return {}, {}
+
+        self._ensure_process_point_metadata()
+        line_kc_map = self._normalize_profile_line_kc_map(profile)
+        point_kc_map = self._normalize_profile_point_kc_map(profile)
+
+        global_kc = self._resolve_profile_global_kc(profile, default=self.get_kc_value())
+        for row_index, row in enumerate(self.data):
+            try:
+                line_no = int(row.get("line_no_aligned", row_index))
+            except Exception:
+                line_no = int(row_index)
+            try:
+                point_index = int(row.get("process_point_index", 0))
+            except Exception:
+                point_index = 0
+            point_key = (line_no, point_index)
+            if point_key not in point_kc_map and line_no not in line_kc_map:
+                point_kc_map[point_key] = max(float(global_kc), 0.0)
+        return point_kc_map, line_kc_map
+
+    def _apply_profile_prediction_to_current_data(
+        self,
+        profile,
+        *,
+        origin,
+        profile_path="",
+    ):
+        if not self.data or not isinstance(profile, dict):
+            return False
+
+        normalized_profile = self._normalize_loaded_kc_profile(
+            profile,
+            source_path=str(profile_path or ""),
+        )
+        if not isinstance(normalized_profile, dict):
+            return False
+
+        self._activate_profile_state(
+            normalized_profile,
+            origin=origin,
+            file_path=str(profile_path or ""),
+            normalize=False,
+        )
+        self._apply_profile_prediction_parameters(
+            normalized_profile,
+            source_identity=str(profile_path or ""),
+        )
+        expected_context_signature = self._build_prediction_context_signature(
+            prediction_source=origin,
+            measurement=getattr(self, "manual_measurement_data", None),
+        )
+        self._invalidate_segmentation_for_prediction_context_change(
+            expected_context_signature,
+            reason="profile 或预测模型发生变化",
+        )
+        if (
+            bool(getattr(self, "_current_interval_ready", False))
+            and not self._has_authoritative_segmentation_state()
+        ):
+            self._clear_current_interval_state(keep_profile_lock=False)
+
+        point_kc_map, line_kc_map = self._build_profile_prediction_point_map(
+            normalized_profile
+        )
+        ke_value = self._resolve_profile_ke_value(
+            normalized_profile,
+            default=self.get_ke_value(),
+        )
+        applied = self._apply_point_kc_map_to_current_data(
+            point_kc_map,
+            line_kc_map=line_kc_map,
+            ke_value=ke_value,
+            clear_interval_ids=not self._has_authoritative_segmentation_state(),
+        )
+        if applied:
+            self._debug_prediction_state_event(
+                "apply_profile_prediction_to_current_data",
+                kc_map_source=origin,
+                historical_intervals_imported=False,
+            )
+        return bool(applied)
+
+    def _refresh_segmentation_process_prediction(self, prediction_payload=None):
+        """按样本预测来源同步过程域 P/P_idle，并返回可校验的内容签名。"""
+
+        measurement = getattr(self, "manual_measurement_data", None)
+        payload = prediction_payload if isinstance(prediction_payload, dict) else measurement
+
+        def _fail(reason):
+            self._segmentation_process_prediction_context_signature = ""
+            self._segmentation_process_prediction_source = ""
+            self._segmentation_process_prediction_row_count = 0
+            if isinstance(measurement, dict):
+                for key in (
+                    "segmentation_process_prediction_context_signature",
+                    "segmentation_process_prediction_source",
+                    "segmentation_process_prediction_row_count",
+                ):
+                    measurement.pop(key, None)
+            self._debug_prediction_state_event(
+                "refresh_segmentation_process_prediction_failed",
+                reason=str(reason or "unknown"),
+            )
+            return {
+                "success": False,
+                "source": "",
+                "context_signature": "",
+                "row_count": 0,
+                "reason": str(reason or "unknown"),
+            }
+
+        if not self.data:
+            return _fail("当前没有 ProcessInfo 过程点")
+        if not isinstance(payload, dict) or not isinstance(measurement, dict):
+            return _fail("缺少实际负载预测 payload")
+
+        policy = payload.get("segmentation_prediction_policy")
+        policy = dict(policy) if isinstance(policy, dict) else {}
+        declared_source = str(
+            policy.get("source")
+            or payload.get("segmentation_prediction_source")
+            or measurement.get("segmentation_prediction_source")
+            or ""
+        ).strip()
+        profile_origin = self._get_profile_origin()
+        if not declared_source and profile_origin == "imported_profile":
+            active_profile = getattr(self, "imported_kc_profile", None)
+            is_independent = bool(
+                isinstance(active_profile, dict)
+                and self._profile_is_independent_from_current_measurement(
+                    active_profile,
+                    measurement=measurement,
+                )
+            )
+            declared_source = "independent_profile" if is_independent else "same_measurement_profile"
+        elif not declared_source and isinstance(measurement, dict):
+            declared_source = "measurement_reverse"
+
+        expected_policy = {
+            "independent_profile": (True, False),
+            "same_measurement_profile": (False, True),
+            "measurement_reverse": (False, True),
+        }
+        if declared_source not in expected_policy:
+            return _fail(f"不支持的六态预测来源: {declared_source or 'empty'}")
+        expected_independent, expected_temporary = expected_policy[declared_source]
+        declared_independent = policy.get(
+            "independent",
+            payload.get("segmentation_prediction_independent"),
+        )
+        declared_temporary = policy.get(
+            "temporary_measurement_mode",
+            payload.get("segmentation_temporary_measurement_mode"),
+        )
+        if declared_independent is not None and bool(declared_independent) != expected_independent:
+            return _fail("样本预测独立性标记与来源不一致")
+        if declared_temporary is not None and bool(declared_temporary) != expected_temporary:
+            return _fail("样本预测临时模式标记与来源不一致")
+
+        applied = False
+        if declared_source in {"independent_profile", "same_measurement_profile"}:
+            source_profile = self._resolve_imported_profile_for_current_context(
+                process_path=self._get_primary_input_file_or_empty(),
+                allow_autoload=True,
+            )
+            if not isinstance(source_profile, dict):
+                source_profile = getattr(self, "imported_kc_profile", None)
+            if not isinstance(source_profile, dict):
+                return _fail("样本声明 profile 预测，但当前没有可用 imported profile")
+            actual_independent = self._profile_is_independent_from_current_measurement(
+                source_profile,
+                measurement=measurement,
+            )
+            if bool(actual_independent) != bool(expected_independent):
+                return _fail("当前 profile 与实际负载的绑定关系已变化")
+            applied = self._apply_saved_kc_profile_to_current_data(source_profile)
+        else:
+            runtime_profile = self._resolve_runtime_identified_profile_for_current_case(
+                measurement=measurement,
+                process_path=self._get_primary_input_file_or_empty(),
+            )
+            if isinstance(runtime_profile, dict):
+                applied = self._apply_profile_prediction_to_current_data(
+                    runtime_profile,
+                    origin="runtime_identified_profile",
+                    profile_path="",
+                )
+            else:
+                aligned_lines = np.asarray(measurement.get("line_no_aligned", []), dtype=int)
+                point_indices = np.asarray(measurement.get("process_point_index", []), dtype=int)
+                kc_points = self._clip_nonnegative_numeric_array(
+                    measurement.get("kc_point", measurement.get("sample_kc_values", []))
+                )
+                kc_valid_mask = np.asarray(
+                    measurement.get("kc_valid_mask", measurement.get("sample_kc_valid_mask", [])),
+                    dtype=bool,
+                )
+                if not (
+                    aligned_lines.size
+                    == point_indices.size
+                    == kc_points.size
+                    == kc_valid_mask.size
+                    and aligned_lines.size > 0
+                    and np.any(kc_valid_mask & np.isfinite(kc_points) & (point_indices >= 0))
+                ):
+                    return _fail("measurement_reverse 缺少有效的点级 Kc")
+                expected_context_signature = self._build_prediction_context_signature(
+                    prediction_source="no_profile",
+                    measurement=measurement,
+                )
+                self._invalidate_segmentation_for_prediction_context_change(
+                    expected_context_signature,
+                    reason="实测反向辨识结果发生变化",
+                )
+                point_kc_map = self._build_full_point_kc_map_from_current_state(
+                    allow_profile_fallback=False,
+                    prefer_current_state=False,
+                    allow_measurement_point_fallback=True,
+                )
+                applied = self._apply_point_kc_map_to_current_data(
+                    point_kc_map,
+                    clear_interval_ids=not self._has_authoritative_segmentation_state(),
+                )
+
+        if not applied:
+            return _fail("无法用当前预测来源刷新过程域 P/P_idle")
+
+        process_rows = []
+        for row_index, row in enumerate(self.data):
+            if bool(row.get("_is_synthetic_fill", False)):
+                continue
+            try:
+                predicted_load = float(row.get("P"))
+                predicted_idle = float(row.get("P_idle"))
+                kc_value = float(row.get("K_c", row.get("K")))
+                ke_value = float(row.get("K_e"))
+                mrr_value = float(row.get("MRR"))
+            except (TypeError, ValueError):
+                return _fail(f"过程点 {row_index} 的预测字段不可解析")
+            if not all(
+                np.isfinite(value)
+                for value in (predicted_load, predicted_idle, kc_value, ke_value, mrr_value)
+            ):
+                return _fail(f"过程点 {row_index} 的预测字段包含非有限值")
+            try:
+                line_no = int(row.get("line_no_aligned", row_index))
+            except Exception:
+                line_no = int(row_index)
+            try:
+                point_index = int(row.get("process_point_index", 0))
+            except Exception:
+                point_index = 0
+            process_rows.append(
+                (
+                    line_no,
+                    point_index,
+                    predicted_load,
+                    predicted_idle,
+                    kc_value,
+                    ke_value,
+                    mrr_value,
+                )
+            )
+
+        prediction_context = self._build_prediction_context_signature(
+            prediction_source=self._get_prediction_source(),
+            measurement=measurement,
+        )
+        sample_prediction_context = str(
+            payload.get("segmentation_sample_prediction_context_signature")
+            or measurement.get("segmentation_sample_prediction_context_signature")
+            or ""
+        )
+        if sample_prediction_context and sample_prediction_context != prediction_context:
+            return _fail("样本预测与过程预测不属于同一模型上下文")
+        context_signature = self._build_stable_prediction_digest(
+            {
+                "source": declared_source,
+                "independent": expected_independent,
+                "temporary_measurement_mode": expected_temporary,
+                "prediction_context": prediction_context,
+                "process_rows": process_rows,
+            }
+        )
+        self._segmentation_process_prediction_context_signature = context_signature
+        self._segmentation_process_prediction_source = declared_source
+        self._segmentation_process_prediction_row_count = len(process_rows)
+        measurement["segmentation_process_prediction_context_signature"] = context_signature
+        measurement["segmentation_process_prediction_source"] = declared_source
+        measurement["segmentation_process_prediction_row_count"] = len(process_rows)
+        self._debug_prediction_state_event(
+            "refresh_segmentation_process_prediction",
+            segmentation_prediction_source=declared_source,
+            segmentation_prediction_independent=expected_independent,
+            segmentation_temporary_measurement_mode=expected_temporary,
+            process_prediction_context_signature=context_signature,
+            process_row_count=len(process_rows),
+        )
+        return {
+            "success": True,
+            "source": declared_source,
+            "independent": expected_independent,
+            "temporary_measurement_mode": expected_temporary,
+            "context_signature": context_signature,
+            "prediction_context": prediction_context,
+            "row_count": len(process_rows),
+            "reason": "",
+        }
 
     def _refresh_current_process_prediction_from_runtime(self, allow_profile_fallback=True, prefer_current_state=True):
         if not self.data:
@@ -5193,7 +6088,7 @@ class PitModelMixin:
                 spindle_speeds.append(0.0)
         speed_arr = np.asarray(spindle_speeds, dtype=float)
 
-        for idx, interval in enumerate(interval_records, 1):
+        for idx, interval in enumerate(self._get_steady_interval_records(interval_records), 1):
             try:
                 start_idx = int(interval.get("start_idx"))
                 end_idx = int(interval.get("end_idx"))
@@ -5253,6 +6148,7 @@ class PitModelMixin:
                 except Exception:
                     row["T"] = 0.0
         self._invalidate_process_alignment_caches(reason="apply_interval_kc_records")
+        self._refresh_authoritative_segmentation_interval_descriptors()
         return True
 
     def _build_compact_runtime_interval_record(
@@ -5280,14 +6176,8 @@ class PitModelMixin:
         formatter = getattr(self, "format_line_point", None)
         start_row = self.data[start_idx]
         end_row = self.data[end_idx]
-        try:
-            start_line = int(start_row.get("line_no_aligned", start_row.get("line_no_raw", start_idx)))
-        except Exception:
-            start_line = int(start_idx)
-        try:
-            end_line = int(end_row.get("line_no_aligned", end_row.get("line_no_raw", end_idx)))
-        except Exception:
-            end_line = int(end_idx)
+        start_line = self._get_process_row_sample_line(start_row, fallback=start_idx)
+        end_line = self._get_process_row_sample_line(end_row, fallback=end_idx)
         try:
             start_point_idx = int(start_row.get("process_point_index", 0))
         except Exception:
@@ -5496,7 +6386,7 @@ class PitModelMixin:
         for segment in segment_records:
             if not isinstance(segment, dict):
                 continue
-            state_code = self._resolve_profile_segment_state_code(segment)
+            state_code = self._resolve_smif_state_code(segment)
             if int(state_code) == 0:
                 continue
             is_idle_interval = int(state_code) == 1 or bool(segment.get("is_idle_interval"))
@@ -5577,62 +6467,31 @@ class PitModelMixin:
         )
         profile = self._normalize_loaded_kc_profile(source_profile, source_path=str(getattr(self, "active_kc_profile_path", "") or ""))
         if not isinstance(profile, dict):
-            self._clear_current_interval_state(keep_profile_lock=False)
+            if not self._has_authoritative_segmentation_state():
+                self._clear_current_interval_state(keep_profile_lock=False)
             self.refresh_pit_button_state()
             return False
+
+        profile_is_independent = self._profile_is_independent_from_current_measurement(profile)
+        if not profile_is_independent:
+            self._debug_prediction_state_event(
+                "allow_measurement_bound_profile_for_temporary_segmentation",
+                reason="profile_training_data_matches_current_measurement",
+                kc_map_source="same_measurement_profile",
+                segmentation_prediction_independent=False,
+                segmentation_temporary_measurement_mode=True,
+            )
 
         profile_path = str(
             getattr(self, "imported_kc_profile_path", "") or getattr(self, "active_kc_profile_path", "") or ""
         ).strip()
-        self._activate_profile_state(
+        applied = self._apply_profile_prediction_to_current_data(
             profile,
             origin="imported_profile",
-            file_path=profile_path,
-        )
-        line_kc_map = self._normalize_profile_line_kc_map(profile)
-        point_kc_map = self._normalize_profile_point_kc_map(profile)
-        interval_records = self._extract_profile_interval_records(profile)
-        segment_records = self._extract_profile_segment_records(profile)
-        if not segment_records and interval_records:
-            segment_records = self._build_profile_segment_records(interval_records=interval_records)
-        self._set_current_interval_state(
-            interval_records=interval_records,
-            segment_records=segment_records,
-            point_kc_map=point_kc_map,
-            source="imported_profile",
-            profile_locked=True,
-            context_signature=self._build_prediction_context_signature(
-                prediction_source="imported_profile",
-                measurement=getattr(self, "manual_measurement_data", None),
-            ),
-            prediction_source="imported_profile",
-            measurement_case_signature=self._get_current_measurement_case_signature(),
-        )
-        self._debug_interval_state_event(
-            "profile_lock_enabled",
-            source="imported_profile",
-            interval_count=len(interval_records),
-            segment_count=len(segment_records),
+            profile_path=profile_path,
         )
         self.refresh_pit_button_state()
-        if not line_kc_map and not point_kc_map:
-            return bool(interval_records or segment_records)
-
-        ke_value = self._resolve_profile_ke_value(profile, default=self.get_ke_value())
-        self._apply_point_kc_map_to_current_data(
-            point_kc_map,
-            line_kc_map=line_kc_map,
-            ke_value=ke_value,
-            clear_interval_ids=False,
-        )
-        self._apply_interval_kc_records_to_current_data(interval_records, ke_value=ke_value)
-        self._debug_prediction_state_event(
-            "apply_imported_profile_to_current_data",
-            kc_map_source="imported_profile",
-            reverse_solve=False,
-            reused_current_template=False,
-        )
-        return True
+        return bool(applied)
 
     def _refresh_preview_with_saved_kc_profile(self, refresh_measurement=True):
         self._apply_saved_kc_profile_to_current_data(getattr(self, "imported_kc_profile", None))
@@ -5805,71 +6664,51 @@ class PitModelMixin:
         if not isinstance(profile, dict):
             raise ValueError("配置文件内容无效")
 
+        preserve_segmentation = self._has_authoritative_segmentation_state()
         normalized_profile = self._normalize_loaded_kc_profile(profile, source_path=file_path)
         self._clear_runtime_identified_profile_state(clear_active=False, reason="load_imported_profile")
-        self._invalidate_measurement_runtime_state(keep_profile_lock=False, clear_interval_state=True)
+        self._invalidate_measurement_runtime_state(
+            keep_profile_lock=False,
+            clear_interval_state=not preserve_segmentation,
+        )
         self._activate_profile_state(
             normalized_profile,
             origin="imported_profile",
             file_path=str(file_path or ""),
+            normalize=False,
         )
         self._set_profile_import_skip_state(skipped=False)
-        idle_model = normalized_profile.get("idle_power_model")
-        if isinstance(idle_model, dict) and idle_model.get("speeds") and idle_model.get("powers"):
-            self.idle_power_model = dict(idle_model)
-            self.idle_model_signature = str(normalized_profile.get("idle_model_signature") or file_path or datetime.now().isoformat())
-        elif "idle_power_model" in profile:
-            self.idle_power_model = None
-            self.idle_model_signature = ""
-        if "global_idle" in normalized_profile and np.isfinite(float(normalized_profile.get("global_idle") or 0.0)):
-            self.p_idle_var.set(float(normalized_profile.get("global_idle") or 0.0))
-        if "global_kc" in normalized_profile and np.isfinite(float(normalized_profile.get("global_kc") or 0.0)):
-            self.kc_coeff.set(self._format_optional_model_param(normalized_profile.get("global_kc")))
-        if "kc_sigma" in normalized_profile and np.isfinite(float(normalized_profile.get("kc_sigma") or 0.0)):
-            self.kc_sigma.set(float(normalized_profile.get("kc_sigma") or 0.0))
-        if "ke_value" in normalized_profile and np.isfinite(float(normalized_profile.get("ke_value") or 0.0)):
-            self.ke_coeff.set(self._format_optional_model_param(normalized_profile.get("ke_value")))
-        elif "global_ke" in normalized_profile and np.isfinite(float(normalized_profile.get("global_ke") or 0.0)):
-            self.ke_coeff.set(self._format_optional_model_param(normalized_profile.get("global_ke")))
-        materialized_records = self._extract_profile_interval_records(normalized_profile)
-        materialized_segments = self._extract_profile_segment_records(normalized_profile)
-        if not materialized_segments and materialized_records and self.data:
-            materialized_segments = self._build_profile_segment_records(interval_records=materialized_records)
-        normalized_point_kc_map = self._normalize_profile_point_kc_map(normalized_profile)
-        self._set_current_interval_state(
-            interval_records=materialized_records,
-            segment_records=materialized_segments,
-            point_kc_map=normalized_point_kc_map,
-            source="imported_profile",
-            profile_locked=True,
-            context_signature=self._build_prediction_context_signature(
-                prediction_source="imported_profile",
-                measurement=getattr(self, "manual_measurement_data", None),
-            ),
-            prediction_source="imported_profile",
-            measurement_case_signature=self._get_current_measurement_case_signature(),
+        self._apply_profile_prediction_parameters(
+            normalized_profile,
+            source_identity=str(file_path or ""),
         )
-        self._debug_interval_state_event(
-            "profile_lock_enabled",
-            source="imported_profile",
-            profile_path=os.path.basename(file_path) if file_path else "memory",
-            interval_count=len(materialized_records),
-            segment_count=len(materialized_segments),
-        )
-        if hasattr(self, "smif_scope_var"):
-            try:
-                self.smif_scope_var.set(
-                    "steady" if self._profile_contains_steady_interval_records(normalized_profile, materialized_records) else "all"
-                )
-            except Exception:
-                pass
-        self.refresh_pit_button_state()
 
         if self.gcode_nc_path_var.get().strip() and os.path.exists(self.gcode_nc_path_var.get().strip()):
             self._refresh_current_program_idle_power_from_gcode()
         else:
             self.current_program_idle_power.set(float(self.p_idle_var.get() or 0.0))
             self._update_program_idle_summary()
+
+        expected_context_signature = self._build_prediction_context_signature(
+            prediction_source="imported_profile",
+            measurement=getattr(self, "manual_measurement_data", None),
+        )
+        self._invalidate_segmentation_for_prediction_context_change(
+            expected_context_signature,
+            reason="导入的 profile 或预测模型发生变化",
+        )
+        if (
+            bool(getattr(self, "_current_interval_ready", False))
+            and not self._has_authoritative_segmentation_state()
+        ):
+            self._clear_current_interval_state(keep_profile_lock=False)
+        self._debug_interval_state_event(
+            "activate_profile_parameters_only",
+            source="imported_profile",
+            profile_path=os.path.basename(file_path) if file_path else "memory",
+            historical_intervals_imported=False,
+        )
+        self.refresh_pit_button_state()
 
         profile_name = os.path.basename(file_path) if file_path else "当前内存配置"
         self.kc_profile_status_var.set(f"案例配置: {profile_name}")
@@ -6133,33 +6972,12 @@ class PitModelMixin:
             and getattr(self, "sample_data_mode", "") == "experiment_measurement"
             and getattr(self, "manual_measurement_data", None)
         ):
-            auto_signature = self._build_measurement_auto_identify_signature()
-            auto_history = getattr(self, "_auto_identified_measurement_signatures", None)
-            if not isinstance(auto_history, set):
-                auto_history = set()
-                self._auto_identified_measurement_signatures = auto_history
-            if auto_signature and auto_signature in auto_history:
-                self._refresh_manual_measurement_prediction()
-                return "measurement_only"
-            # 自动辨识需要与手动“重新辨识”保持相同的提交刷新保护，
-            # 避免保存配置弹窗导致参数输入框 FocusOut，再次触发 on_model_param_commit。
-            previous_auto_identifying = bool(getattr(self, "_auto_identifying_model", False))
-            try:
-                previous_suppressed_until = float(
-                    getattr(self, "_model_param_commit_refresh_suppressed_until", 0.0) or 0.0
-                )
-            except Exception:
-                previous_suppressed_until = 0.0
-            self._auto_identifying_model = True
-            self._arm_model_param_commit_refresh_suppression(duration_seconds=30.0)
-            try:
-                self._identify_model_parameters_from_measurement_core(save_strategy=save_strategy, refresh_preview=False)
-            finally:
-                self._auto_identifying_model = previous_auto_identifying
-                self._model_param_commit_refresh_suppressed_until = previous_suppressed_until
-            if auto_signature:
-                auto_history.add(auto_signature)
-            return "auto_identified"
+            # 实际负载只用于分析和采样坐标，不得被自动反解为六态分类模型。
+            # 缺少独立 profile 时保留实测分析预览，但不写回过程域 Kc/Ke/P_idle。
+            self._debug_prediction_state_event(
+                "skip_measurement_auto_identification",
+                reason="actual_measurement_is_not_a_segmentation_model_source",
+            )
 
         if getattr(self, "sample_data_mode", "") == "experiment_measurement" and getattr(self, "manual_measurement_data", None):
             self._refresh_manual_measurement_prediction()
@@ -6821,13 +7639,7 @@ class PitModelMixin:
         """按原始程序行号汇总工艺参数，供实验实测样本映射。"""
         lookup = {}
         for row_idx, row in enumerate(self.data or []):
-            raw_line = row.get("line_no_raw")
-            if raw_line is None:
-                continue
-            try:
-                raw_key = int(raw_line)
-            except Exception:
-                continue
+            raw_key = self._get_process_row_sample_line(row, fallback=row_idx)
 
             bucket = lookup.setdefault(raw_key, {
                 "ap": [],
@@ -6836,7 +7648,7 @@ class PitModelMixin:
                 "feed_plan": [],
                 "speed_plan": [],
             })
-            for key in ("ap", "ae", "line_no_aligned", "MRR", "S"):
+            for key in ("ap", "ae", "line_no_aligned", "S"):
                 value = row.get(key)
                 try:
                     numeric = float(value)
@@ -6850,13 +7662,18 @@ class PitModelMixin:
                     bucket["ae"].append(numeric)
                 elif key == "line_no_aligned":
                     bucket["line_no_aligned"].append(numeric)
-                elif key == "MRR":
-                    ap_val = float(row.get("ap", 0.0) or 0.0)
-                    ae_val = float(row.get("ae", 0.0) or 0.0)
-                    if ap_val > 0 and ae_val > 0:
-                        bucket["feed_plan"].append(numeric * 60.0 / (ap_val * ae_val))
                 elif key == "S":
                     bucket["speed_plan"].append(numeric)
+
+            feed_value = row.get("F_program")
+            if feed_value is None:
+                feed_value = row.get("feed_effective", row.get("F_plan"))
+            try:
+                feed_numeric = float(feed_value)
+            except Exception:
+                feed_numeric = float("nan")
+            if np.isfinite(feed_numeric) and feed_numeric >= 0.0:
+                bucket["feed_plan"].append(feed_numeric)
 
         records = []
         for raw_line, bucket in lookup.items():
@@ -6880,13 +7697,14 @@ class PitModelMixin:
 
     def _build_process_point_lookup(self):
         """按原始程序行号保留工艺点序列，供实测点在同一行内均匀对齐。"""
+        # profile 应用会统一失效对齐缓存；缓存键不得反向解析 profile，
+        # 否则 profile 规范化在投影端点时会递归进入本方法。
         cache_key = (
             id(self.data),
             len(self.data or []),
             int(getattr(self, "_process_model_state_version", 0) or 0),
             self._get_prediction_source(),
             str(getattr(self, "step_feed_model_signature", "") or ""),
-            str(self._get_saved_kc_profile_signature() if hasattr(self, "_get_saved_kc_profile_signature") else ""),
             float(self.get_kc_value()),
             float(self.get_ke_value()),
         )
@@ -6904,19 +7722,16 @@ class PitModelMixin:
 
         lookup = {}
         for row_idx, row in enumerate(self.data or []):
-            raw_line = row.get("line_no_raw")
-            if raw_line is None:
-                continue
-            try:
-                raw_key = int(raw_line)
-            except Exception:
-                continue
+            raw_key = self._get_process_row_sample_line(row, fallback=row_idx)
 
             ap_val = _safe_float(row.get("ap"))
             ae_val = _safe_float(row.get("ae"))
             aligned_val = _safe_float(row.get("line_no_aligned", raw_key))
             speed_val = _safe_float(row.get("S"))
-            feed_plan = _safe_float(row.get("feed_effective"))
+            feed_value = row.get("F_program")
+            if feed_value is None:
+                feed_value = row.get("feed_effective", row.get("F_plan"))
+            feed_plan = _safe_float(feed_value)
             kc_val = _safe_float(row.get("K_c", row.get("K", self.get_kc_value())))
             if not np.isfinite(feed_plan) or feed_plan < 0.0:
                 feed_plan = 0.0
@@ -6948,7 +7763,7 @@ class PitModelMixin:
         if not lookup:
             raise ValueError("当前工艺信息文件中未找到可映射的工艺点")
 
-        for bucket in lookup.values():
+        for raw_line, bucket in lookup.items():
             for key in (
                 "line_no_aligned",
                 "ap",
@@ -6964,7 +7779,7 @@ class PitModelMixin:
             bucket["point_count"] = int(len(bucket["ap"]))
             point_count = max(int(bucket["point_count"]), 1)
             bucket["process_anchor_x"] = (
-                bucket["line_no_aligned"].astype(float)
+                float(raw_line)
                 + bucket["process_point_index"].astype(float) / float(point_count)
             )
         self._process_point_lookup_cache = lookup
@@ -7160,18 +7975,13 @@ class PitModelMixin:
         ) & (
             pd.to_numeric(sample_df["ae"], errors='coerce').to_numpy(dtype=float) > 1e-12
         )
-        feed_actual = pd.to_numeric(sample_df["feed_speed_actual"], errors='coerce').to_numpy(dtype=float)
         feed_plan = pd.to_numeric(sample_df["feed_plan"], errors='coerce').to_numpy(dtype=float)
-        effective_feed = np.where(
-            np.isfinite(feed_actual) & (feed_actual > 1e-9),
-            feed_actual,
-            np.where(np.isfinite(feed_plan), feed_plan, 0.0),
-        )
-        sample_df["feed_speed"] = effective_feed
+        program_feed = np.where(np.isfinite(feed_plan) & (feed_plan >= 0.0), feed_plan, 0.0)
+        sample_df["feed_speed"] = program_feed
         sample_df["mrr"] = (
             pd.to_numeric(sample_df["ap"], errors='coerce')
             * pd.to_numeric(sample_df["ae"], errors='coerce')
-            * pd.Series(effective_feed, index=sample_df.index)
+            * pd.Series(program_feed, index=sample_df.index)
             / 60.0
         )
 
@@ -7353,7 +8163,7 @@ class PitModelMixin:
             if not isinstance(segment, dict):
                 continue
             is_idle_segment = (
-                int(self._resolve_profile_segment_state_code(segment)) == 1
+                int(self._resolve_smif_state_code(segment)) == 1
                 or bool(segment.get("is_idle_interval"))
                 or str(segment.get("segment_type") or "").strip().lower() == "idle"
             )
@@ -7456,47 +8266,48 @@ class PitModelMixin:
                     kc_values[saved_valid_mask] = saved_kc_values[saved_valid_mask]
                     kc_sources[saved_valid_mask] = "sample_kc_profile"
 
-        interval_kc, interval_sources = self._build_interval_template_sample_kc_array(
-            sample_df,
-            profile=source_profile,
-        )
-        idle_mask = interval_sources == "profile_idle"
-        if np.any(idle_mask):
-            kc_values[idle_mask] = np.nan
-            kc_sources[idle_mask] = "profile_idle"
-        interval_override_mask = np.isfinite(interval_kc) & (interval_sources == "profile_interval_mode")
-        if np.any(interval_override_mask):
-            kc_values[interval_override_mask] = interval_kc[interval_override_mask]
-            kc_sources[interval_override_mask] = interval_sources[interval_override_mask]
-        else:
-            legacy_mask = np.isfinite(interval_kc) & (interval_sources != "profile_idle")
-            if np.any(legacy_mask):
-                kc_values[legacy_mask] = interval_kc[legacy_mask]
-                kc_sources[legacy_mask] = interval_sources[legacy_mask]
+        if bool(prefer_interval_templates):
+            interval_kc, interval_sources = self._build_interval_template_sample_kc_array(
+                sample_df,
+                profile=source_profile,
+            )
+            idle_mask = interval_sources == "profile_idle"
+            if np.any(idle_mask):
+                kc_values[idle_mask] = np.nan
+                kc_sources[idle_mask] = "profile_idle"
+            interval_override_mask = np.isfinite(interval_kc) & (interval_sources == "profile_interval_mode")
+            if np.any(interval_override_mask):
+                kc_values[interval_override_mask] = interval_kc[interval_override_mask]
+                kc_sources[interval_override_mask] = interval_sources[interval_override_mask]
+            else:
+                legacy_mask = np.isfinite(interval_kc) & (interval_sources != "profile_idle")
+                if np.any(legacy_mask):
+                    kc_values[legacy_mask] = interval_kc[legacy_mask]
+                    kc_sources[legacy_mask] = interval_sources[legacy_mask]
 
         return kc_values, kc_sources
 
     def _resolve_forward_prediction_mrr_values(self, sample_df, preferred_column=None, profile=None, source_origin=""):
         if sample_df is None or sample_df.empty:
-            return np.zeros(0, dtype=float), np.zeros(0, dtype=object), "measurement_mrr_fallback", 0
+            return np.zeros(0, dtype=float), np.zeros(0, dtype=object), "computed_program_mrr", 0
 
         row_count = int(len(sample_df))
-        resolved_mrr = pd.to_numeric(sample_df.get("mrr"), errors="coerce").to_numpy(dtype=float)
-        resolved_source = np.full(row_count, "measurement_mrr_fallback", dtype=object)
-        resolved_label = "measurement_mrr_fallback"
-        preferred_count = 0
-
-        preferred_name = str(preferred_column or "").strip()
-        if preferred_name and preferred_name in sample_df.columns:
-            preferred_values = pd.to_numeric(sample_df.get(preferred_name), errors="coerce").to_numpy(dtype=float)
-            preferred_mask = np.isfinite(preferred_values) & (preferred_values >= 0.0)
-            if np.any(preferred_mask):
-                resolved_mrr[preferred_mask] = preferred_values[preferred_mask]
-                resolved_source[preferred_mask] = preferred_name
-                resolved_label = preferred_name
-                preferred_count = int(np.sum(preferred_mask))
-
-        return resolved_mrr, resolved_source, resolved_label, preferred_count
+        ap_values = pd.to_numeric(sample_df["ap"], errors="coerce").to_numpy(dtype=float)
+        ae_values = pd.to_numeric(sample_df["ae"], errors="coerce").to_numpy(dtype=float)
+        feed_values = pd.to_numeric(sample_df["feed_plan"], errors="coerce").to_numpy(dtype=float)
+        resolved_mrr = ap_values * ae_values * feed_values / 60.0
+        valid_mask = (
+            np.isfinite(ap_values)
+            & np.isfinite(ae_values)
+            & np.isfinite(feed_values)
+            & np.isfinite(resolved_mrr)
+            & (ap_values >= 0.0)
+            & (ae_values >= 0.0)
+            & (feed_values >= 0.0)
+        )
+        resolved_mrr = np.where(valid_mask, np.maximum(resolved_mrr, 0.0), 0.0)
+        resolved_source = np.full(row_count, "computed_program_mrr", dtype=object)
+        return resolved_mrr, resolved_source, "computed_program_mrr", int(np.sum(valid_mask))
 
     def _compute_forward_prediction_for_sample_df(
         self,
@@ -7595,37 +8406,30 @@ class PitModelMixin:
         forward_label = "runtime_forward" if source_origin == "runtime_identified_profile" else "profile_forward"
         idle_label = "runtime_idle" if source_origin == "runtime_identified_profile" else "profile_idle"
         prefer_interval_templates = False
-        preferred_mrr_column = "process_mrr" if source_origin == "imported_profile" else None
         sample_df = self._compute_forward_prediction_for_sample_df(
             sample_df,
             profile=source_profile,
             forward_label=forward_label,
             idle_label=idle_label,
             prefer_interval_templates=prefer_interval_templates,
-            preferred_mrr_column=preferred_mrr_column,
+            preferred_mrr_column=None,
             source_origin=source_origin,
         )
         forward_mrr_source = (
             sample_df["forward_prediction_mrr_source"].astype(str).to_numpy(dtype=object)
-            if "forward_prediction_mrr_source" in sample_df.columns else np.full(len(sample_df), "measurement_mrr_fallback", dtype=object)
+            if "forward_prediction_mrr_source" in sample_df.columns else np.full(len(sample_df), "computed_program_mrr", dtype=object)
         )
-        process_mrr_used_count = int(np.sum(forward_mrr_source == "process_mrr"))
-        measurement_mrr_fallback_count = int(np.sum(forward_mrr_source == "measurement_mrr_fallback"))
-        if process_mrr_used_count > 0:
-            resolved_mrr_source = "process_mrr"
-        else:
-            resolved_mrr_source = "measurement_mrr_fallback"
+        computed_program_mrr_count = int(np.sum(forward_mrr_source == "computed_program_mrr"))
         self._debug_prediction_state_event(
             "apply_profile_forward_prediction",
             reverse_solve=False,
             prefer_interval_templates=prefer_interval_templates,
-            mrr_source=resolved_mrr_source,
-            process_mrr_used_count=process_mrr_used_count,
-            measurement_mrr_fallback_count=measurement_mrr_fallback_count,
+            mrr_source="computed_program_mrr",
+            computed_program_mrr_count=computed_program_mrr_count,
             kc_map_source=(
-                "runtime_fit_with_steady_interval_override"
+                "runtime_sample_point_line_global"
                 if source_origin == "runtime_identified_profile"
-                else "sample_point_line_global_with_steady_interval_override"
+                else "sample_point_line_global"
             ),
         )
         return sample_df
@@ -7635,6 +8439,8 @@ class PitModelMixin:
         measurement = getattr(self, "manual_measurement_data", None)
         if not measurement:
             return
+        for key in self._SEGMENTATION_PREDICTION_PROVENANCE_KEYS:
+            measurement.pop(key, None)
 
         sample_df = self._initialize_measurement_prediction_channels(sample_df)
         sample_df = self._sync_display_prediction_aliases(sample_df)
@@ -7880,6 +8686,48 @@ class PitModelMixin:
         sample_df["interval_source"] = str(interval_source or "none")
         sample_df["prediction_source"] = str(self._get_prediction_source())
         self._store_manual_measurement_prediction(sample_df)
+        if reverse_solve or profile_origin == "runtime_identified_profile":
+            segmentation_prediction_source = "measurement_reverse"
+            segmentation_prediction_independent = False
+        elif profile_origin == "imported_profile":
+            independence_checker = getattr(
+                self,
+                "_profile_is_independent_from_current_measurement",
+                None,
+            )
+            profile_is_independent = bool(
+                isinstance(forward_profile, dict)
+                and callable(independence_checker)
+                and independence_checker(
+                    forward_profile,
+                    measurement=measurement,
+                )
+            )
+            segmentation_prediction_source = (
+                "independent_profile"
+                if profile_is_independent
+                else "same_measurement_profile"
+            )
+            segmentation_prediction_independent = bool(profile_is_independent)
+        else:
+            segmentation_prediction_source = "unclassified"
+            segmentation_prediction_independent = False
+        measurement["segmentation_prediction_source"] = str(
+            segmentation_prediction_source
+        )
+        measurement["segmentation_prediction_independent"] = bool(
+            segmentation_prediction_independent
+        )
+        measurement["segmentation_temporary_measurement_mode"] = bool(
+            segmentation_prediction_source
+            in {"measurement_reverse", "same_measurement_profile"}
+        )
+        measurement["segmentation_sample_prediction_context_signature"] = (
+            self._build_prediction_context_signature(
+                prediction_source=profile_origin,
+                measurement=measurement,
+            )
+        )
         self._debug_prediction_state_event(
             "refresh_manual_measurement_prediction",
             measurement_case_signature=measurement_case_signature or "none",
@@ -7888,6 +8736,9 @@ class PitModelMixin:
             display_mode=effective_display_mode,
             interval_source=str(interval_source or "none"),
             live_display=effective_display_mode,
+            sample_prediction_context_signature=measurement[
+                "segmentation_sample_prediction_context_signature"
+            ],
             kc_map_source=(
                 "imported_profile"
                 if profile_origin == "imported_profile"
@@ -8395,7 +9246,7 @@ class PitModelMixin:
         ap_values = np.asarray(measurement.get("mapped_ap", []), dtype=float)
         ae_values = np.asarray(measurement.get("mapped_ae", []), dtype=float)
         mrr_values = np.asarray(measurement.get("mapped_mrr", []), dtype=float)
-        feed_values = np.asarray(measurement.get("actual_feed_speed", []), dtype=float)
+        feed_values = np.asarray(measurement.get("mapped_feed", []), dtype=float)
         speed_values = np.asarray(measurement.get("actual_spindle_speed", []), dtype=float)
         aligned_values = np.asarray(measurement.get("line_no_aligned", line_values), dtype=int)
 
@@ -8687,10 +9538,10 @@ class PitModelMixin:
         global_sigma = float(self.kc_sigma.get())
         valid_indices = []
         for idx, interval in enumerate(intervals):
-            if str(interval.get("kc_source", "")).strip() == "idle":
-                interval["K_c_hat"] = 0.0
-                interval["sigma_Kc"] = 0.0
-                interval["K_c_UCB"] = 0.0
+            if not self._record_represents_steady_interval(interval):
+                for key in ("K_c_hat", "sigma_Kc", "K_c_UCB"):
+                    interval.pop(key, None)
+                interval["kc_source"] = ""
                 continue
             kc_hat = interval.get("K_c_hat")
             sigma_kc = interval.get("sigma_Kc")
@@ -8702,6 +9553,8 @@ class PitModelMixin:
                 valid_indices.append(idx)
 
         for idx, interval in enumerate(intervals):
+            if not self._record_represents_steady_interval(interval):
+                continue
             if str(interval.get("kc_source", "")).startswith("interval") or interval.get("kc_source") == "idle":
                 continue
             if valid_indices:
@@ -10238,7 +11091,7 @@ class PitModelMixin:
             line_span = self._resolve_smif_interval_line_span(record)
             if line_span is None:
                 continue
-            state_code = int(self._resolve_profile_segment_state_code(record))
+            state_code = int(self._resolve_smif_state_code(record))
             dedupe_key = (int(line_span[0]), int(line_span[1]), int(state_code))
             if dedupe_key in seen_interval_keys:
                 continue
@@ -10572,15 +11425,7 @@ class PitModelMixin:
         for interval_index, record in enumerate(source_records):
             if not isinstance(record, dict):
                 continue
-            try:
-                state_code = int(record.get("state_code"))
-            except Exception:
-                if bool(record.get("is_idle_interval")) or str(record.get("kc_source", "")).strip().lower() == "idle":
-                    state_code = 1
-                elif self._record_represents_steady_interval(record):
-                    state_code = 2
-                else:
-                    state_code = 0
+            state_code = int(self._resolve_smif_state_code(record))
             is_idle_interval = int(state_code) == 1
             try:
                 metric_raw = float(record.get(metric_key))
@@ -11735,7 +12580,10 @@ class PitModelMixin:
         self.step_feed_model_signature = ""
         self.profile_origin = "no_profile"
         self.prediction_source = "no_profile"
-        self._invalidate_measurement_runtime_state(keep_profile_lock=False, clear_interval_state=True)
+        self._invalidate_measurement_runtime_state(
+            keep_profile_lock=False,
+            clear_interval_state=not self._has_authoritative_segmentation_state(),
+        )
         self._invalidate_process_alignment_caches(reason="reidentify_reset")
         self._debug_prediction_state_event(
             "reidentify_reset",
@@ -12255,7 +13103,10 @@ class PitModelMixin:
 
         ttk.Label(
             point_tab,
-            text="累计行程 s 显示当前工艺点的累计行程；若输入工艺信息已自带 s 列，则优先按输入累计值显示。",
+            text=(
+                "累计行程 s 显示统一累计坐标；普通 s(mm) 按逐行增量累加，"
+                "只有显式 cumulative 列才按输入累计值解释。"
+            ),
             font=UI_FONT_SMALL,
             foreground=UI_COLOR_TEXT_MUTED,
         ).pack(anchor="w", pady=(0, 6))

@@ -3,7 +3,212 @@ from __future__ import annotations
 from .shared import *
 
 
+SEGMENTATION_STATE_STYLES = {
+    # Okabe-Ito 风格高对比色；背景透明后仍能区分，并兼顾常见色觉缺陷。
+    "idle": {"state_code": 0, "label": "空载", "color": "#7A7A7A"},
+    "entry": {"state_code": 1, "label": "进刀", "color": "#E69F00"},
+    "steady": {"state_code": 2, "label": "稳态", "color": "#009E73"},
+    "transition": {"state_code": 3, "label": "过渡", "color": "#0072B2"},
+    "nonsteady": {"state_code": 4, "label": "非稳态", "color": "#D55E00"},
+    "exit": {"state_code": 5, "label": "退刀", "color": "#CC79A7"},
+}
+SEGMENTATION_STATE_ORDER = tuple(SEGMENTATION_STATE_STYLES)
+SEGMENTATION_PREDICTED_LINE_COLOR = "#111827"
+
+
 class PlotSupportMixin:
+    def get_segmentation_predicted_line_color(self):
+        """返回与六态背景均保持高对比的统一预测负载曲线颜色。"""
+        return SEGMENTATION_PREDICTED_LINE_COLOR
+
+    def get_segmentation_state_style(self, segment_type):
+        """返回固定六态的绘图样式；未知类型按非稳态保守显示。"""
+        state = str(segment_type or "").strip().lower()
+        style = SEGMENTATION_STATE_STYLES.get(state, SEGMENTATION_STATE_STYLES["nonsteady"])
+        return dict(style)
+
+    def resolve_segmentation_idle_power_tolerance(self):
+        """从六态集中配置读取空载功率门控容差。"""
+        config = (
+            getattr(self, "segmentation_config", None)
+            or getattr(self, "_segmentation_config", None)
+        )
+        if isinstance(config, dict):
+            value = config.get("idle_power_tolerance", 1e-9)
+        else:
+            value = getattr(config, "idle_power_tolerance", 1e-9)
+        try:
+            tolerance = float(value)
+        except (TypeError, ValueError):
+            tolerance = 1e-9
+        if not np.isfinite(tolerance) or tolerance < 0.0:
+            tolerance = 1e-9
+        return tolerance
+
+    def build_segmentation_sample_background_masks(
+        self,
+        predicted_load,
+        predicted_idle_power,
+        interval_records,
+        *,
+        valid_mask=None,
+    ):
+        """构建采样域六态背景；过程投影优先，域外只补 idle/nonsteady。"""
+        predicted = np.asarray(predicted_load, dtype=float)
+        sample_count = int(predicted.size)
+        idle_power = np.asarray(predicted_idle_power, dtype=float)
+        if idle_power.size != sample_count:
+            raise ValueError("预测空载功率与预测负载数量不一致")
+
+        valid = np.isfinite(predicted) & np.isfinite(idle_power)
+        if valid_mask is not None:
+            requested_valid = np.asarray(valid_mask, dtype=bool)
+            if requested_valid.size != sample_count:
+                raise ValueError("采样域背景有效掩码与预测负载数量不一致")
+            valid &= requested_valid
+
+        state_masks = {
+            state: np.zeros(sample_count, dtype=bool)
+            for state in SEGMENTATION_STATE_ORDER
+        }
+        process_mask = np.zeros(sample_count, dtype=bool)
+        if hasattr(interval_records, "to_dict"):
+            records = interval_records.to_dict(orient="records")
+        else:
+            records = list(interval_records or [])
+
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            try:
+                start_idx = int(record.get("sample_start_idx"))
+                end_idx = int(record.get("sample_end_idx"))
+            except (TypeError, ValueError):
+                resolver = getattr(self, "_get_interval_sample_index_span", None)
+                sample_bounds = resolver(record) if callable(resolver) else None
+                if not sample_bounds:
+                    continue
+                start_idx, end_idx = map(int, sample_bounds)
+            if end_idx < start_idx:
+                start_idx, end_idx = end_idx, start_idx
+            safe_start = max(0, start_idx)
+            safe_end = min(sample_count - 1, end_idx)
+            if safe_end < safe_start:
+                continue
+
+            segment_type = str(record.get("segment_type") or "").strip().lower()
+            if segment_type not in state_masks:
+                is_idle = bool(record.get("is_idle_interval")) or str(
+                    record.get("kc_source", "")
+                ).strip().lower() == "idle"
+                segment_type = "idle" if is_idle else "steady"
+            interval_slice = slice(safe_start, safe_end + 1)
+            interval_mask = (
+                valid[interval_slice]
+                & (~process_mask[interval_slice])
+            )
+            state_masks[segment_type][interval_slice] |= interval_mask
+            process_mask[interval_slice] |= interval_mask
+
+        external_mask = valid & (~process_mask)
+        tolerance = self.resolve_segmentation_idle_power_tolerance()
+        external_idle_mask = (
+            external_mask
+            & np.isfinite(idle_power)
+            & (predicted <= idle_power + tolerance)
+        )
+        external_nonsteady_mask = external_mask & (~external_idle_mask)
+        state_masks["idle"] |= external_idle_mask
+        state_masks["nonsteady"] |= external_nonsteady_mask
+
+        return {
+            "state_masks": state_masks,
+            "valid_mask": valid,
+            "process_projected_mask": process_mask,
+            "external_idle_mask": external_idle_mask,
+            "external_nonsteady_mask": external_nonsteady_mask,
+            "valid_sample_count": int(np.sum(valid)),
+            "process_projected_sample_count": int(np.sum(process_mask)),
+            "external_idle_sample_count": int(np.sum(external_idle_mask)),
+            "external_nonsteady_sample_count": int(np.sum(external_nonsteady_mask)),
+            "idle_power_tolerance": float(tolerance),
+        }
+
+    def draw_full_path_segmentation_background(
+        self,
+        ax,
+        intervals,
+        *,
+        alpha=0.30,
+        show_labels=False,
+        mark_boundaries=True,
+    ):
+        """按物理行程绘制六态背景，不修改或重新计算区间。"""
+        if ax is None or intervals is None:
+            return []
+        if hasattr(intervals, "to_dict"):
+            records = intervals.to_dict(orient="records")
+        else:
+            records = list(intervals)
+
+        artists = []
+        labeled_states = set()
+        boundaries = set()
+
+        def _finite_float(record, keys):
+            for key in keys:
+                try:
+                    value = float(record.get(key))
+                except Exception:
+                    continue
+                if np.isfinite(value):
+                    return value
+            return None
+
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            start = _finite_float(record, ("start_s", "display_start_x", "path_start", "start_idx"))
+            end = _finite_float(record, ("end_s", "display_end_x", "path_end", "end_idx"))
+            if start is None or end is None:
+                continue
+            if end < start:
+                start, end = end, start
+            if end <= start:
+                continue
+
+            segment_type = str(record.get("segment_type") or "nonsteady").strip().lower()
+            style = self.get_segmentation_state_style(segment_type)
+            label = None
+            if show_labels and segment_type not in labeled_states:
+                label = f"{style['label']} [{style['state_code']}]"
+                labeled_states.add(segment_type)
+            artist = ax.axvspan(
+                start,
+                end,
+                facecolor=style["color"],
+                edgecolor="none",
+                alpha=float(alpha),
+                label=label,
+                zorder=0,
+            )
+            artists.append(artist)
+            boundaries.add(float(start))
+            boundaries.add(float(end))
+
+        if mark_boundaries:
+            for boundary in sorted(boundaries):
+                artists.append(
+                    ax.axvline(
+                        boundary,
+                        color="#263238",
+                        linewidth=0.45,
+                        alpha=0.45,
+                        zorder=2,
+                    )
+                )
+        return artists
+
     def _compress_plot_segment_preserve_extrema(self, x_segment, y_segment, max_points):
         """按桶保留边界/峰值/谷值，压缩顶点数但尽量保留完整波形信息。"""
         try:
@@ -875,9 +1080,14 @@ class PlotSupportMixin:
         return self.merge_intervals(clipped)
 
     def get_predicted_intervals_for_display(self, ranges=None):
-        """获取用于显示的稳态区间（按行号）- 直接返回原始区间，不进行裁剪合并"""
+        """获取完整稳态区间（按行号），供目标值和 .rg 消费。"""
         base_intervals = []
-        for interval in self._get_current_interval_records(allow_profile_fallback=False):
+        interval_records = self._get_current_interval_records(allow_profile_fallback=False)
+        if hasattr(self, "_get_steady_interval_records"):
+            interval_records = self._get_steady_interval_records(interval_records)
+        else:
+            interval_records = []
+        for interval in interval_records:
             start_line = interval.get('start_line')
             end_line = interval.get('end_line')
             if start_line is None or end_line is None:
@@ -960,23 +1170,48 @@ class PlotSupportMixin:
         intervals = self.get_predicted_intervals_for_display(tool_ranges)
         if not intervals:
             return None, 0, intervals
-        mask = self.build_sample_mask(program_no, tool_ranges)
-        if mask is None or not mask.any():
+        base_mask = self.build_sample_mask(program_no, tool_ranges)
+        if base_mask is None or not base_mask.any():
             return None, 0, intervals
+
+        interval_records = self._get_current_interval_records(allow_profile_fallback=False)
+        if hasattr(self, "_get_steady_interval_records"):
+            interval_records = self._get_steady_interval_records(interval_records)
+        else:
+            interval_records = []
+        interval_mask = np.zeros(len(base_mask), dtype=bool)
+        for interval in interval_records:
+            interval_mask |= self._build_interval_sample_mask(
+                interval,
+                len(base_mask),
+                line_numbers=self.sample_data_line_numbers,
+            )
+        mask = base_mask & interval_mask
+        if not mask.any():
+            return None, 0, intervals
+
         source_idx = int(self.sample_data_source.get())
-        values = self.sample_data_values[:, source_idx][mask]
-        line_numbers = self.sample_data_line_numbers[mask]
-        mean_val, count = self.compute_measured_avg_in_intervals(values, line_numbers, intervals)
-        return mean_val, count, intervals
+        values = np.asarray(self.sample_data_values[:, source_idx], dtype=float)
+        finite_mask = mask & np.isfinite(values)
+        if not finite_mask.any():
+            return None, 0, intervals
+        return float(np.mean(values[finite_mask])), int(np.sum(finite_mask)), intervals
 
     def format_line_point(self, line_number, point_index):
-        """格式化行点：行号.点序号"""
+        """格式化现有界面的一基行点标签。"""
         try:
             ln = int(line_number)
             pt = max(int(point_index) + 1, 1)
         except Exception:
             return f"{line_number}.{point_index}"
         return f"{ln}.{pt}"
+
+    def format_rg_line_point(self, line_number, point_index):
+        """按旧 .rg 契约格式化零基采样坐标。"""
+        try:
+            return f"{int(line_number)}.{max(int(point_index), 0)}"
+        except Exception:
+            return f"{line_number}.{point_index}"
 
     def collect_line_point_intervals_for_tool(self, program_name, tool_id):
         """获取指定程序+刀具的稳态区间行点范围（包含每个区间的平均值）
@@ -986,7 +1221,7 @@ class PlotSupportMixin:
         """
         if not self.sample_data_loaded or self.sample_data_line_numbers is None:
             return []
-        interval_records = self._get_current_interval_records(allow_profile_fallback=False)
+        interval_records = self._get_steady_interval_records()
         if not interval_records:
             return []
         if not self.data:
@@ -1071,8 +1306,8 @@ class PlotSupportMixin:
                 first_idx = int(block_start)
                 last_idx = int(block_end)
 
-                start_lp = self.format_line_point(sample_line_numbers[first_idx], sample_point_indices[first_idx])
-                end_lp = self.format_line_point(sample_line_numbers[last_idx], sample_point_indices[last_idx])
+                start_lp = self.format_rg_line_point(sample_line_numbers[first_idx], sample_point_indices[first_idx])
+                end_lp = self.format_rg_line_point(sample_line_numbers[last_idx], sample_point_indices[last_idx])
 
                 interval_values = sample_values[block_start:block_end + 1]
                 finite_mask = np.isfinite(interval_values)

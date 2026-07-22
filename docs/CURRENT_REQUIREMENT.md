@@ -1,269 +1,296 @@
-# 当前需求：初步规则 Semi-Markov 全行程六类区间划分 alpha（直接替换旧区间）
+# 当前需求：基于工艺信息与预测负载的全行程六态划分
 
-日期：2026-07-15
+日期：2026-07-16
 
-## 1. 目标
+## 1. 目标与权威结果
 
-在不使用神经网络和实测加工信号的条件下，仅根据当前工艺信息表完成覆盖原始全行程的六类连续区间划分，为后续 TCN、Patch Transformer 和 Neural Semi-Markov 训练保留稳定接口。
+程序需要把工艺过程划分为六类连续区间，并以本次 Semi-Markov 解码得到的“全行程最优划分结果”替换旧的稳态区间结果。业务运行时只保留一套权威区间状态：`current_interval_records`、`pred_power_intervals` 和 `pit_records` 必须引用或同步同一批记录，旧算法、历史 profile 和界面刷新不得再次覆盖它。
 
-新的六类 Semi-Markov 结果直接替换现有运行时稳态区间划分，成为 `current_interval_records`、`pred_power_intervals` 和 `pit_records` 的唯一权威区间来源。不得保留旧稳态算法与新算法并行运行、相互覆盖或由界面切换的双轨状态；旧 profile 中的历史区间边界可以继续作为兼容数据读取，但不得覆盖本次重新计算得到的六类边界。
+六态及内部编码固定为：
 
-同时精简主界面：移除顶层“数据分析表”Tab 页，只保留“工艺信息分析”和“PIT / SMIF”等当前主流程入口。这里的“移除”仅指不再创建和注册该 Tab，不删除底层数据分析函数、历史导出逻辑或已有数据结构。
+| CSV 行编号 | `segment_type` | `state_code` | 中文名称 |
+|---:|---|---:|---|
+| 1 | `idle` | 0 | 空载 |
+| 2 | `entry` | 1 | 进刀 |
+| 3 | `steady` | 2 | 稳态 |
+| 4 | `transition` | 3 | 过渡 |
+| 5 | `nonsteady` | 4 | 非稳态 |
+| 6 | `exit` | 5 | 退刀 |
 
-六类标签固定为：
+每个过程点必须恰好属于一个状态，每个连续区间必须同时保存字符串标签和内部整数编码。六类表示标签种类固定，不代表最终只能得到六个连续区间。
 
-- `idle`：空载；
-- `entry`：进刀；
-- `steady`：稳态候选；
-- `transition`：过渡；
-- `nonsteady`：非稳态；
-- `exit`：退刀。
+六态划分只描述工艺阶段，不再维护区间优化资格。代码、界面、导出、诊断和文档中删除旧的 `is_optimizable`、优化保护带、资格筛选及其派生分支。新的六态导出不得覆盖现有 `SampleData.rg`；旧 `.rg` 文件及其冒号后数值语义保持不变。
 
-六类数字编码固定为：
+## 2. 数据来源与判定边界
 
-- `0 = idle`；
-- `1 = entry`；
-- `2 = steady`；
-- `3 = transition`；
-- `4 = nonsteady`；
-- `5 = exit`。
+### 2.1 工艺信息
 
-每个连续区间必须同时保存字符串标签 `segment_type` 和整数编码 `state_code`。这里的“六类”表示允许产生任意数量的连续区间，每个区间属于六类之一，不要求最终结果恰好只有六条记录。
+过程域输入来自 `ProcessInfo.csv`，使用：
 
-## 2. 当前输入
+- 原始编程切深 `ap`；
+- 原始编程切宽 `ae`；
+- 原始编程进给 `F_program`；
+- 指令行号及行内点序；
+- 有效的行程信息。
 
-初步 alpha 只允许使用：
+材料去除率必须在程序内部统一重新计算：
 
-- 累计行程 s；
-- 指令行号 `line_id`；
-- 切深 `ap`；
-- 切宽 `ae`；
-- 原始编程进给 `F_program`。
+```text
+MRR_program = ap × ae × F_program / 60
+```
 
-现有代码字段映射：
+其中 `ap`、`ae` 的单位为 mm，`F_program` 的单位为 mm/min，因此内部 `MRR_program` 的单位为 mm³/s。
 
-- 使用 `path_start` / `path_end` 或已解析累计行程生成统一 s；
-- `line_no_aligned` 用于内部连续行分组，同时保留 `line_no_raw` / `N_str` 用于显示和导出；
-- `ap`、`ae` 直接使用现有字段；
-- `feed_effective` 在当前版本中映射为 `F_program`；
-- 原表没有 `point_id` 时按原始行顺序生成。
+输入文件中的 `MRR`、`MRR_program` 或同义列一律不读取、不校验、不参与评分。修改这些输入列不得改变划分结果。
 
-累计行程必须先进行有效性判断，再决定是否使用：
+### 2.2 预测功率与空载功率
 
-1. 输入累计行程有限、单调不减且具有有效正跨度时，优先使用输入累计行程；
-2. 输入存在 `s(mm)` 列但全零、无有效跨度、严重回退或无法形成物理行程时，不得因为列存在就将其视为有效行程；
-3. 无有效输入累计行程时，优先使用现有 G 代码直线/圆弧几何计算结果或已绑定 NC profile 的 `path_start` / `path_end`；
-4. 同一指令包含多个工艺点时，将该指令物理长度确定性地分配到各点；`line_no_raw` 缺失时使用 `line_no_aligned` 进行连续指令分组；
-5. 如果输入行程、G 代码几何和 NC profile 均无法提供有效物理行程，允许使用集中配置中的确定性顺序回退，但必须在诊断中标记为非物理行程，所有相关区间强制 `is_optimizable=False`、`review_required=True`。
+分类时，预测负载 `P_pred` 和相同主轴转速下的预测空载功率 `P_idle` 只用于判定 `idle`：
 
-硬性规则：如果输入表中存在累计行程列，但该列的有效数值全部为 `0`，必须忽略这组全零累计行程，采用程序根据 G 代码/NC 几何计算得到的行程；不得因为输入列存在而使最终 `s`、`path_start` 和 `path_end` 保持全零。只有程序也无法计算出有效物理行程时，才允许进入上述非物理顺序回退。
+```text
+P_pred <= P_idle + idle_power_tolerance
+```
 
-区间边界继续采用现有一基点号格式：
+`idle_power_tolerance` 必须是集中、可序列化配置。`idle` 是硬门控：满足条件的点不能被判为其他五态；不满足条件的点不能被判为 `idle`。除这个门控外，`entry`、`steady`、`transition`、`nonsteady` 和 `exit` 的划分只允许使用程序重算的 `MRR_program` 及其沿行程的统计和趋势。
+
+当前区间划分验证阶段允许用本次实际负载临时反向辨识 `K_c`、`K_e` 或 `P_idle`，再生成与实际采样序列对齐的 `P_pred` / `P_idle`。这条临时链只解决尚未完成独立预测负载模型时的空载门控和绘图输入，不得把实际负载值本身、预测残差或由实际功率直接计算的统计量作为 `entry`、`steady`、`transition`、`nonsteady`、`exit` 的分类特征；这五态仍只由程序重算的 `MRR_program` 及其行程时序决定。运行状态和诊断必须把来源标记为 `measurement_reverse` 或 `same_measurement_profile`，并同时记录 `temporary_measurement_mode=true`、`independent=false`，不得冒充独立前向预测或作为论文泛化精度证据。未来独立预测负载模型可直接替换这条临时来源，而不改变六态输入契约。两数组仍必须与实际采样序列等长、程序行序列一致且值均有限，否则安全停止投影或导出。在调用 Semi-Markov 前，还必须从同一当前预测来源和同一内容签名重新生成过程域 `P_pred` / `P_idle`，并与样本级 payload 的来源与当前性绑定；仅有形式合法的样本数组、但过程域功率仍来自旧 profile 或旧模型时必须安全失败。
+
+### 2.3 行程语义与来源优先级
+
+正常工艺信息文件应优先提供行程。当前 `ProcessInfo.csv` 契约中，`s(mm)` 表示每行 G 代码或当前工艺点对应的增量行程；保存的不是累计行程是正确的。只有显式的 `input_path_cumulative`、`s_cumulative` 或 `path_cumulative` 字段才按从程序起点累计的行程解释。程序先校验对应语义的数值有效性，再统一生成单调的 `path_start`、`path_end`；不得根据数值外观猜测同一列的语义，也不能在已有有效输入行程时自行重算。
+
+行程来源按以下顺序选择：
+
+1. 有效输入行程；
+2. 已绑定 NC profile 中的物理行程；
+3. 根据 G 代码直线或圆弧几何计算的物理行程；
+4. 仅在前三者均不可用时使用确定性的非物理顺序回退，并在诊断中明确标记。
+
+输入行程全零、无有效正跨度、严重回退或含无法解释的无效值时，才允许进入下一层来源。若同一 G 指令对应多个工艺点，该指令的物理长度必须按确定性规则守恒分配，各点分配长度之和必须等于指令长度；当前采用等分，不得把整段长度重复赋给每个点。
+
+### 2.4 程序行号补齐
+
+优先使用工艺信息中的有效程序行号。当 `N` 全部缺失或部分缺失时，可使用绑定的 NC 文件补齐，但必须在保持顺序的前提下做严格递增且唯一的匹配：
+
+- 恰好一个解时才接受；
+- 没有解或存在多个解时安全失败并给出诊断；
+- 不得以最近行、模糊行或任意首个候选静默替代。
+
+验收数据路径只用于本地验证，不得硬编码进源码。
+
+## 3. 六态定义与判定顺序
+
+六态定义如下：
+
+- `idle`：满足预测负载空载硬门控的点，包括加工前和加工结束后的空载段。所有满足门控的点都必须保留 `idle` 标签，不得为了维持加工阶段而改成其他状态。
+- `entry`：一个连续加工阶段在“有效 idle 间隔”之后开始时，从空载离开并由较低 MRR 上升至该加工阶段 MRR 峰值或首个稳态带的阶段。若先遇到合法稳态带，进刀在稳态起点前结束；否则可包含首个 MRR 峰值点。其前一段必须是有效 idle 间隔，因此不能作为全行程首段，也不能由内部瞬时 idle 脉冲触发。
+- `steady`：最终只表示严格绿色平台再次内缩后的核心。严格平台必须满足集中配置的 MRR 稳定阈值、局部窗口与整段线性拟合漂移上限、最小平台点数和最小物理长度。标准差采用候选点的总体标准差（`ddof=0`），点等权，不按单点行程加权；趋势拟合使用真实行程坐标。平滑长斜坡和长趋势中的短暂平肩都不是严格平台。
+- `transition`：只表示严格绿色平台 `P` 自身内部的固定点数边缘。设 `P` 包含 `N` 个有效 ProcessInfo 点，单侧点数为 `k=max(min_transition_points, floor(N×transition_ratio+0.5))`，当前 `transition_ratio=5%`、`min_transition_points=1`；`P` 的前 `k` 点和后 `k` 点改判为 transition，中间 `N-2k` 点才是最终 steady 核心。不得从 `P` 外侧取点，也不得把确定 `P` 时被排除的旧 transition 边缘继续保留为 transition。比例不按物理行程或实际负载采样点数计算。若不能同时形成左右 transition，或裁后核心不再满足完整平台阈值、最小平台点数与 `min_steady_mm`，该严格平台整体保守改判为 `nonsteady`。
+- `nonsteady`：MRR 波动较大，或在非空载加工阶段内排除进刀、严格平台和退刀后剩余的阶段。基础划分已经判为 `nonsteady` 的点必须保持 `nonsteady`；位于两个严格平台之间的长波动区域不得被 transition 侵占。基础 steady 候选 `B` 中位于严格平台 `P` 外的旧蓝边缘必须恢复相应侧的相邻类别；继承后的区间必须重新通过评分、状态语法和 idle 硬门控，否则保守归为 `nonsteady`。
+- `exit`：一个连续加工阶段结束前，从该阶段最后一个 MRR 峰值或最后一个稳态带之后下降并最终进入“有效 idle 间隔”的阶段。若存在合法稳态带，退刀在稳态终点后开始；否则可包含最后一个 MRR 峰值点。其后一段必须是有效 idle 间隔，因此不能作为全行程末段，也不能由内部瞬时 idle 脉冲触发。
+
+这里的“峰值”只指当前连续加工阶段内的 `MRR_program` 峰值，不是功率峰值。相同最大值形成平台时，进刀侧使用首个峰值位置，退刀侧使用最后一个峰值位置；每个由有效 idle 间隔分隔的加工阶段独立确定。`entry` 和 `exit` 是允许为空的可选状态：若加工阶段由有效 idle 直接进入 `steady` / `nonsteady`，或由这些状态直接回到有效 idle，不得为了凑齐六态强行生成进退刀段。
+
+“idle 硬标签”和“有效 idle 间隔”必须分离：
+
+- 连续 idle 点的物理长度达到集中配置 `min_idle_reset_mm` 时，该区间是有效 idle 间隔；完整输入行程的首段和末段 idle 也视为有效边界 idle。
+- 短于阈值的内部 idle 脉冲仍逐点输出为 `idle`，但不结束当前加工阶段、不重新计算阶段峰值，也不能生成新的 `entry` 或 `exit`。
+- 最终每个 `entry` 的起点必须具有“前接有效 idle”边界资格，每个 `exit` 的终点必须具有“后接有效 idle”边界资格；缺少该元数据时必须保守禁止进退刀，不得退回“任意 idle 都有效”的旧规则。
+- 首尾 idle 自动作为有效边界的前提是输入为完整 ProcessInfo 行程；不得先裁切子区间再把其局部首尾冒充全行程边界。
+
+稳态相关术语固定为：
+
+- “局部稳态候选点”：非空载、MRR 大于切削下限，且固定点数局部窗口的 MRR 相对标准差和相对拟合漂移均不超过各自阈值的点；
+- “合法稳态候选”：只包含局部稳态候选点，候选整段 MRR 相对标准差和相对拟合漂移均不超过阈值，点数不少于 `steady_min_plateau_points`（当前规则基线默认 24 点），物理长度不少于 `min_steady_mm`，且 steady 评分有限的原子段组合；
+- “基础 steady 候选 `B`”：不含 transition 的基础 Viterbi 回溯后，通过整段阈值、最短物理长度和结构复查的 provisional steady；它不是 transition 的直接来源。
+- “严格绿色平台 `P`”：在 `B` 内先确定的严格平台，边界等于本语义变更前图中最终绿色 steady 核心。`B\P` 只是平台边界复查排除的外缘，必须恢复相邻类别而不是继续标成 transition。只有 `P` 是 transition 的允许来源。
+- “最终 steady 核心”：从 `P` 内部前后各裁去 `k` 个 transition 点后保留的中间部分，仍必须通过整段平台阈值、最小平台点数且物理长度不少于 `min_steady_mm`。
+
+判定优先级固定为：
+
+```text
+idle 硬门控
+→ 识别有效 idle 间隔并建立加工阶段
+→ Viterbi 基础划分：entry / steady / nonsteady / exit（不生成 transition）
+→ 复查得到基础 steady 候选 B
+→ 在 B 内先确定严格绿色平台 P，并将 B\P 恢复为相邻类别
+→ 只从 P 自身内部固定裁出前后各 5% transition
+→ 全覆盖、状态语法和硬不变量复查
+```
+
+基础评分阶段必须把 `transition` 设为不可选状态，不再存在 transition-priority 原子、向外侧寻找过渡段或强迫生成 transition 的路径。Viterbi 先在其余五态中得到基础划分；随后必须先得到严格平台 `P`，不能直接把基础候选 `B` 的外缘登记为最终 transition。
+
+transition 使用严格平台 `P` 的 ProcessInfo 点数，不使用基础候选 `B` 的点数、物理行程宽度或实际负载采样点数。每个有效 ProcessInfo 点都建立独立原子；旧 `min_transition_mm` / `max_transition_mm` 仅保留配置兼容。两侧都必须存在，裁后核心必须仍是合法 steady。不能满足条件时 `P` 保守改判 `nonsteady`，不得保留“没有双侧过渡的稳态”，也不得向 `P` 外扩张。
+
+以下关系是不可放宽的硬不变量：
+
+```text
+strict_platform P ⊆ base_steady_candidate B
+final_transition ⊆ strict_platform P
+final_transition ∩ (B \ P) = ∅
+provisional_nonsteady ∩ final_transition = ∅
+left_transition ∪ final_steady_core ∪ right_transition = P
+final_steady_core_length >= min_steady_mm
+```
+
+任何后处理都不得改变 `idle` 硬门控，也不得产生不邻接 `steady` 的 `transition`、不具有有效 idle 前驱资格的 `entry`，或不具有有效 idle 后继资格的 `exit`。这些约束必须进入候选评分和解码后校验；即使未来替换为 Neural Segment Scorer，也不能绕过这些安全约束。
+
+## 4. Semi-Markov 解码职责
+
+算法模块位于 `src/project/segmentation/`，职责分离如下：
+
+- `features.py`：标准化完整行程输入，重算 MRR，建立 idle 硬门控、有效 idle reset 资格、加工阶段、峰值阶段、局部波动、真实行程拟合趋势和原子段；每个有效 ProcessInfo 点建立一个原子，使固定点数 transition 能落在真实工艺点边界。不得拆分、插值或伪造 ProcessInfo 点；旧 `max_atomic_length_mm` 只保留配置兼容，不再参与原子划分。
+- `scorers.py`：对基础五态候选评分并执行 idle/非 idle、有效 idle 边界、平台波动/趋势/点数和峰值阶段硬约束；基础 transition 评分恒为非法，只登记已经证明位于严格平台 `P` 内部的精确最终裁边。`B\P` 继承相邻类别后必须重新验分，失败时保守归为 `nonsteady`。
+- `semi_markov.py`：执行不含 transition 的 Viterbi 与回溯，复查得到 `B`，先确定严格平台 `P` 并恢复 `B\P`，再仅从 `P` 内部裁出两端各 `5%` transition。无合法基础解时仍逐点遵守 idle 硬门控并保守完整覆盖。
+- `pipeline.py`：校验 `P⊆B`、transition 只来自 `P`、恢复外缘不再成为 transition、固定点数分割、steady 核心阈值、有效 idle 边界、状态语法和完整覆盖，再把最终互斥标签展开回每个有效 ProcessInfo 点。
+
+“全行程展开”是把回溯得到的区间级结果映射回过程域的每一个工艺点，保证覆盖率 100%、无空洞、无重叠；它不是把区间扩张到 ProcessInfo 未覆盖的实际负载采样范围。
+
+`SegmentScorer` 与 `SemiMarkovDecoder` 必须继续解耦，便于未来替换评分器而不重写原子段、持续长度、Viterbi、回溯和输出结构。对外文档、界面、日志、诊断、图表和导出统一称“全行程最优划分结果”，不称“全行程最优路径”。
+
+当前 `RuleSegmentScorer` 只作为可解释基线和硬约束验证器，不再通过增加具体轨迹、程序行号或案例专用阈值追逐所有未知轨迹。面向多轨迹泛化的论文主方法应替换为学习型 `SegmentScorer`：由模型从带标签的 MRR 时序、局部上下文和工艺特征学习候选区间得分，Semi-Markov 继续负责持续长度、状态语法、Viterbi 和回溯；MRR 重算、idle 硬门控、固定 5% transition 来源、完整覆盖及进退刀有效 idle 邻接仍作为不可学习、不可绕过的物理约束。本迭代不在缺少多案例人工标签时臆造或训练模型。
+
+`max_segment_atoms` 只允许作为可同态分块长状态的计算上限，不得成为隐含的物理持续长度上限。`entry` / `exit` 不能依靠同态分块延长，因此解码器必须至少按各自 `max_entry_mm` / `max_exit_mm` 回看完整物理候选；每点一原子增加的原子数量不得改变本来合法的进退刀物理长度。
+
+## 5. 过程域与实际采样域
+
+过程域和实际采样域必须明确分离：
+
+- ProcessInfo 的有效点构成过程域，Semi-Markov 只在该域内分类并生成权威连续区间。
+- 实际负载文件通常包含加工前、加工后或其他未被 ProcessInfo 覆盖的采样点；这些点不反向参与过程域解码。
+- 过程域区间投影到实际采样坐标时，必须保持程序顺序、端点唯一、终点包含，且不得产生空洞、逆序或重叠。
+- 只允许恰好一个实际采样序列块覆盖当前过程域；没有匹配块或多个块都匹配时安全失败。过程区间投影后若没有实际采样点则折叠跳过，相邻同态投影段随后合并；最终非空投影段仍必须连续覆盖唯一匹配块内的整个过程范围。
+- 对预测负载图中未被过程域投影覆盖的有效采样点，先用同一功率门控显示为 `idle`，其余显示为 `nonsteady`。该补色只影响采样域可视化和诊断，不写回过程域运行状态，也不写入 `intervals.csv`。
+
+暂不把域外补色写入六行 CSV。原因是旧“行号.点号”坐标在多个采样序列块中可能重复，不能唯一表示首尾采样点；不得为补色擅自扩展旧坐标格式或放宽唯一性约束。
+
+## 6. 输出要求
+
+输出统一位于 `output/segmentation/`。
+
+### 6.1 `intervals.csv`
+
+文件格式固定为六行、无表头：
+
+```text
+1,<idle区间1>,<idle区间2>,...
+2,<entry区间1>,<entry区间2>,...
+3,<steady区间1>,<steady区间2>,...
+4,<transition区间1>,<transition区间2>,...
+5,<nonsteady区间1>,<nonsteady区间2>,...
+6,<exit区间1>,<exit区间2>,...
+```
+
+没有区间的类别仍保留对应编号行。每个区间格式固定为：
 
 ```text
 起点行号.点号-终点行号.点号
 ```
 
-内部没有原始行号时，可使用连续内部 `line_id` 生成边界标签，但必须同时保留原始点序号，保证逐点可追溯。
+要求：
 
-初步版本明确不使用：
+- 行号和点号必须对应实际负载文件中的采样点，而不是 ProcessInfo 的行序号；行号直接采用实际负载 `program_line` 通道的整数值，不另加偏移；
+- 点号使用零基编号，与旧 `.rg` 坐标一致；
+- 起点和终点均包含在区间内；
+- 每个端点必须在实际负载数据中唯一存在；
+- 同一类别的多个区间按实际采样顺序排列并以逗号分隔；
+- 文件中的 1–6 是类别行编号，内部 `state_code` 仍为 0–5，二者不得混淆。
 
-- 主轴功率、切削功率或预测功率；
-- 实际进给 `F_actual`；
-- 尚未接入的指令进给 `F_cmd`；
-- 振动、报警或其他机床采样。
+文件编码固定为 UTF-8 无 BOM、换行固定为 LF。没有区间的类别行只写类别编号本身，例如 `4`，不追加尾随逗号。
 
-## 3. 特征与原子段
+不再导出 `point_labels.csv`。若旧运行留下该文件，重新导出时应清理，避免用户误认为它仍是有效结果。内部可以保留逐点标签用于覆盖校验，但不得作为正式文件输出。
 
-需要计算：
+### 6.2 `overview.png`
 
-- `MRR_program = ap * ae * F_program / 60`；
-- `ap`、`ae`、`F_program`、`MRR_program` 对 s 的变化率；
-- 局部均值、标准差、趋势和有效切削标志；
-- 指令行切换、指令行物理长度、行内相对位置；
-- 短指令行标志和单位行程换行密度。
+最终图只绘制：
 
-在保留以下边界的前提下压缩连续相似点形成原子段：
+- 完整实际采样域上的预测负载曲线；
+- 六态背景；
+- 必要的区间边界和图例。
 
-- 指令行变化；
-- 空载/有效切削变化；
-- `ap`、`ae` 或 `F_program` 的显著变化；
-- MRR趋势或风险标志变化。
+横轴固定为实际负载文件的全局零基采样索引；有效预测负载点是 `P_pred` 为有限值且同时具有有限 `P_idle` 的采样点。
 
-所有阈值必须集中在可序列化配置中，不得散落硬编码在界面或导出函数里。持续长度使用毫米行程，不使用简单点数作为唯一依据。
+六态使用统一、色盲友好且能明显区分的高对比配色；主界面和 `overview.png` 必须复用同一套颜色与透明度策略，预测负载曲线使用不与六态混淆的深色。不得把 `ap`、`ae`、`F_program`、MRR 或其他分析曲线画入该最终图，也不得再生成、复用或借用旧的四联工艺参数概览图。背景必须覆盖完整有效预测负载域：过程域使用权威投影标签，域外使用第 5 节的显示规则。
 
-## 4. 算法结构
+主界面的非均匀行程域背景色块必须使用完整有序横坐标上相邻采样中心的中点作为共享单元边界；相邻状态只共享零宽边界，不得使用全局中位步长扩宽单点色块，也不得出现正宽度重叠。重复行程坐标按确定性零宽边界处理，非有限坐标或负载造成的洞不得被多边形跨越连接。
 
-新增独立模块 `src/project/segmentation/`，至少包含：
+### 6.3 `diagnostics.json`
 
-- `schemas.py`：标签、输入版本、配置和结果结构；
-- `features.py`：标准输入、派生特征和原子段；
-- `scorers.py`：`SegmentScorer` 接口与 `RuleSegmentScorer`；
-- `semi_markov.py`：转移语法、持续长度、Viterbi和回溯；
-- `pipeline.py`：完整运行流程、全行程展开和诊断；
-- `__init__.py`：稳定公开接口。
+诊断至少记录：
 
-核心调用形式：
-
-```python
-result = SegmentationPipeline(config).run(
-    input_frame,
-    scorer=RuleSegmentScorer(config),
-)
-```
-
-`SegmentScorer` 与 `SemiMarkovDecoder` 必须分离。后续 TCN 或 Patch Transformer 只替换区间评分器，不得重写原子段、语法、持续长度、Viterbi、回溯和输出结构。
-
-解码完成后，六类区间必须适配为现有运行时区间记录结构并通过统一状态写入入口更新 `current_interval_records`；`pred_power_intervals` 和 `pit_records` 仅作为兼容别名同步读取同一批记录。旧规则划分函数不得在随后绘图、profile 加载、参数刷新或导出过程中再次覆盖六类结果。
-
-初步版本采用固定工艺语法：
-
-```text
-空载 → 进刀 → 过渡 / 稳态 / 非稳态
-稳态 → 过渡 / 非稳态 / 退刀
-过渡 → 稳态 / 非稳态 / 退刀
-非稳态 → 过渡 / 稳态 / 退刀
-退刀 → 空载
-```
-
-## 5. 输出
-
-新的结构化输出统一放入 `output/segmentation/`。六类结果按本需求更新当前 PIT/区间运行状态，但不得覆盖现有 `SampleData.rg` 文件、目标值结果或其他旧导出文件；只有用户执行既有保存操作时，才允许继续按原格式写入 `SampleData.rg`。
-
-### 5.1 逐点全行程表 `point_labels.csv`
-
-至少包含：
-
-- `point_id`；
-- s、`line_id`、原始行号；
-- `ap`、`ae`、`F_program`、`MRR_program`；
-- `interval_id`、`segment_type`、`state_code`；
-- 当前点对应的一基“行号.点号”标签；
-- `is_optimizable`、`review_required`。
-
-原始输入的每个点必须恰好对应一行结果。
-
-### 5.2 连续区间表 `intervals.csv`
-
-至少包含：
-
-- 区间编号；
-- 起止点、起止行程、起止指令行；
-- 一基“起点行号.点号-终点行号.点号”兼容边界；
-- 六类区间类型、`state_code`、物理长度、点数；
-- `ap`、`ae`、F、MRR统计量；
-- 最优规则分数、第二高分、`score_margin`；
-- `confidence_type=rule_margin`、高/中/低规则置信等级；
-- `is_optimizable`、`review_required`、`decision_reason`。
-
-为后续兼容，预留但当前允许为空：
-
-- `input_schema_version`、`scorer_type`、`model_version`；
-- `class_confidence`；
-- `boundary_confidence`；
-- `optimization_confidence`。
-
-### 5.3 可视化 `overview.png`
-
-必须展示：
-
-- 全行程 `ap`、`ae`、`F_program` 和 `MRR_program`；
-- 六类区间彩色背景；
-- 区间边界；
-- 可优化稳态候选的单独标识。
-
-### 5.4 诊断 `diagnostics.json`
-
-至少包含：
-
-- 输入点数、原子段数、最终区间数；
-- 全行程覆盖率；
-- 空洞数和重叠数；
-- 非法状态转移数；
-- 过短稳态数量；
-- 使用的输入版本和完整配置；
-- 行程来源、行程有效性和是否使用非物理顺序回退；
+- 原始行数、有效过程点数、原子段数、过程级最终区间数；
+- 过程域覆盖率、空洞数、重叠数和非法转移数；
+- 基础 steady 候选 `B` 数量、严格绿色平台 `P` 数量，以及每段 `B`/`P` 的起止点和点数；
+- `B\P` 左右外缘的范围、点数、相邻基础状态、尝试继承状态、最终恢复类别和回退原因，汇总字段至少包含 `restored_outer_interval_count`、`restored_outer_point_count`、`restored_outer_state_counts` 和 `restored_outer_invalid_score_count`；失败尝试不得计入最终 transition 的目标/实际点数合计；
+- 每个 `P` 的目标/实际单侧 transition 点数 `k`、左右 transition 和最终核心的精确范围；`transition_ratio_parent` 固定为 `strict_steady_platform`；
+- `transition_outside_strict_platform_count`、`restored_outer_to_transition_count`、`strict_platform_partition_violation_count`、与 provisional nonsteady 相交数量、不邻接最终 steady 数量和固定点数比例违规数量；上述违规计数必须为 0；
+- 因局部 MRR 拟合漂移被平台门控拒绝的点数、最终 steady 核心点数违规数；
+- 前一段不是 idle 的进刀段、后一段不是 idle 的退刀段，以及不具有有效 idle 边界资格的进/退刀数量；
+- 输入版本、完整分割配置、MRR 计算公式，以及预测负载是独立前向还是带 `temporary_measurement_mode=true` 的临时实测来源；
+- 行程来源、行程语义、有效性和非物理回退标志；
+- 程序行号匹配结果及唯一性；
+- 实际采样总数、过程域投影范围、投影区间数、投影覆盖点数；
+- 域外 `idle` 与域外 `nonsteady` 的显示点数；
 - 重复运行一致性摘要。
 
-### 5.5 现有行号.点号及 `.rg` 兼容
+新导出不得创建或覆盖 `SampleData.rg`、目标值结果、i 代码或其他旧文件。
 
-- 新的六类全覆盖区间记录、`point_labels.csv` 和 `intervals.csv` 必须写入 `state_code=0..5`；
-- 现有区间边界字段继续采用“行号.点号-行号.点号”，点号从 1 开始；
-- `SampleData.rg` 的文件结构、分隔符、程序名、理想值和冒号后实测平均值语义保持不变，不得把冒号后的平均值静默改成 `0..5` 类型码；
-- `SampleData.rg` 只导出满足安全条件、可优化的 `steady` 区间，其他五类虽然不写入优化范围，但仍必须存在于六类全覆盖结果中；
-- 不改变 `ProcessDataPath.txt`、`ProcessInfo.csv` 和 i 代码的既有格式。
+## 7. 应用状态与切换行为
 
-## 6. 安全规则
+- 加载或切换 ProcessInfo 后，立即清空上一文件的六态结果、投影和诊断，待重新解码后写入新的权威结果。
+- 加载或切换实际负载文件后，立即清空旧采样投影，并使用当前过程域结果重新建立采样坐标；不得复用上一负载文件的边界。解析、对齐、预测或刷新任一步失败时，必须清空旧文件和半写入的采样状态，后续投影或导出安全停止。
+- 右侧区间详情仅可在投影成功后显示 sample 起止坐标；投影失败或某过程区间折叠后没有独立采样点时，必须显示“无采样投影”及原因，不得把 ProcessInfo 点标签伪装成 sample 坐标。
+- ProcessInfo、实际负载和 profile 的加载先后顺序不得改变最终过程域预测、六态边界或来源标记；profile、`K_c/K_e`、空载模型或阶梯进给模型的内容发生变化后，必须立即使旧六态结果失效并待重算。
+- 主界面预测负载图和导出的 `overview.png` 必须使用同一套状态颜色、投影规则和域外补色逻辑。
+- 顶层“数据分析表”Tab 不再创建和注册；底层历史分析函数和数据结构不在本需求中删除。
+- profile 可提供当前预测所需的 `K_c/K_e/P_idle`、行程或程序行号；其中的历史区间记录仅作旧格式兼容，不得覆盖当前六态结果，也不得在未明确启用 interval template 时暗中改写样本域或过程域的 `K_c` 预测。
 
-- 只有达到最短物理长度、远离进退刀保护边界且规则置信等级足够的 `steady` 才可设置 `is_optimizable=True`；
-- 使用非物理顺序行程回退的 `steady` 不得设置为可优化；
-- `idle`、`entry`、`transition`、`nonsteady` 和 `exit` 默认不优化；
-- 低置信区间仍必须获得六类中的一个标签，以保证全行程覆盖，但强制 `is_optimizable=False` 和 `review_required=True`；
-- 若解码无合法路径，必须安全回退到完整覆盖的保守结果，不得输出空洞。
+## 8. 安全与确定性规则
 
-## 7. 现有代码接入边界
+- 所有阈值只存在于集中、可序列化配置中，不在评分器、界面和导出函数中散落魔法数。
+- 物理持续长度使用毫米；平台最小点数只能作为离散证据充分性约束，不得替代毫米持续长度。
+- `idle` 和非 `idle` 候选硬互斥。
+- `min_idle_reset_mm` 只控制加工阶段重置资格，不改变任意点的 idle 硬标签；原子与有效 ProcessInfo 点一一对应，不得合并、拆分、插值或伪造工艺点。`max_atomic_length_mm` 仅作为旧配置兼容字段，不再参与原子划分或结果诊断。
+- transition 只能来自严格平台 `P` 内部、`B\P` 必须恢复相邻类别，以及有效 idle 进退刀边界，均属于评分器之外仍需复查的安全约束；未来 Neural scorer 也必须遵守。
+- 解码失败时必须生成保守、完整覆盖的结果并明确诊断，不得输出部分结果或静默沿用旧结果。
+- 相同输入、预测负载、空载功率和配置必须得到完全一致的边界与标签。
+- 不修改数据库、依赖、外部配置格式、实际负载文件或用户原始数据。
+- 不新增机器相关绝对路径；所有验收路径只作为运行参数传入。
 
-允许修改：
+## 9. 本次验收数据
 
-- `src/project/academic_workbench.py`：增加标准输入适配、运行入口和最近一次完整 `SegmentationResult` 诊断/导出对象；该对象不得形成与 `current_interval_records` 并行的第二套业务区间状态；保留现有数据分析底层函数，但不再由顶层“数据分析表”Tab 调用其界面构建函数；
-- `src/project/ui_bootstrap.py`：增加“全行程六类划分”入口和状态显示；删除顶层 `data_analysis_tab` 的创建、Notebook 注册以及 `create_data_analysis_tab()` 启动调用；
-- `src/project/plot_support.py`：增加六类颜色和全行程绘图支持；
-- `src/project/analysis_export.py`：增加独立六类结果导出；
-- `src/project/processing_core.py`：增加输入累计行程有效性判断，并在全零或无有效跨度时回退到 G 代码几何或 NC profile 行程；
-- `src/project/pit_model.py`：将六类全覆盖结果接入统一当前区间状态，禁止旧划分或历史 profile 边界覆盖新结果，并使下游只对安全稳态执行优化相关逻辑；
-- `src/project/config_state.py`：将现有区间详情和计数显示适配为六类全行程结果；
-- 新增 `src/project/segmentation/` 模块。
+在 Conda 环境 `AFC` 中使用以下数据验证：
 
-`academic_workbench.py` 可以保留最近一次完整 `SegmentationResult` 作为诊断和导出对象，但它不是与旧区间并行的第二套业务状态；业务区间唯一来源仍为写入 `current_interval_records` 的六类结果。
+- 工艺信息：`C:\Users\wumin\Nutstore\1\AFC2.0论文写作\稳态区间划分\基于工艺信息表的稳态区间划分\output\ProcessInfo.csv`
+- NC 文件：`C:\Users\wumin\Nutstore\1\AFC2.0论文写作\稳态区间划分\数据资料\实验数据汇总\变负载切削\OBQX.NC`
+- 实际负载：`C:\Users\wumin\Nutstore\1\AFC2.0论文写作\稳态区间划分\数据资料\实验数据汇总\变负载切削\AFC2.0\外侧第2次进刀-未优化状态22s.csv`
+- 当前临时反向辨识/同源案例配置：`profiles/OBQX.kcke`（只用于本案例区间划分验证，诊断必须标记为非独立）
 
-初步版本不得覆盖或改变：
+验收标准：
 
-- `src/project/academic_analysis.py` 中现有稳态/非稳态分析和目标值逻辑；
-- `SampleData.rg` 导出结构及数值语义；
-- 负载预测、目标功率、参考功率和 i 代码生成；
-- 现有 profile、数据库、依赖和配置文件格式。
-- `academic_workbench.py` 中的数据分析计算、导入和导出函数；本需求只移除界面 Tab，不做底层功能清理或重构。
+1. 分割模块在 `AFC` 环境可导入、可编译、可重复运行。
+2. 有效 ProcessInfo 点均被覆盖且只覆盖一次，覆盖率 100%，空洞和重叠均为 0。
+3. 输入 MRR 列被任意篡改时，边界和标签完全不变。
+4. 所有 `idle` 点满足功率门控，其他状态不包含满足门控的点。
+5. 每个最终 `steady` 核心均满足 MRR 波动、整体拟合漂移、最小平台点数和 `min_steady_mm`。必须先从基础候选 `B` 得到严格绿色平台 `P`，再按 `P` 的 `N` 个 ProcessInfo 点计算 `k=max(1,floor(0.05N+0.5))`；只有 `P` 的前后各 `k` 点是 transition，中间才是最终 steady。不能双侧合法裁边的 `P` 整体为 `nonsteady`。
+6. `P⊆B`，最终 transition 与 `B\P` 交集为 0；旧蓝外缘必须恢复相邻类别且重新验分，失败回退 `nonsteady`。基础 `nonsteady` 与最终 transition 交集也必须为 0；两个平台之间的长波动保持 `nonsteady`。
+7. 基础 Viterbi 不生成 transition。固定比例裁边只处理严格平台 `P`；短于 `min_steady_mm`、点数不足、整体趋势超限或整段评分不合法的伪平台不得产生 transition。对本次真实案例，严格平台 `140–231` 必须得到 transition `140–144` / `227–231` 和 steady `145–226`；严格平台 `306–384` 必须得到 transition `306–309` / `381–384` 和 steady `310–380`。旧 transition `135–139`、`232–236`、`302–305`、`385–388` 必须恢复相邻类别。
+8. `entry` / `exit` 允许为空；存在时，`entry` 必须具有前接有效 idle 的边界资格并在首个合法稳态带前结束，未先遇到稳态时可包含首个 MRR 峰值；`exit` 必须具有后接有效 idle 的边界资格并在最后稳态带后开始，缺少稳态时可包含最后一个 MRR 峰值。内部短 idle 仍输出为 idle，但不得新增进退刀。
+9. 每个有效 ProcessInfo 点恰好对应一个原子，原子数量与有效工艺点数量一致，不新增或删除点；合法的 35 mm 进刀在 `max_entry_mm=40` 时不得因 32 原子计算窗口被截断。
+10. 非均匀行程域相邻色块使用同一中点边界，任意两块没有正宽度重叠；重复坐标和非有限值洞按第 6.2 节处理。
+11. `intervals.csv` 固定六行、无表头、零基点号、终点包含，所有端点唯一对应实际负载采样点。
+12. 不生成 `point_labels.csv`，也不覆盖 `SampleData.rg`。
+13. `overview.png` 只包含预测负载和六态背景，首尾及其他域外有效样本按规则补色。
+14. 诊断能区分过程域区间、采样域投影和域外显示点数，并报告 `B→P→transition/steady core` 的完整边界、外缘恢复类别、严格平台包含关系、provisional nonsteady 交集及有效 idle 边界违规数。
+15. 切换 ProcessInfo 或实际负载时不会残留上一文件的区间或投影。
+16. 当前三套运行时区间入口保持一致，旧逻辑不会在刷新、绘图、profile 加载或导出时覆盖结果。
+17. 完整 Git Diff 不包含计划外改动，不恢复用户已删除的文档，不提交、不推送。
+18. 当前实际负载反向辨识链能够完成区间划分和绘图，来源明确标记为 `measurement_reverse` 或 `same_measurement_profile`，并具有 `temporary_measurement_mode=true`、`independent=false`；不得把该结果声称为独立预测或跨轨迹泛化验证。
 
-现有依赖稳态区间的 Kc、目标值、优化和 `.rg` 导出消费者，必须从六类记录中显式筛选 `segment_type == "steady"` 且满足相应安全条件的区间，不得把 `entry`、`transition`、`nonsteady`、`exit` 或 `idle` 当作可优化稳态。
+## 10. 本次不做
 
-## 8. 初步版本不做
-
-- 不增加表格分类模型；
-- 不增加 PyTorch；
-- 不实现 TCN、Transformer或Patch Transformer；
-- 不实现 Neural Semi-Markov 损失；
-- 不训练任何模型；
-- 不使用实测主轴功率或实际进给；
-- 不实现概率置信度校准；
+- 不增加表格分类模型、PyTorch、TCN、Transformer 或 Neural Semi-Markov 训练。
+- 不使用实测功率、振动、报警或实际进给参与分类。
 - 不修改 `tests/` 或 `scripts/verification/`。
-
-## 9. 验收标准
-
-1. 在 Conda 环境 `AFC` 中可以导入并运行新分割模块。
-2. 使用 `data/sample/ProcessInfo.csv` 时，逐点结果行数与有效原始输入点数一致。
-3. 全行程覆盖率为100%，空洞数为0，重叠数为0。
-4. 非法状态转移数为0。
-5. 每个区间均可追溯到原始点、行程、指令行和一基“行号.点号”边界。
-6. 只有符合安全条件的稳态候选能够标记为可优化。
-7. 相同输入和配置重复运行得到完全一致的区间边界和标签。
-8. 成功生成逐点表、区间表、全行程图和诊断文件。
-9. 现有目标值、profile 和旧导出接口及格式不受影响；现有稳态/PIT 区间边界按本需求由六类全覆盖结果替换，其公共读取入口继续可用。
-10. 实际运行导入检查、源码编译检查和当前样例端到端检查；无法执行或失败的检查必须如实报告。
-11. 主 Notebook 中不再显示“数据分析表”Tab，应用启动和切换剩余 Tab 时无属性错误；底层数据分析代码及其历史数据保持不变。
-12. `current_interval_records`、`pred_power_intervals` 和 `pit_records` 反映同一批六类全覆盖结果，旧稳态划分不会在刷新、绘图、profile 加载或导出时重新覆盖它们。
-13. 所有区间同时包含 `segment_type` 和固定的 `state_code=0..5`，内部点号及导出点号从 1 开始。
-14. 对 `data/sample/ProcessInfo.csv`，不能因为 `s(mm)` 全零而将全行程保持为零；应使用可用的 G 代码/NC 几何行程，并在诊断中记录实际行程来源。只有所有物理来源均不可用时才允许非物理顺序回退。
-15. `SampleData.rg` 格式及冒号后实测平均值语义保持不变，且其中不得出现五类不可优化区间。
-
-## 10. 后续接口
-
-后续按以下顺序扩展，不属于初步版本范围：
-
-1. 增加 `F_cmd` 输入版本；
-2. 建立规则预标注 + 人工区间修正数据；
-3. 训练 TCN 点级编码器；
-4. 实现神经区间评分和 Neural Semi-Markov 损失；
-5. 输出并校准类别、边界和优化置信度；
-6. 完成 4 类受控轨迹、每类 3 个独立 NC 程序、每程序 3 轮加工，共 36 条开发数据；按完整程序进行三折交叉验证，每折使用 8 个程序的 24 条数据训练、4 个程序的 12 条数据验证；另用 1 个完全独立的实际零件程序加工 3 轮作为冻结测试集；
-7. 训练 Patch Transformer 作为对比；
-8. 实测主轴功率用于标签、测试和实际有效性验证；上一轮功率仅作为可选重复加工增强实验。
+- 不改变数据库、依赖、外部配置文件格式和旧 `.rg` 坐标格式。
+- 不把采样域补色反写到过程域或六行 CSV。
