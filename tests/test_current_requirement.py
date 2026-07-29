@@ -21,6 +21,7 @@ from matplotlib.collections import PolyCollection
 from project.academic_workbench import AcademicWorkbenchMixin
 from project.analysis_export import AnalysisExportMixin
 from project.plot_support import PlotSupportMixin
+from project.processing_core import ProcessingCoreMixin
 from project.sample_manager import SampleManagerMixin
 from project.segmentation import SegmentationConfig, SegmentationPipeline
 
@@ -231,6 +232,62 @@ class _VisualizationHarness(AnalysisExportMixin, PlotSupportMixin):
                 dtype=float,
             )
         return self.manual_measurement_data
+
+
+class _ProcessExportHarness(AnalysisExportMixin):
+    def __init__(self, process_result):
+        self._latest_segmentation_result = process_result
+        self._sample_mapping_status = "not_available"
+        self._current_mapping_signature = ""
+        self._segmentation_sample_projection_records = []
+        self.sample_programs = {}
+        self.status_var_data = _ValueVar("")
+        self.data = []
+        for source_index in range(len(process_result.point_labels)):
+            self.data.append({
+                "line_no_raw": source_index,
+                "N_str": f"N{source_index + 1}",
+                "S": 5000.0,
+                "ap": 1.0,
+                "ae": float(source_index + 1),
+                "feed_effective": 60.0,
+                "s": 0.1,
+                "gcode_content": f"G1 X{source_index + 1}",
+                "_is_synthetic_fill": False,
+            })
+
+
+class _ProcessPathHarness(ProcessingCoreMixin):
+    def __init__(self):
+        self.gcode_profile = {}
+        self.process_input_diagnostics = {}
+        self.process_line_number_diagnostics = {}
+        self.s_base = _ValueVar(5000.0)
+        self.k_base = _ValueVar(1.0)
+        self.current_program_speed = _ValueVar(5000.0)
+
+    def get_kc_value(self):
+        return 1.0
+
+    def get_ke_value(self):
+        return 0.0
+
+    def predict_idle_power(self, speed):
+        return 100.0
+
+    def calculate_additional_columns(
+        self,
+        ap,
+        ae,
+        feed_rate,
+        s,
+        current_s,
+        s_base,
+        k_base,
+        **kwargs,
+    ):
+        mrr = float(ap) * float(ae) * float(feed_rate) / 60.0
+        return 0.0, float(ap) * float(ae), mrr, 1.0, 0.0, 100.0 + mrr, 100.0, 0.0
 
 
 def _fill_heights_at_x(collections, x_values) -> np.ndarray:
@@ -769,6 +826,128 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
             )
         finally:
             plt.close(gap_figure)
+
+    def test_06_process_only_save_exports_state_codes_without_rg(self):
+        process_result = _run(
+            [0.0] * 3
+            + [1.0, 2.0, 3.0, 2.0]
+            + [4.0] * 12
+            + [3.0, 2.0, 1.0]
+            + [0.0] * 3
+        )
+        harness = _ProcessExportHarness(process_result)
+
+        with (
+            TemporaryDirectory() as temporary_dir,
+            patch("project.analysis_export.OUTPUT_DIR", Path(temporary_dir)),
+            patch("project.analysis_export.messagebox.showinfo") as showinfo,
+        ):
+            harness.save_interval_info()
+            process_info_path = Path(temporary_dir) / "ProcessInfo.csv"
+            self.assertTrue(process_info_path.exists())
+            self.assertFalse((Path(temporary_dir) / "SampleData.rg").exists())
+            self.assertFalse((Path(temporary_dir) / "segmentation").exists())
+            exported = pd.read_csv(process_info_path, encoding="utf-8-sig")
+
+        self.assertEqual("state_code", exported.columns[-1])
+        expected_codes = (
+            process_result.point_labels
+            .sort_values("source_index")["state_code"]
+            .astype(int)
+            .tolist()
+        )
+        self.assertEqual(expected_codes, exported["state_code"].astype(int).tolist())
+        self.assertTrue(exported["state_code"].isin(range(6)).all())
+        showinfo.assert_called_once()
+        self.assertIn("未生成或覆盖 SampleData.rg", showinfo.call_args.args[1])
+
+    def test_07_process_file_without_s_uses_gcode_geometry_or_sequence_fallback(self):
+        harness = _ProcessPathHarness()
+        header = "N,S(r/min),ap(mm),ae(mm),F(mm/min),MRR(mm3/min),G"
+        parsed_header, layout = harness.parse_gcode_line(
+            header,
+            return_layout=True,
+        )
+        self.assertIsNone(parsed_header)
+        self.assertEqual("export_no_seq_no_s", layout)
+
+        state_header = f"{header},state_code"
+        parsed_header, state_layout = harness.parse_gcode_line(
+            state_header,
+            return_layout=True,
+        )
+        self.assertIsNone(parsed_header)
+        self.assertEqual(
+            "export_no_seq_no_s__with_state_code",
+            state_layout,
+        )
+        parsed_with_state, state_layout = harness.parse_gcode_line(
+            "N1,5000,1,1,60,1,G1 X1,2",
+            layout_hint=state_layout,
+            return_layout=True,
+        )
+        self.assertEqual("G1 X1", parsed_with_state["gcode_content"])
+        self.assertEqual(
+            "export_no_seq_no_s__with_state_code",
+            state_layout,
+        )
+
+        rows = []
+        for line in (
+            "N1,5000,1,1,60,1,G1 X1",
+            "N2,5000,1,1,60,1,G1 X3",
+        ):
+            parsed, layout = harness.parse_gcode_line(
+                line,
+                layout_hint=layout,
+                return_layout=True,
+            )
+            self.assertIsNotNone(parsed)
+            self.assertFalse(parsed["path_column_present"])
+            self.assertEqual(5000.0, parsed["spindle_speed"])
+            rows.append({
+                "line_no_raw": parsed["line_number"],
+                "gcode_content": parsed["gcode_content"],
+                "ap": parsed["ap"],
+                "ae": parsed["ae"],
+                "feed_effective": parsed["feed_rate"],
+                "S": parsed["spindle_speed"],
+                "s": 0.0,
+                "_input_path_column_present": parsed["path_column_present"],
+                "_input_path_value": parsed["path_value"],
+                "_input_path_semantics_hint": None,
+                "_has_input_spindle_speed": True,
+                "_has_input_path_bounds": False,
+                "_is_synthetic_fill": False,
+            })
+
+        harness._apply_nc_profile_to_process_rows(rows, origin=(0.0, 0.0, 0.0))
+        self.assertEqual("gcode_geometry", harness.process_path_source)
+        self.assertTrue(harness.process_path_is_physical)
+        np.testing.assert_allclose([row["s"] for row in rows], [1.0, 2.0])
+        np.testing.assert_allclose([row["path_end"] for row in rows], [1.0, 3.0])
+
+        no_geometry_rows = [
+            {
+                **dict(row),
+                "gcode_content": "M3",
+                "s": 0.0,
+                "path_start": 0.0,
+                "path_end": 0.0,
+                "path_cumulative": 0.0,
+            }
+            for row in rows
+        ]
+        harness._apply_nc_profile_to_process_rows(
+            no_geometry_rows,
+            origin=(0.0, 0.0, 0.0),
+        )
+        self.assertEqual("sequential_fallback", harness.process_path_source)
+        self.assertFalse(harness.process_path_is_physical)
+        np.testing.assert_allclose(
+            [row["s"] for row in no_geometry_rows],
+            [1.0, 1.0],
+        )
 
 
 if __name__ == "__main__":

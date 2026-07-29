@@ -68,6 +68,22 @@ class AnalysisExportMixin:
             return pd.DataFrame(payload)
         raise TypeError(f"SegmentationResult.{attribute_name} must be a pandas DataFrame")
 
+    def _write_dataframe_csv_compat(self, frame, output_path):
+        """兼容 pandas 1.4 的 line_terminator 与新版 lineterminator。"""
+        kwargs = {
+            "index": False,
+            "encoding": "utf-8",
+            "lineterminator": "\n",
+        }
+        try:
+            frame.to_csv(output_path, **kwargs)
+        except TypeError as exc:
+            if "lineterminator" not in str(exc):
+                raise
+            kwargs.pop("lineterminator")
+            kwargs["line_terminator"] = "\n"
+            frame.to_csv(output_path, **kwargs)
+
     def _normalize_segmentation_json_value(self, value):
         if isinstance(value, dict):
             return {
@@ -1002,17 +1018,13 @@ class AnalysisExportMixin:
             process_diagnostics
         )
         try:
-            process_point_labels.to_csv(
+            self._write_dataframe_csv_compat(
+                process_point_labels,
                 process_temporary_paths["point_labels"],
-                index=False,
-                encoding="utf-8",
-                lineterminator="\n",
             )
-            process_intervals.to_csv(
+            self._write_dataframe_csv_compat(
+                process_intervals,
                 process_temporary_paths["intervals"],
-                index=False,
-                encoding="utf-8",
-                lineterminator="\n",
             )
             self._save_segmentation_process_overview(
                 process_point_labels,
@@ -1124,11 +1136,9 @@ class AnalysisExportMixin:
                 for key, path in mapping_paths.items()
             }
             try:
-                projection_frame.to_csv(
+                self._write_dataframe_csv_compat(
+                    projection_frame,
                     mapping_temporary_paths["sample_projection"],
-                    index=False,
-                    encoding="utf-8",
-                    lineterminator="\n",
                 )
                 predicted_values = self._resolve_segmentation_display_prediction(
                     actual_values.size
@@ -1668,40 +1678,61 @@ class AnalysisExportMixin:
     def save_interval_info(self):
         """保存区间信息按钮的处理函数"""
         segmentation_result = getattr(self, "_latest_segmentation_result", None)
-        process_exported = False
-        if segmentation_result is not None:
-            try:
-                self.export_latest_segmentation_result(segmentation_result)
-                process_exported = True
-            except Exception as exc:
-                messagebox.showerror("过程域导出失败", str(exc))
-                return
+        if segmentation_result is None:
+            messagebox.showwarning("无六态结果", "请先完成全行程六类划分")
+            return
+
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        output_dir = str(OUTPUT_DIR)
+        try:
+            process_info_path = self._save_process_info_csv(
+                output_dir,
+                segmentation_result,
+            )
+        except Exception as exc:
+            messagebox.showerror("ProcessInfo导出失败", str(exc))
+            return
+        if not process_info_path:
+            messagebox.showwarning("无工艺信息", "当前没有可导出的工艺信息")
+            return
+
         mapping_valid = bool(
             str(getattr(self, "_sample_mapping_status", "") or "") == "valid"
             and str(getattr(self, "_current_mapping_signature", "") or "")
             and getattr(self, "_segmentation_sample_projection_records", None)
         )
-        if process_exported and not mapping_valid:
+        if not mapping_valid:
             mapping_status = str(
                 getattr(self, "_sample_mapping_status", "not_available")
                 or "not_available"
             )
             mapping_note = (
-                "实际采样映射失败，未覆盖已有 SampleData.rg。"
+                "实际采样映射失败，未生成或覆盖 SampleData.rg。"
                 if mapping_status == "failed"
-                else "导入并成功映射实际采样文件后，可再导出采样域结果。"
+                else "未导入可映射的实测数据，因此未生成或覆盖 SampleData.rg。"
+            )
+            self.status_var_data.set(
+                f"工艺信息已保存: {os.path.basename(process_info_path)}"
             )
             messagebox.showinfo(
                 "保存成功",
-                "过程域逐点结果、区间表、诊断和 MRR 总览已保存。\n"
+                f"已导出: {os.path.basename(process_info_path)}\n"
                 + mapping_note,
             )
             return
         if not self.sample_programs:
-            messagebox.showwarning("无程序信息", "请先加载 SampleData.txt")
+            messagebox.showwarning(
+                "无程序信息",
+                f"{os.path.basename(process_info_path)} 已保存；"
+                "缺少程序/刀具信息，未生成 SampleData.rg",
+            )
             return
         if not self._get_current_interval_records(allow_profile_fallback=False):
-            messagebox.showwarning("无稳态区间", "请先生成稳态区间")
+            messagebox.showwarning(
+                "无稳态区间",
+                f"{os.path.basename(process_info_path)} 已保存；"
+                "当前没有可映射的稳态区间，未生成 SampleData.rg",
+            )
             return
         
         # 收集所有可导出的刀具
@@ -1717,7 +1748,11 @@ class AnalysisExportMixin:
                         exportable_tools.append((program_name, tool_id, store.get("rg", 2.0)))
         
         if not exportable_tools:
-            messagebox.showwarning("无可导出数据", "未找到可导出的刀具区间信息")
+            messagebox.showwarning(
+                "无可导出数据",
+                f"{os.path.basename(process_info_path)} 已保存；"
+                "未找到可导出的刀具区间信息，未生成 SampleData.rg",
+            )
             return
         
         # 如果只有1把刀，直接保存
@@ -1869,11 +1904,10 @@ class AnalysisExportMixin:
             else:
                 process_info_path = self._save_process_info_csv(output_dir)
                 self.status_var_data.set(f"区间信息已保存: {os.path.basename(output_path)} (共{saved_lines}行)")
-                
-                # 需求7：保存ProcessDataPath.txt文件，只记录当前保存的工具对应的工艺信息文件路径
-                saved_programs = set(prog for prog, _, _ in tools_to_save)
+
+                saved_programs = {program_name for program_name, _, _ in tools_to_save}
                 self._save_process_data_paths(output_dir, saved_programs)
-                
+
                 detail = "结果已保存，请关闭该窗口"
                 if process_info_path:
                     detail += f"\n同时导出: {os.path.basename(process_info_path)}"
@@ -1909,13 +1943,87 @@ class AnalysisExportMixin:
         except Exception as e:
             print(f"[WARNING] 保存ProcessDataPath.txt失败: {e}")
 
-    def _save_process_info_csv(self, save_dir):
-        """导出当前工艺信息为统一的 ProcessInfo.csv。"""
+    def _save_process_info_csv(self, save_dir, segmentation_result=None):
+        """导出当前工艺信息，并在末列写入逐点六态 state_code。"""
         if not self.data:
             return None
 
-        output_path = os.path.join(save_dir, "ProcessInfo.csv")
-        header = ["N", "S(r/min)", "ap(mm)", "ae(mm)", "F(mm/min)", "s(mm)", "MRR(mm3/s)", "G"]
+        resolved_result = (
+            segmentation_result
+            or getattr(self, "_latest_segmentation_result", None)
+        )
+        if resolved_result is None:
+            raise ValueError("缺少六态划分结果，无法写入 state_code")
+        point_labels = self._coerce_segmentation_dataframe(
+            resolved_result,
+            "point_labels",
+        )
+        required_columns = {"source_index", "state_code"}
+        missing_columns = sorted(required_columns.difference(point_labels.columns))
+        if missing_columns:
+            raise ValueError(f"六态逐点结果缺少列: {missing_columns}")
+
+        source_indices = pd.to_numeric(
+            point_labels["source_index"],
+            errors="coerce",
+        )
+        state_codes = pd.to_numeric(
+            point_labels["state_code"],
+            errors="coerce",
+        )
+        if source_indices.isna().any() or state_codes.isna().any():
+            raise ValueError("六态逐点结果包含无效的 source_index 或 state_code")
+        if not np.equal(source_indices, np.floor(source_indices)).all():
+            raise ValueError("六态逐点结果的 source_index 必须为整数")
+        if not np.equal(state_codes, np.floor(state_codes)).all():
+            raise ValueError("六态逐点结果的 state_code 必须为整数")
+        state_codes = state_codes.astype(int)
+        if not state_codes.isin(range(6)).all():
+            raise ValueError("六态逐点结果包含 0..5 之外的 state_code")
+
+        state_by_source = {}
+        for source_index, state_code_value in zip(
+            source_indices.astype(int),
+            state_codes,
+        ):
+            source_index_value = int(source_index)
+            if source_index_value in state_by_source:
+                raise ValueError(
+                    f"六态逐点结果包含重复 source_index: {source_index_value}"
+                )
+            state_by_source[source_index_value] = int(state_code_value)
+
+        process_rows = [
+            (source_index, row)
+            for source_index, row in enumerate(self.data)
+            if isinstance(row, dict) and not bool(row.get("_is_synthetic_fill"))
+        ]
+        expected_sources = {source_index for source_index, _row in process_rows}
+        actual_sources = set(state_by_source)
+        if expected_sources != actual_sources:
+            missing_sources = sorted(expected_sources.difference(actual_sources))
+            extra_sources = sorted(actual_sources.difference(expected_sources))
+            details = []
+            if missing_sources:
+                details.append(f"缺少工艺行 {missing_sources[:10]}")
+            if extra_sources:
+                details.append(f"存在未知工艺行 {extra_sources[:10]}")
+            raise ValueError("六态逐点结果与工艺信息行不一致：" + "；".join(details))
+
+        output_path = Path(save_dir) / "ProcessInfo.csv"
+        temporary_path = output_path.with_name(f".{output_path.stem}.tmp{output_path.suffix}")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        header = [
+            "N",
+            "S(r/min)",
+            "ap(mm)",
+            "ae(mm)",
+            "F(mm/min)",
+            "s(mm)",
+            "MRR(mm3/s)",
+            "G",
+            "state_code",
+        ]
 
         def _as_csv_value(value):
             if value is None:
@@ -1946,21 +2054,30 @@ class AnalysisExportMixin:
                 return ""
             return ap_value * ae_value * feed_value / 60.0
 
-        with open(output_path, 'w', encoding='utf-8-sig', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(header)
-            for row in self.data:
-                writer.writerow([
-                    _export_line_number(row),
-                    _as_csv_value(row.get("S")),
-                    _as_csv_value(row.get("ap")),
-                    _as_csv_value(row.get("ae")),
-                    _as_csv_value(row.get("feed_effective")),
-                    _as_csv_value(row.get("s")),
-                    _as_csv_value(_calculated_mrr(row)),
-                    _as_csv_value(row.get("gcode_content")),
-                ])
-        return output_path
+        try:
+            with temporary_path.open(
+                "w",
+                encoding="utf-8-sig",
+                newline="",
+            ) as stream:
+                writer = csv.writer(stream, lineterminator="\n")
+                writer.writerow(header)
+                for source_index, row in process_rows:
+                    writer.writerow([
+                        _export_line_number(row),
+                        _as_csv_value(row.get("S")),
+                        _as_csv_value(row.get("ap")),
+                        _as_csv_value(row.get("ae")),
+                        _as_csv_value(row.get("feed_effective")),
+                        _as_csv_value(row.get("s")),
+                        _as_csv_value(_calculated_mrr(row)),
+                        _as_csv_value(row.get("gcode_content")),
+                        state_by_source[source_index],
+                    ])
+            temporary_path.replace(output_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+        return str(output_path)
 
     def export_i_code(self):
         """保存结果文件 SampleData.rg"""

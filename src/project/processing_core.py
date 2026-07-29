@@ -12,8 +12,17 @@ PROCESS_LAYOUT_DIRECT_SEQ_NO_MRR = "direct_seq_no_mrr"
 PROCESS_LAYOUT_DIRECT_NO_SEQ_NO_MRR = "direct_no_seq_no_mrr"
 PROCESS_LAYOUT_EXPORT_SEQ_NO_MRR = "export_seq_no_mrr"
 PROCESS_LAYOUT_EXPORT_NO_SEQ_NO_MRR = "export_no_seq_no_mrr"
+PROCESS_LAYOUT_DIRECT_SEQ_NO_S = "direct_seq_no_s"
+PROCESS_LAYOUT_DIRECT_NO_SEQ_NO_S = "direct_no_seq_no_s"
+PROCESS_LAYOUT_EXPORT_SEQ_NO_S = "export_seq_no_s"
+PROCESS_LAYOUT_EXPORT_NO_SEQ_NO_S = "export_no_seq_no_s"
+PROCESS_LAYOUT_DIRECT_SEQ_NO_MRR_NO_S = "direct_seq_no_mrr_no_s"
+PROCESS_LAYOUT_DIRECT_NO_SEQ_NO_MRR_NO_S = "direct_no_seq_no_mrr_no_s"
+PROCESS_LAYOUT_EXPORT_SEQ_NO_MRR_NO_S = "export_seq_no_mrr_no_s"
+PROCESS_LAYOUT_EXPORT_NO_SEQ_NO_MRR_NO_S = "export_no_seq_no_mrr_no_s"
 PROCESS_LAYOUT_LEGACY_SEQ = "legacy_seq"
 PROCESS_LAYOUT_LEGACY_NO_SEQ = "legacy_no_seq"
+PROCESS_LAYOUT_STATE_SUFFIX = "__with_state_code"
 
 PROCESS_LAYOUT_GCODE_INDEX = {
     PROCESS_LAYOUT_DIRECT_SEQ: 8,
@@ -24,6 +33,14 @@ PROCESS_LAYOUT_GCODE_INDEX = {
     PROCESS_LAYOUT_DIRECT_NO_SEQ_NO_MRR: 6,
     PROCESS_LAYOUT_EXPORT_SEQ_NO_MRR: 7,
     PROCESS_LAYOUT_EXPORT_NO_SEQ_NO_MRR: 6,
+    PROCESS_LAYOUT_DIRECT_SEQ_NO_S: 7,
+    PROCESS_LAYOUT_DIRECT_NO_SEQ_NO_S: 6,
+    PROCESS_LAYOUT_EXPORT_SEQ_NO_S: 7,
+    PROCESS_LAYOUT_EXPORT_NO_SEQ_NO_S: 6,
+    PROCESS_LAYOUT_DIRECT_SEQ_NO_MRR_NO_S: 6,
+    PROCESS_LAYOUT_DIRECT_NO_SEQ_NO_MRR_NO_S: 5,
+    PROCESS_LAYOUT_EXPORT_SEQ_NO_MRR_NO_S: 6,
+    PROCESS_LAYOUT_EXPORT_NO_SEQ_NO_MRR_NO_S: 5,
     PROCESS_LAYOUT_LEGACY_SEQ: 6,
     PROCESS_LAYOUT_LEGACY_NO_SEQ: 5,
 }
@@ -37,6 +54,14 @@ PROCESS_HEADER_MAP = {
     ("N", "ap(mm)", "ae(mm)", "F(mm/min)", "s(mm)", "S(r/min)", "G"): PROCESS_LAYOUT_DIRECT_NO_SEQ_NO_MRR,
     ("序号", "N", "S(r/min)", "ap(mm)", "ae(mm)", "F(mm/min)", "s(mm)", "G"): PROCESS_LAYOUT_EXPORT_SEQ_NO_MRR,
     ("N", "S(r/min)", "ap(mm)", "ae(mm)", "F(mm/min)", "s(mm)", "G"): PROCESS_LAYOUT_EXPORT_NO_SEQ_NO_MRR,
+    ("序号", "N", "ap(mm)", "ae(mm)", "F(mm/min)", "MRR(mm3/min)", "S(r/min)", "G"): PROCESS_LAYOUT_DIRECT_SEQ_NO_S,
+    ("N", "ap(mm)", "ae(mm)", "F(mm/min)", "MRR(mm3/min)", "S(r/min)", "G"): PROCESS_LAYOUT_DIRECT_NO_SEQ_NO_S,
+    ("序号", "N", "S(r/min)", "ap(mm)", "ae(mm)", "F(mm/min)", "MRR(mm3/min)", "G"): PROCESS_LAYOUT_EXPORT_SEQ_NO_S,
+    ("N", "S(r/min)", "ap(mm)", "ae(mm)", "F(mm/min)", "MRR(mm3/min)", "G"): PROCESS_LAYOUT_EXPORT_NO_SEQ_NO_S,
+    ("序号", "N", "ap(mm)", "ae(mm)", "F(mm/min)", "S(r/min)", "G"): PROCESS_LAYOUT_DIRECT_SEQ_NO_MRR_NO_S,
+    ("N", "ap(mm)", "ae(mm)", "F(mm/min)", "S(r/min)", "G"): PROCESS_LAYOUT_DIRECT_NO_SEQ_NO_MRR_NO_S,
+    ("序号", "N", "S(r/min)", "ap(mm)", "ae(mm)", "F(mm/min)", "G"): PROCESS_LAYOUT_EXPORT_SEQ_NO_MRR_NO_S,
+    ("N", "S(r/min)", "ap(mm)", "ae(mm)", "F(mm/min)", "G"): PROCESS_LAYOUT_EXPORT_NO_SEQ_NO_MRR_NO_S,
     ("序号", "N", "ap(mm)", "ae(mm)", "F(mm/min)", "MRR(mm3/min)", "G"): PROCESS_LAYOUT_LEGACY_SEQ,
     ("N", "ap(mm)", "ae(mm)", "F(mm/min)", "MRR(mm3/min)", "G"): PROCESS_LAYOUT_LEGACY_NO_SEQ,
 }
@@ -100,6 +125,17 @@ class ProcessingCoreMixin:
             return "s(mm)"
         if lowered in {"g", "gcode", "nc", "程序段", "代码"}:
             return "G"
+        if lowered in {
+            "state",
+            "statecode",
+            "state_code",
+            "segmentstate",
+            "segment_state",
+            "区间状态",
+            "六态",
+            "六态标识",
+        }:
+            return "state_code"
         return normalized
 
     def _parse_prefixed_numeric_token(self, token, prefix):
@@ -123,6 +159,10 @@ class ProcessingCoreMixin:
             for token in tokens
             if str(token).strip()
         )
+        if normalized and normalized[-1] == "state_code":
+            base_layout = PROCESS_HEADER_MAP.get(normalized[:-1])
+            if base_layout:
+                return f"{base_layout}{PROCESS_LAYOUT_STATE_SUFFIX}"
         return PROCESS_HEADER_MAP.get(normalized)
 
     def _is_process_header_row(self, tokens):
@@ -337,15 +377,25 @@ class ProcessingCoreMixin:
         if detected_layout:
             return None, detected_layout
 
+        reported_layout = layout_hint
+        if (
+            isinstance(layout_hint, str)
+            and layout_hint.endswith(PROCESS_LAYOUT_STATE_SUFFIX)
+        ):
+            if not cleaned:
+                return None, reported_layout
+            cleaned = cleaned[:-1]
+            layout_hint = layout_hint[:-len(PROCESS_LAYOUT_STATE_SUFFIX)]
+
         numeric_tokens, gcode_tokens = self._split_numeric_and_gcode_tokens(
             cleaned,
             layout_hint=layout_hint,
         )
         if not numeric_tokens or not gcode_tokens or len(numeric_tokens) < 4:
-            return None, layout_hint
+            return None, reported_layout or layout_hint
 
         result = None
-        effective_layout = layout_hint
+        effective_layout = reported_layout or layout_hint
 
         if layout_hint == PROCESS_LAYOUT_DIRECT_SEQ and len(numeric_tokens) >= 8:
             result = self._build_process_parse_result(
@@ -437,6 +487,90 @@ class ProcessingCoreMixin:
                 ae_token=numeric_tokens[3],
                 feed_token=numeric_tokens[4],
                 s_token=numeric_tokens[5],
+                gcode_tokens=gcode_tokens,
+            )
+        elif layout_hint == PROCESS_LAYOUT_DIRECT_SEQ_NO_S and len(numeric_tokens) >= 7:
+            result = self._build_process_parse_result(
+                layout_name=layout_hint,
+                line_token=numeric_tokens[1],
+                ap_token=numeric_tokens[2],
+                ae_token=numeric_tokens[3],
+                feed_token=numeric_tokens[4],
+                mrr_token=numeric_tokens[5],
+                spindle_token=numeric_tokens[6],
+                gcode_tokens=gcode_tokens,
+            )
+        elif layout_hint == PROCESS_LAYOUT_DIRECT_NO_SEQ_NO_S and len(numeric_tokens) >= 6:
+            result = self._build_process_parse_result(
+                layout_name=layout_hint,
+                line_token=numeric_tokens[0],
+                ap_token=numeric_tokens[1],
+                ae_token=numeric_tokens[2],
+                feed_token=numeric_tokens[3],
+                mrr_token=numeric_tokens[4],
+                spindle_token=numeric_tokens[5],
+                gcode_tokens=gcode_tokens,
+            )
+        elif layout_hint == PROCESS_LAYOUT_EXPORT_SEQ_NO_S and len(numeric_tokens) >= 7:
+            result = self._build_process_parse_result(
+                layout_name=layout_hint,
+                line_token=numeric_tokens[1],
+                spindle_token=numeric_tokens[2],
+                ap_token=numeric_tokens[3],
+                ae_token=numeric_tokens[4],
+                feed_token=numeric_tokens[5],
+                mrr_token=numeric_tokens[6],
+                gcode_tokens=gcode_tokens,
+            )
+        elif layout_hint == PROCESS_LAYOUT_EXPORT_NO_SEQ_NO_S and len(numeric_tokens) >= 6:
+            result = self._build_process_parse_result(
+                layout_name=layout_hint,
+                line_token=numeric_tokens[0],
+                spindle_token=numeric_tokens[1],
+                ap_token=numeric_tokens[2],
+                ae_token=numeric_tokens[3],
+                feed_token=numeric_tokens[4],
+                mrr_token=numeric_tokens[5],
+                gcode_tokens=gcode_tokens,
+            )
+        elif layout_hint == PROCESS_LAYOUT_DIRECT_SEQ_NO_MRR_NO_S and len(numeric_tokens) >= 6:
+            result = self._build_process_parse_result(
+                layout_name=layout_hint,
+                line_token=numeric_tokens[1],
+                ap_token=numeric_tokens[2],
+                ae_token=numeric_tokens[3],
+                feed_token=numeric_tokens[4],
+                spindle_token=numeric_tokens[5],
+                gcode_tokens=gcode_tokens,
+            )
+        elif layout_hint == PROCESS_LAYOUT_DIRECT_NO_SEQ_NO_MRR_NO_S and len(numeric_tokens) >= 5:
+            result = self._build_process_parse_result(
+                layout_name=layout_hint,
+                line_token=numeric_tokens[0],
+                ap_token=numeric_tokens[1],
+                ae_token=numeric_tokens[2],
+                feed_token=numeric_tokens[3],
+                spindle_token=numeric_tokens[4],
+                gcode_tokens=gcode_tokens,
+            )
+        elif layout_hint == PROCESS_LAYOUT_EXPORT_SEQ_NO_MRR_NO_S and len(numeric_tokens) >= 6:
+            result = self._build_process_parse_result(
+                layout_name=layout_hint,
+                line_token=numeric_tokens[1],
+                spindle_token=numeric_tokens[2],
+                ap_token=numeric_tokens[3],
+                ae_token=numeric_tokens[4],
+                feed_token=numeric_tokens[5],
+                gcode_tokens=gcode_tokens,
+            )
+        elif layout_hint == PROCESS_LAYOUT_EXPORT_NO_SEQ_NO_MRR_NO_S and len(numeric_tokens) >= 5:
+            result = self._build_process_parse_result(
+                layout_name=layout_hint,
+                line_token=numeric_tokens[0],
+                spindle_token=numeric_tokens[1],
+                ap_token=numeric_tokens[2],
+                ae_token=numeric_tokens[3],
+                feed_token=numeric_tokens[4],
                 gcode_tokens=gcode_tokens,
             )
         elif layout_hint == PROCESS_LAYOUT_LEGACY_SEQ and len(numeric_tokens) >= 5:

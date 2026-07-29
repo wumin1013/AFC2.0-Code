@@ -915,7 +915,7 @@ class BootstrapUiMixin:
         self.run_segmentation_btn = ttk.Button(
             interval_frame,
             text="🧭 全行程六类划分",
-            command=lambda: self.run_full_path_segmentation(),
+            command=lambda: self.run_full_path_segmentation(export_outputs=False),
             width=18,
             style='Tech.TButton',
         )
