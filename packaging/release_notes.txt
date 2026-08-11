@@ -1,0 +1,25 @@
+AFC2.0.2alpha 发布说明
+========================
+
+版本：{{VERSION}}
+Git 提交：{{GIT_COMMIT}}
+工作区状态：{{GIT_STATE}}
+构建时间：{{BUILD_TIME}}
+
+构建环境
+--------
+{{DEPENDENCIES}}
+
+使用方法
+--------
+1. 必须完整复制或解压本目录，不能只发送或移动 AFC2.0.2alpha.exe。
+2. 外部软件须在本程序启动前，将 SampleData.csv 和 SampleData.txt 同时写入 EXE 所在目录。
+3. 启动 AFC2.0.2alpha.exe。程序只在启动阶段读取一次上述文件，运行期间不会轮询或热重载。
+4. 本目录必须可写；请勿放在 Program Files 等通常需要管理员权限的位置。
+5. 程序生成的结果文件和启动错误日志直接写入 EXE 所在目录，不创建 output 子目录；本机配置和运行状态仍分别写入 config、data/runtime。
+
+发布边界
+--------
+- 本发布版不包含机理辨识、PIT、SMIF、profile 前向预测和手动实测文件导入入口。
+- SampleData 文件缺失或无效时，程序应显示明确原因；工艺信息的过程域划分仍可独立使用。
+- 本目录中的 SHA256SUMS.txt 用于校验文件完整性，build-manifest.json 记录构建来源和依赖版本。

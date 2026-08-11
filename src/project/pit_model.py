@@ -2,6 +2,13 @@ from __future__ import annotations
 
 import time
 
+from .prediction_support import (
+    append_inverse_prediction_channels,
+    clip_nonnegative_numeric_array,
+    estimate_idle_noise_and_mrr_gate,
+    robust_sigma,
+    summarize_interval_kc_mode_statistics,
+)
 from .segmentation import STATE_CODE_BY_TYPE
 from .shared import *
 from matplotlib.collections import LineCollection
@@ -4176,6 +4183,7 @@ class PitModelMixin:
         )
 
     def _clip_nonnegative_numeric_array(self, values):
+        return clip_nonnegative_numeric_array(values)
         array = np.asarray(values, dtype=float).copy()
         negative_mask = np.isfinite(array) & (array < 0.0)
         if np.any(negative_mask):
@@ -7079,6 +7087,7 @@ class PitModelMixin:
         return abs(left_val - right_val) / scale
 
     def _robust_sigma(self, values):
+        return robust_sigma(values)
         finite = pd.to_numeric(pd.Series(values), errors='coerce').dropna().to_numpy(dtype=float)
         if finite.size == 0:
             return float("nan")
@@ -7118,6 +7127,7 @@ class PitModelMixin:
         return filtered if filtered.size > 0 else finite
 
     def _summarize_interval_kc_mode_statistics(self, values, precision=6):
+        return summarize_interval_kc_mode_statistics(values, precision=precision)
         arr = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(dtype=float)
         valid = arr[np.isfinite(arr) & (arr >= 0.0)]
         if valid.size == 0:
@@ -7509,6 +7519,14 @@ class PitModelMixin:
                 self.steady_gate_status_var.set("稳态门控: 未找到可用空载窗口，已退化为仅几何门控")
 
     def _estimate_idle_sigma_and_delta_mrr(self, sample_df, kc_reference=None):
+        try:
+            float(kc_reference)
+        except (TypeError, ValueError):
+            kc_reference = self._resolve_measurement_gate_reference_kc()
+        return estimate_idle_noise_and_mrr_gate(
+            sample_df,
+            kc_reference=kc_reference,
+        )
         mrr_values = pd.to_numeric(sample_df["mrr"], errors='coerce').fillna(0.0).to_numpy(dtype=float)
         ap_values = pd.to_numeric(sample_df["ap"], errors='coerce').fillna(0.0).to_numpy(dtype=float)
         ae_values = pd.to_numeric(sample_df["ae"], errors='coerce').fillna(0.0).to_numpy(dtype=float)
@@ -7565,6 +7583,14 @@ class PitModelMixin:
         return float(sigma_idle), float(delta_mrr), int(residuals.size), idle_mask
 
     def _append_manual_measurement_impedance(self, sample_df, sigma_idle, delta_mrr, idle_mask):
+        result = append_inverse_prediction_channels(
+            sample_df,
+            sigma_idle=sigma_idle,
+            delta_mrr=delta_mrr,
+            idle_mask=idle_mask,
+            ke_value=self.get_ke_value(),
+        )
+        return self._initialize_measurement_prediction_channels(result)
         sample_df = sample_df.copy()
         ap_values = pd.to_numeric(sample_df["ap"], errors='coerce').fillna(0.0).to_numpy(dtype=float)
         mrr_values = pd.to_numeric(sample_df["mrr"], errors='coerce').fillna(0.0).to_numpy(dtype=float)

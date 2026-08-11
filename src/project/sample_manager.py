@@ -4,7 +4,7 @@ from .shared import *
 
 
 class SampleManagerMixin:
-    _OPTIONAL_OVERLAY_SPINE_STEP_POINTS = 52.0
+    _OPTIONAL_OVERLAY_SPINE_STEP_POINTS = 56.0
     _OPTIONAL_OVERLAY_EDGE_PADDING_POINTS = 64.0
 
     def show_sample_preview(self):
@@ -535,10 +535,14 @@ class SampleManagerMixin:
             handles.extend(h_aux)
             labels.extend(l_aux)
 
-        filtered = [
-            (handle, label) for handle, label in zip(handles, labels)
-            if label and label != "_nolegend_"
-        ]
+        filtered = []
+        seen_labels = set()
+        for handle, label in zip(handles, labels):
+            normalized = str(label or "").strip()
+            if not normalized or normalized == "_nolegend_" or normalized in seen_labels:
+                continue
+            seen_labels.add(normalized)
+            filtered.append((handle, normalized))
         if not filtered:
             return None
 
@@ -1246,47 +1250,117 @@ class SampleManagerMixin:
         self.sample_data_source.set(default_value)
         self.load_sample_data(silent=False)
 
-    def _find_file_case_insensitive(self, directory, filename):
-        """在目录内按文件名大小写不敏感查找文件"""
+    def _find_files_case_insensitive(self, directory, filename):
+        """返回目录中与目标文件名大小写无关匹配的全部普通文件。"""
         if not directory or not filename:
-            return None
+            return []
+        target = str(filename).casefold()
+        matches = []
         try:
-            target = filename.lower()
-            for name in os.listdir(directory):
-                if name.lower() == target:
-                    return os.path.join(directory, name)
-        except Exception:
-            return None
-        return None
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if entry.name.casefold() == target and entry.is_file():
+                        matches.append(os.path.join(directory, entry.name))
+        except OSError:
+            return []
+        return sorted(matches, key=lambda path: os.path.basename(path))
 
-    def resolve_sampledata_files(self, base_dir):
+    def _find_file_case_insensitive(self, directory, filename):
+        """兼容旧调用：唯一匹配时返回路径，冲突时不任意选择。"""
+        matches = self._find_files_case_insensitive(directory, filename)
+        return matches[0] if len(matches) == 1 else None
+
+    def _validate_sampledata_input_file(self, file_path, display_name):
+        """在解析前确认文件存在、非空且当前可读取。"""
+        if not file_path or not os.path.isfile(file_path):
+            raise ValueError(f"缺少 {display_name}")
+        try:
+            if os.path.getsize(file_path) <= 0:
+                raise ValueError(f"{display_name} 为空文件")
+            with open(file_path, "rb") as stream:
+                if not stream.read(1):
+                    raise ValueError(f"{display_name} 为空文件")
+        except ValueError:
+            raise
+        except OSError as exc:
+            raise ValueError(f"{display_name} 当前不可读取或仍被占用：{exc}") from exc
+
+    def resolve_sampledata_files(self, base_dir, strict_root=False):
         """
         在目录中定位 SampleData.csv / SampleData.txt。
         兼容两种放置方式：
         1) 与工艺信息表同目录
         2) 放在同目录下的 SampleData 子目录
         """
+        self._sampledata_resolution_error = ""
         if not base_dir:
+            self._sampledata_resolution_error = "未提供 SampleData 目录"
             return None, None, None
-        candidates = [base_dir, os.path.join(base_dir, "SampleData")]
+        candidates = [base_dir]
+        if not strict_root:
+            candidates.append(os.path.join(base_dir, "SampleData"))
         for directory in candidates:
             if not os.path.isdir(directory):
                 continue
-            csv_path = self._find_file_case_insensitive(directory, "SampleData.csv")
-            txt_path = self._find_file_case_insensitive(directory, "SampleData.txt")
-            if csv_path and txt_path and os.path.exists(csv_path) and os.path.exists(txt_path):
+            csv_matches = self._find_files_case_insensitive(directory, "SampleData.csv")
+            txt_matches = self._find_files_case_insensitive(directory, "SampleData.txt")
+            conflicts = []
+            if len(csv_matches) > 1:
+                conflicts.append("SampleData.csv")
+            if len(txt_matches) > 1:
+                conflicts.append("SampleData.txt")
+            if conflicts:
+                self._sampledata_resolution_error = (
+                    "文件名冲突：同一目录存在多个仅大小写不同的 " + "、".join(conflicts)
+                )
+                return None, None, None
+            if len(csv_matches) == 1 and len(txt_matches) == 1:
+                csv_path, txt_path = csv_matches[0], txt_matches[0]
+                try:
+                    self._validate_sampledata_input_file(csv_path, "SampleData.csv")
+                    self._validate_sampledata_input_file(txt_path, "SampleData.txt")
+                except ValueError as exc:
+                    self._sampledata_resolution_error = str(exc)
+                    return None, None, None
                 return directory, csv_path, txt_path
+            if csv_matches or txt_matches:
+                missing = "SampleData.txt" if csv_matches else "SampleData.csv"
+                self._sampledata_resolution_error = f"文件对不完整：缺少 {missing}"
+                if strict_root:
+                    return None, None, None
+        self._sampledata_resolution_error = "未找到完整的 SampleData.csv 和 SampleData.txt 文件对"
         return None, None, None
 
     def load_sample_data_from_paths(self, csv_path, txt_path, silent=False, sample_dir=None):
         """从明确路径加载实测数据 SampleData.csv 与 SampleData.txt（不依赖工艺信息表路径）"""
         if not csv_path or not txt_path:
+            if bool(getattr(self, "release_mode", False)) and hasattr(self, "reset_sample_data_state"):
+                self.reset_sample_data_state()
             return False
         if not os.path.exists(csv_path) or not os.path.exists(txt_path):
+            if bool(getattr(self, "release_mode", False)) and hasattr(self, "reset_sample_data_state"):
+                self.reset_sample_data_state()
             if hasattr(self, "sample_auto_status_var"):
                 self.sample_auto_status_var.set("未找到SampleData.csv或SampleData.txt")
             if hasattr(self, "status_var_data"):
                 self.status_var_data.set("未发现实测数据文件，已跳过导入")
+            return False
+
+        try:
+            self._validate_sampledata_input_file(csv_path, "SampleData.csv")
+            self._validate_sampledata_input_file(txt_path, "SampleData.txt")
+        except ValueError as exc:
+            try:
+                self.reset_sample_data_state()
+            except Exception:
+                pass
+            reason = str(exc)
+            if not silent:
+                messagebox.showerror("SampleData读取失败", reason)
+            if hasattr(self, "sample_auto_status_var"):
+                self.sample_auto_status_var.set(reason)
+            if hasattr(self, "status_var_data"):
+                self.status_var_data.set(reason)
             return False
 
         if sample_dir is None:
@@ -1307,6 +1381,8 @@ class SampleManagerMixin:
         if hasattr(self, "_update_manual_kcke_button_text"):
             self._update_manual_kcke_button_text()
         self.sample_data_mode = "sampledata"
+        if bool(getattr(self, "release_mode", False)):
+            self.sample_data_source.set(1)
         self.sample_source_labels = ["电流", "VGpro功率", "边缘模块功率"]
         self.refresh_sample_source_labels()
         if hasattr(self, "sample_bundle_path_var"):
@@ -1324,6 +1400,11 @@ class SampleManagerMixin:
                 pass
 
             self.sample_programs = self.parse_sample_program_file(txt_path)
+            if not self.sample_programs or not any(
+                bool((program_info or {}).get("tools"))
+                for program_info in self.sample_programs.values()
+            ):
+                raise ValueError("SampleData.txt 未解析到有效程序或刀具范围")
             df = pd.read_csv(csv_path, header=None, usecols=[0, 1, 2, 3, 4], dtype={4: str})
             if df.shape[1] < 5:
                 if not silent:
@@ -1341,6 +1422,8 @@ class SampleManagerMixin:
             values = values[valid_mask]
             program_numbers = program_numbers[valid_mask]
             line_numbers = line_numbers[valid_mask].astype(int)
+            if line_numbers.size == 0:
+                raise ValueError("SampleData.csv 未解析到有效采样行")
             negative_value_mask = np.isfinite(values) & (values < 0)
             corrected_count = int(np.sum(negative_value_mask))
             if corrected_count > 0:
@@ -1401,9 +1484,9 @@ class SampleManagerMixin:
             if not silent:
                 messagebox.showerror("加载失败", f"读取实测数据时发生错误:\n{str(e)}")
             if hasattr(self, "sample_auto_status_var"):
-                self.sample_auto_status_var.set("实测数据导入失败")
+                self.sample_auto_status_var.set(f"实测数据导入失败：{str(e)}")
             if hasattr(self, "status_var_data"):
-                self.status_var_data.set("实测数据导入失败")
+                self.status_var_data.set(f"实测数据导入失败：{str(e)}；工艺信息仍可独立分析")
             return False
         finally:
             self._loading_sample_data = False
@@ -1872,7 +1955,7 @@ class SampleManagerMixin:
             messagebox.showwarning("无程序信息", "请先加载 SampleData.txt")
             return
         primary_file = self.get_primary_input_file()
-        # 统一保存到项目输出目录，避免生成文件散落在根目录。
+        # 源码研究版写项目 output/；冻结发布版直接写 EXE 同目录。
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         output_dir = str(OUTPUT_DIR)
         if not output_dir:

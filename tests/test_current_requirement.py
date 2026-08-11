@@ -139,6 +139,83 @@ class _MappingHarness(AcademicWorkbenchMixin):
         ]
 
 
+class _SequenceProjectionHarness(AcademicWorkbenchMixin):
+    """模拟工艺信息 N 列为空、但实际负载行程连续的发布场景。"""
+
+    def __init__(self):
+        self.data = [
+            {"line_no_raw": None, "_is_synthetic_fill": False}
+            for _index in range(6)
+        ]
+        self.sample_data_loaded = True
+        self.sample_data_line_numbers = np.arange(10, 22, dtype=int)
+        self.sample_data_point_indices = np.zeros(12, dtype=int)
+        self.sample_data_base_blocks = [(0, 11)]
+
+    @staticmethod
+    def _resolve_interval_process_bounds(record, process_rows=None):
+        return {
+            "start_idx": int(record["start_idx"]),
+            "end_idx": int(record["end_idx"]),
+        }
+
+    @staticmethod
+    def format_rg_line_point(line_number, point_index):
+        return f"{int(line_number)}.{int(point_index)}"
+
+    @staticmethod
+    def get_selected_program_number():
+        return "P1"
+
+    @staticmethod
+    def get_selected_tool_ranges():
+        return [(12, 19)]
+
+    def build_sample_mask(self, program_no=None, tool_ranges=None):
+        mask = np.zeros(12, dtype=bool)
+        mask[2:10] = True
+        return mask
+
+
+class _QuantizedProjectionHarness(AcademicWorkbenchMixin):
+    """模拟短过程区间落在两个实际采样点之间的精确行号映射。"""
+
+    def __init__(self):
+        self.data = [
+            {"line_no_raw": 20, "_is_synthetic_fill": False}
+            for _index in range(3)
+        ]
+        self.sample_data_line_numbers = np.full(6, 20, dtype=int)
+        self.sample_data_base_blocks = [(0, 5)]
+
+    def _get_segmentation_sample_lines(self):
+        return self.sample_data_line_numbers
+
+    def _get_current_sample_line_point_context(self, line_numbers=None):
+        return {
+            "point_indices": np.arange(6, dtype=int),
+            "x_positions": 20.0 + np.arange(6, dtype=float) / 6.0,
+        }
+
+    @staticmethod
+    def _resolve_interval_process_bounds(record, process_rows=None):
+        return {
+            "start_idx": int(record["start_idx"]),
+            "end_idx": int(record["end_idx"]),
+        }
+
+    @staticmethod
+    def _resolve_interval_process_x_bounds(record, process_bounds=None):
+        return {
+            "process_start_x": float(record["process_start_x"]),
+            "process_display_end_x": float(record["process_display_end_x"]),
+        }
+
+    @staticmethod
+    def format_rg_line_point(line_number, point_index):
+        return f"{int(line_number)}.{int(point_index)}"
+
+
 class _ValueVar:
     def __init__(self, value=""):
         self.value = value
@@ -604,6 +681,94 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
         pd.testing.assert_frame_equal(before_points, after_failure_points)
         pd.testing.assert_frame_equal(before_intervals, after_failure_intervals)
 
+        sequence_harness = _SequenceProjectionHarness()
+        sequence_records = [
+            {"interval_id": "SEG0001", "start_idx": 0, "end_idx": 1, "segment_type": "idle"},
+            {"interval_id": "SEG0002", "start_idx": 2, "end_idx": 3, "segment_type": "steady"},
+            {"interval_id": "SEG0003", "start_idx": 4, "end_idx": 5, "segment_type": "exit"},
+        ]
+        sequence_projection = sequence_harness._materialize_segmentation_sample_bounds(
+            sequence_records
+        )
+        self.assertEqual(
+            [(2, 3), (4, 6), (7, 9)],
+            [
+                (record["sample_start_idx"], record["sample_end_idx"])
+                for record in sequence_projection
+            ],
+        )
+        self.assertTrue(all(
+            record["mapping_source"] == "journey_order_ratio_missing_n"
+            for record in sequence_projection
+        ))
+        self.assertEqual(
+            list(range(2, 10)),
+            [
+                index
+                for record in sequence_projection
+                for index in range(
+                    record["sample_start_idx"],
+                    record["sample_end_idx"] + 1,
+                )
+            ],
+        )
+
+        partial_n_harness = _SequenceProjectionHarness()
+        partial_n_harness.data[0]["line_no_raw"] = 10
+        with self.assertRaisesRegex(ValueError, "N 行号部分缺失"):
+            partial_n_harness._materialize_segmentation_sample_bounds(sequence_records)
+
+        quantized_harness = _QuantizedProjectionHarness()
+        quantized_records = [
+            {
+                "interval_id": "SEG0001",
+                "start_idx": 0,
+                "end_idx": 0,
+                "segment_type": "idle",
+                "process_start_x": 20.0,
+                "process_display_end_x": 20.2,
+            },
+            {
+                "interval_id": "SEG0002",
+                "start_idx": 1,
+                "end_idx": 1,
+                "segment_type": "entry",
+                "process_start_x": 20.2,
+                "process_display_end_x": 20.21,
+            },
+            {
+                "interval_id": "SEG0003",
+                "start_idx": 2,
+                "end_idx": 2,
+                "segment_type": "steady",
+                "process_start_x": 20.21,
+                "process_display_end_x": 21.0,
+            },
+        ]
+        quantized_projection = quantized_harness._materialize_segmentation_sample_bounds(
+            quantized_records
+        )
+        self.assertEqual(3, len(quantized_projection))
+        self.assertTrue(all(
+            record["mapping_source"] == "program_line_and_point_order_quantized"
+            for record in quantized_projection
+        ))
+        self.assertTrue(all(
+            int(record["sample_count"]) >= 1
+            for record in quantized_projection
+        ))
+        self.assertEqual(
+            list(range(6)),
+            [
+                index
+                for record in quantized_projection
+                for index in range(
+                    record["sample_start_idx"],
+                    record["sample_end_idx"] + 1,
+                )
+            ],
+        )
+
         plotter = PlotSupportMixin()
         figure, axis = plt.subplots()
         try:
@@ -736,9 +901,9 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
             self.assertEqual(1, len(sample_figure.axes))
             line_labels = [line.get_label() for line in sample_axis.lines]
             self.assertIn("实际负载", line_labels)
-            self.assertIn("预测负载", line_labels)
+            self.assertNotIn("预测负载", line_labels)
             self.assertNotIn("程序 MRR", line_labels)
-            self.assertEqual(1, visualization.prediction_refresh_count)
+            self.assertEqual(0, visualization.prediction_refresh_count)
             actual_line = next(
                 line for line in sample_axis.lines if line.get_label() == "实际负载"
             )
@@ -755,7 +920,7 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
                 for path in artist.get_paths()
             ])
             self.assertAlmostEqual(
-                float(np.max(predicted_load)),
+                float(np.nanmax(actual_load)),
                 float(np.max(sample_fill_y)),
             )
             np.testing.assert_allclose(
@@ -763,7 +928,8 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
                     sample_fills,
                     visualization.sample_data_time_indices,
                 ),
-                predicted_load,
+                np.maximum(actual_load, 0.0),
+                equal_nan=True,
             )
             self.assertEqual(0.0, float(np.min(sample_fill_y)))
             self.assertEqual(0, len(sample_axis.patches))
@@ -773,7 +939,7 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
 
         visualization.progress = []
         self.assertTrue(visualization.generate_plots(silent=True))
-        self.assertEqual(1, visualization.prediction_refresh_count)
+        self.assertEqual(0, visualization.prediction_refresh_count)
         plt.close(visualization.figures[0])
 
         visualization.manual_measurement_data = {"actual_load": actual_load}
@@ -787,27 +953,9 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
         try:
             self.assertEqual(1, len(fallback_figure.axes))
             fallback_labels = [line.get_label() for line in fallback_axis.lines]
-            self.assertIn("程序 MRR", fallback_labels)
-            self.assertNotIn("实际负载", fallback_labels)
-            fallback_fills = [
-                artist
-                for artist in fallback_axis.collections
-                if isinstance(artist, PolyCollection)
-            ]
-            np.testing.assert_allclose(
-                _fill_heights_at_x(
-                    fallback_fills,
-                    (
-                        process_result.point_labels["path_start"].to_numpy(dtype=float)
-                        + process_result.point_labels["path_end"].to_numpy(dtype=float)
-                    )
-                    * 0.5,
-                ),
-                np.maximum(
-                    process_result.point_labels["MRR_program"].to_numpy(dtype=float),
-                    0.0,
-                ),
-            )
+            self.assertIn("实际负载", fallback_labels)
+            self.assertNotIn("预测负载", fallback_labels)
+            self.assertNotIn("程序 MRR", fallback_labels)
             self.assertEqual(0, len(fallback_axis.patches))
             self.assertEqual(100, visualization.progress[-1][0])
         finally:
@@ -822,13 +970,12 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
             stale_overview = export_dir / "sample_overview.png"
             stale_projection.write_text("旧投影", encoding="utf-8")
             stale_overview.write_bytes(b"old-overview")
-            with self.assertRaisesRegex(ValueError, "预测负载"):
-                visualization.export_latest_segmentation_result(
-                    process_result,
-                    export_dir,
-                )
-            self.assertFalse(stale_projection.exists())
-            self.assertFalse(stale_overview.exists())
+            visualization.export_latest_segmentation_result(
+                process_result,
+                export_dir,
+            )
+            self.assertTrue(stale_projection.exists())
+            self.assertTrue(stale_overview.exists())
             self.assertTrue((export_dir / "point_labels.csv").exists())
             self.assertTrue((export_dir / "intervals.csv").exists())
             self.assertTrue((export_dir / "overview.png").exists())
@@ -936,6 +1083,22 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
 
     def test_07_process_file_without_s_uses_gcode_geometry_or_sequence_fallback(self):
         harness = _ProcessPathHarness()
+        partial_n_rows = [
+            {"line_no_raw": 14, "gcode_content": "G0 X-35 Y-40", "_is_synthetic_fill": False},
+            {"line_no_raw": None, "gcode_content": "G0 X-35 Y-40", "_is_synthetic_fill": False},
+            {"line_no_raw": 19, "gcode_content": "G1 Z-0.5 F100", "_is_synthetic_fill": False},
+            {"line_no_raw": None, "gcode_content": "G1 Z-0.5 F100", "_is_synthetic_fill": False},
+        ]
+        line_diagnostics = harness._restore_missing_line_numbers_from_nc_profile(
+            partial_n_rows
+        )
+        self.assertEqual([14, 14, 19, 19], [row["line_no_raw"] for row in partial_n_rows])
+        self.assertEqual(
+            "input_with_gcode_group_completion",
+            line_diagnostics["line_number_source"],
+        )
+        self.assertEqual(2, line_diagnostics["gcode_group_completed_row_count"])
+
         header = "N,S(r/min),ap(mm),ae(mm),F(mm/min),MRR(mm3/min),G"
         parsed_header, layout = harness.parse_gcode_line(
             header,
@@ -1163,7 +1326,7 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
         self.assertTrue(visualization.generate_plots(silent=True))
         figure = visualization.figures[0]
         try:
-            self.assertEqual("功率与区间状态", figure.axes[0].get_title())
+            self.assertEqual("实际负载与区间划分", figure.axes[0].get_title())
             self.assertIn(id(figure), visualization._optional_overlay_contexts)
             self.assertEqual(1, len(figure.axes))
             visualization._current_preview_fig = figure
@@ -1210,8 +1373,8 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
                 line.get_label()
                 for line in toggled_figure.axes[0].lines
             ]
-            self.assertNotIn("实际负载", labels)
-            self.assertIn("预测负载", labels)
+            self.assertIn("实际负载", labels)
+            self.assertNotIn("预测负载", labels)
             state_fills = [
                 artist
                 for artist in toggled_figure.axes[0].collections
@@ -1234,6 +1397,17 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
             self.assertNotIn("预测负载", labels)
         finally:
             plt.close(prediction_hidden_figure)
+
+        visualization.manual_measurement_data = {"actual_load": actual_load}
+        visualization.display_prediction_to_generate = None
+        self.assertTrue(visualization.generate_plots(silent=True))
+        actual_only_figure = visualization.figures[0]
+        try:
+            labels = [line.get_label() for line in actual_only_figure.axes[0].lines]
+            self.assertIn("实际负载", labels)
+            self.assertNotIn("程序 MRR", labels)
+        finally:
+            plt.close(actual_only_figure)
 
         visualization.sample_data_mode = "sampledata"
         visualization.show_feed_overlay_var.set(True)

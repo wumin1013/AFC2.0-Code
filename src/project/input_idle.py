@@ -32,7 +32,9 @@ class InputIdleMixin:
         file_paths = [p for p in file_paths if p]
         self.input_file_paths = file_paths
         self.merged_input_file_path = ""
-        self.ensure_sample_data_matches_inputs(file_paths)
+        release_mode = bool(getattr(self, "release_mode", False))
+        if not release_mode:
+            self.ensure_sample_data_matches_inputs(file_paths)
         self.reset_processing_state()
         self._refresh_import_order_controls()
         if len(file_paths) >= 1:
@@ -62,21 +64,22 @@ class InputIdleMixin:
             else:
                 self.input_file_count_var.set(f"已选择 {len(file_paths)} 个工艺信息表（已按序号合并）")
             self.set_sample_controls_enabled(True, refresh=False)
-            sample_dir = self._resolve_input_source_dir(file_paths, effective_input_path)
-            resolved_dir, csv_path, txt_path = self.resolve_sampledata_files(sample_dir)
-            sample_files_ready = bool(resolved_dir and csv_path and txt_path)
-            if sample_files_ready:
-                sample_dir_norm = os.path.normcase(os.path.normpath(os.path.abspath(resolved_dir)))
-                current_sample_dir = ""
-                if self.sample_data_dir:
-                    current_sample_dir = os.path.normcase(os.path.normpath(os.path.abspath(self.sample_data_dir)))
-                if (not self.sample_data_loaded) or (not current_sample_dir) or (current_sample_dir != sample_dir_norm):
-                    self.load_sample_data_from_paths(csv_path, txt_path, silent=True, sample_dir=resolved_dir)
-            elif self.sample_data_loaded:
-                if hasattr(self, "sample_auto_status_var"):
-                    self.sample_auto_status_var.set("未找到SampleData，可手动导入实验实测文件；当前保留已加载实测数据")
-                if hasattr(self, "status_var_data"):
-                    self.status_var_data.set("未找到SampleData，可手动导入实验实测文件；当前保留已加载实测数据")
+            if not release_mode:
+                sample_dir = self._resolve_input_source_dir(file_paths, effective_input_path)
+                resolved_dir, csv_path, txt_path = self.resolve_sampledata_files(sample_dir)
+                sample_files_ready = bool(resolved_dir and csv_path and txt_path)
+                if sample_files_ready:
+                    sample_dir_norm = os.path.normcase(os.path.normpath(os.path.abspath(resolved_dir)))
+                    current_sample_dir = ""
+                    if self.sample_data_dir:
+                        current_sample_dir = os.path.normcase(os.path.normpath(os.path.abspath(self.sample_data_dir)))
+                    if (not self.sample_data_loaded) or (not current_sample_dir) or (current_sample_dir != sample_dir_norm):
+                        self.load_sample_data_from_paths(csv_path, txt_path, silent=True, sample_dir=resolved_dir)
+                elif self.sample_data_loaded:
+                    if hasattr(self, "sample_auto_status_var"):
+                        self.sample_auto_status_var.set("未找到SampleData，可手动导入实验实测文件；当前保留已加载实测数据")
+                    if hasattr(self, "status_var_data"):
+                        self.status_var_data.set("未找到SampleData，可手动导入实验实测文件；当前保留已加载实测数据")
             if self.sample_data_loaded:
                 self.show_sample_preview()
             else:
@@ -264,36 +267,66 @@ class InputIdleMixin:
         self.merged_input_file_path = merged_path
         return merged_path
 
-    def load_sample_bundle_from_dir(self, base_dir, silent=False):
+    def load_sample_bundle_from_dir(self, base_dir, silent=False, strict_root=None, clear_on_failure=None):
         """按目录自动加载 SampleData"""
-        resolved_dir, csv_path, txt_path = self.resolve_sampledata_files(base_dir)
+        release_mode = bool(getattr(self, "release_mode", False))
+        if strict_root is None:
+            strict_root = release_mode
+        if clear_on_failure is None:
+            clear_on_failure = release_mode
+        resolved_dir, csv_path, txt_path = self.resolve_sampledata_files(
+            base_dir,
+            strict_root=bool(strict_root),
+        )
         if not resolved_dir:
+            reason = str(
+                getattr(self, "_sampledata_resolution_error", "")
+                or "未找到完整的 SampleData.csv 和 SampleData.txt 文件对"
+            )
+            if clear_on_failure and hasattr(self, "reset_sample_data_state"):
+                self.reset_sample_data_state()
             if not silent:
-                messagebox.showerror(
-                    "文件缺失",
-                    "未找到 SampleData.csv 或 SampleData.txt（可放在同目录或 SampleData 子目录）\n可改用“导入实验实测”手动导入实验文件"
-                )
+                detail = reason
+                if not release_mode:
+                    detail += "\n可放在同目录或 SampleData 子目录，也可改用手动导入。"
+                messagebox.showerror("SampleData读取失败", detail)
             if hasattr(self, "sample_auto_status_var"):
-                self.sample_auto_status_var.set("未找到SampleData.csv或SampleData.txt，可手动导入实验实测文件")
+                self.sample_auto_status_var.set(f"SampleData未加载：{reason}")
             if hasattr(self, "status_var_data"):
-                self.status_var_data.set("未发现SampleData，已跳过自动导入；可手动导入实验实测文件")
+                self.status_var_data.set(f"SampleData未加载：{reason}；工艺信息仍可独立分析")
             return False
 
         if not self.load_sample_data_from_paths(csv_path, txt_path, silent=silent, sample_dir=resolved_dir):
             return False
 
+        sample_lines = getattr(self, "sample_data_line_numbers", None)
+        sample_count = len(sample_lines) if sample_lines is not None else 0
+        source_name = self.get_sample_data_source_name() if hasattr(self, "get_sample_data_source_name") else "VGpro功率"
         if hasattr(self, "sample_auto_status_var"):
-            self.sample_auto_status_var.set("SampleData已导入；请为程序选择工艺信息表")
+            self.sample_auto_status_var.set(
+                f"SampleData已导入：{sample_count} 点，实际负载源={source_name}，等待工艺映射"
+            )
         if hasattr(self, "status_var_data"):
-            self.status_var_data.set("已导入SampleData；请为程序选择工艺信息表")
+            self.status_var_data.set(
+                f"已从 {resolved_dir} 读取 SampleData（{sample_count} 点）；请导入工艺信息文件"
+            )
         return True
 
     def auto_load_sample_bundle(self):
         """启动后自动加载 SampleData 并自动执行处理"""
+        if bool(getattr(self, "_sampledata_startup_attempted", False)):
+            return
+        self._sampledata_startup_attempted = True
         if self.sample_data_loaded:
             return
-        # 从项目示例数据目录加载 SampleData（而非依赖当前工作目录）。
-        success = self.load_sample_bundle_from_dir(str(SAMPLE_DATA_DIR), silent=True)
+        release_mode = bool(getattr(self, "release_mode", False))
+        sample_root = PROJECT_ROOT if release_mode else SAMPLE_DATA_DIR
+        success = self.load_sample_bundle_from_dir(
+            str(sample_root),
+            silent=True,
+            strict_root=release_mode,
+            clear_on_failure=release_mode,
+        )
         if success and self.get_input_files():
             # 自动执行处理
             self.root.after(100, self._auto_process_after_load)

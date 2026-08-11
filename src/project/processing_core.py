@@ -902,6 +902,42 @@ class ProcessingCoreMixin:
             self.process_line_number_diagnostics = diagnostics
             return diagnostics
 
+        # AfoMilling 会把同一条 NC 指令细分为多个工艺点。部分细分点的 N
+        # 为空时，优先使用最后一列 G 代码把它归入同一连续指令组，并继承该组
+        # 已存在的物理行号；这比丢弃已有 N 后整体做比例映射更可靠。
+        group_known_lines = []
+        completed_group_row_count = 0
+        for group in groups:
+            known_lines = {
+                int(row.get("line_no_raw"))
+                for row in group["rows"]
+                if row.get("line_no_raw") is not None
+            }
+            if len(known_lines) > 1:
+                diagnostics["line_number_source"] = "partial_gcode_group_anchor_conflict"
+                for row in process_rows:
+                    row["line_number_source"] = diagnostics["line_number_source"]
+                self.process_line_number_diagnostics = diagnostics
+                return diagnostics
+            known_line = next(iter(known_lines), None)
+            group_known_lines.append(known_line)
+            if known_line is None:
+                continue
+            for row in group["rows"]:
+                if row.get("line_no_raw") is None:
+                    row["line_no_raw"] = int(known_line)
+                    row["line_number_source"] = "gcode_group_anchor"
+                    completed_group_row_count += 1
+
+        diagnostics["gcode_group_completed_row_count"] = int(completed_group_row_count)
+        missing_flags = [row.get("line_no_raw") is None for row in process_rows]
+        if not any(missing_flags):
+            diagnostics["line_number_source"] = "input_with_gcode_group_completion"
+            for row in process_rows:
+                row.setdefault("line_number_source", "input")
+            self.process_line_number_diagnostics = diagnostics
+            return diagnostics
+
         profile = getattr(self, "gcode_profile", None) or {}
         states = sorted(
             (
@@ -921,21 +957,6 @@ class ProcessingCoreMixin:
             (self._normalize_gcode_for_nc_line_match(state.get("line_text", "")), state)
             for state in states
         ]
-        group_known_lines = []
-        for group in groups:
-            known_lines = {
-                int(row.get("line_no_raw"))
-                for row in group["rows"]
-                if row.get("line_no_raw") is not None
-            }
-            if len(known_lines) > 1:
-                diagnostics["line_number_source"] = "partial_nc_anchor_conflict"
-                for row in process_rows:
-                    row["line_number_source"] = diagnostics["line_number_source"]
-                self.process_line_number_diagnostics = diagnostics
-                return diagnostics
-            group_known_lines.append(next(iter(known_lines), None))
-
         state_position_by_line = {
             int(state.get("file_line_index")): index
             for index, (_normalized, state) in enumerate(normalized_states)
@@ -1691,7 +1712,9 @@ class ProcessingCoreMixin:
     def reset_processing_state(self):
         """清理工艺信息表处理与预览状态"""
         self.data = []
-        self._clear_current_interval_state()
+        interval_state_clearer = getattr(self, "_clear_current_interval_state", None)
+        if callable(interval_state_clearer):
+            interval_state_clearer()
         self._latest_segmentation_result = None
         self._current_process_signature = ""
         self._current_mapping_signature = ""
@@ -1733,7 +1756,9 @@ class ProcessingCoreMixin:
         self._smif_focus_bounds = None
         self._smif_profile_process_rows_cache = None
         self._last_process_application_context = ""
-        self._reset_smif_runtime_cache()
+        smif_cache_resetter = getattr(self, "_reset_smif_runtime_cache", None)
+        if callable(smif_cache_resetter):
+            smif_cache_resetter()
         if self.sample_display_mode.get() == "program":
             self.sample_avg_var.set("-")
             self.sample_ideal_var.set("-")
@@ -1744,8 +1769,12 @@ class ProcessingCoreMixin:
             self.update_nav_buttons()
         except Exception:
             pass
-        self.refresh_pit_button_state()
-        self.refresh_smif_view()
+        pit_button_refresher = getattr(self, "refresh_pit_button_state", None)
+        if callable(pit_button_refresher):
+            pit_button_refresher()
+        smif_refresher = getattr(self, "refresh_smif_view", None)
+        if callable(smif_refresher):
+            smif_refresher()
         if hasattr(self, "refresh_main_pit_preview"):
             self.refresh_main_pit_preview()
         if hasattr(self, "refresh_prediction_metrics_summary"):

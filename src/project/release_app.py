@@ -5,18 +5,16 @@ from .analysis_export import AnalysisExportMixin
 from .config_state import ConfigStateMixin
 from .input_idle import InputIdleMixin
 from .interval_runtime import IntervalRuntimeMixin
-from .pit_model import PitModelMixin
 from .plot_support import PlotSupportMixin
 from .processing_core import ProcessingCoreMixin
 from .sample_manager import SampleManagerMixin
 from .ui_bootstrap import BootstrapUiMixin
 
 
-class MillingAnalysisTool(
+class AFCReleaseApplication(
     BootstrapUiMixin,
     AcademicWorkbenchMixin,
     InputIdleMixin,
-    PitModelMixin,
     IntervalRuntimeMixin,
     ProcessingCoreMixin,
     SampleManagerMixin,
@@ -24,6 +22,13 @@ class MillingAnalysisTool(
     AnalysisExportMixin,
     ConfigStateMixin,
 ):
-    """模块化后的铣削工艺信息分析工具主类。"""
+    """AFC2.0.2alpha 多文件发布版主类（不含 PIT/SMIF 混入层）。"""
 
-    pass
+    release_mode = True
+    enable_research_features = False
+    enable_profile_config = False
+
+# 供启动器和外部冒烟测试使用的稳定名称。
+MillingAnalysisTool = AFCReleaseApplication
+
+__all__ = ["AFCReleaseApplication", "MillingAnalysisTool"]

@@ -299,10 +299,27 @@ class AcademicWorkbenchMixin:
         else:
             self._segmentation_sample_projection_records = []
 
+        mapping_source = str(
+            records[0].get("mapping_source", "")
+            if records
+            else ""
+        ).strip()
+        if mapping_source == "journey_order_ratio_missing_n":
+            valid_status_text = (
+                f"采样映射: 成功（{len(records)} 段；"
+                "按行程顺序比例映射，N列缺失）"
+            )
+        elif mapping_source == "program_line_and_point_order_quantized":
+            valid_status_text = (
+                f"采样映射: 成功（{len(records)} 段；"
+                "短区间按相邻采样点量化）"
+            )
+        else:
+            valid_status_text = f"采样映射: 成功（{len(records)} 段）"
         status_text = {
             "not_available": "采样映射: 未导入实际采样文件",
             "pending": "采样映射: 待建立",
-            "valid": f"采样映射: 成功（{len(records)} 段）",
+            "valid": valid_status_text,
             "failed": f"采样映射: 失败（{reason or '未知原因'}）",
         }.get(status, f"采样映射: {status}")
         status_var = getattr(self, "sample_mapping_status_var", None)
@@ -333,7 +350,9 @@ class AcademicWorkbenchMixin:
                     ),
                     "projected_sample_start_idx": int(records[0]["sample_start_idx"]),
                     "projected_sample_end_idx": int(records[-1]["sample_end_idx"]),
-                    "mapping_source": "program_line_and_point_order",
+                    "mapping_source": (
+                        mapping_source or "program_line_and_point_order"
+                    ),
                 }
             else:
                 diagnostics["sample_projection"] = {
@@ -349,21 +368,177 @@ class AcademicWorkbenchMixin:
             refresh_export_state()
         return status
 
+    def _get_current_sample_projection_indices(self, sample_lines):
+        """返回当前程序/刀具用于区间投影的连续采样点索引。"""
+
+        sample_count = int(np.asarray(sample_lines).size)
+        if sample_count <= 0:
+            raise ValueError("实际负载文件没有可用采样点")
+        selected_mask = np.ones(sample_count, dtype=bool)
+        mask_builder = getattr(self, "build_sample_mask", None)
+        if callable(mask_builder):
+            try:
+                program_getter = getattr(self, "get_selected_program_number", None)
+                program_no = program_getter() if callable(program_getter) else None
+                range_getter = getattr(self, "get_selected_tool_ranges", None)
+                tool_ranges = range_getter() if callable(range_getter) else None
+                candidate = mask_builder(program_no, tool_ranges)
+                if candidate is not None:
+                    candidate = np.asarray(candidate, dtype=bool).reshape(-1)
+                    if candidate.size != sample_count:
+                        raise ValueError("当前程序/刀具掩码与实际采样数量不一致")
+                    selected_mask = candidate
+            except ValueError:
+                raise
+            except Exception:
+                selected_mask = np.ones(sample_count, dtype=bool)
+
+        selected_indices = np.flatnonzero(selected_mask)
+        if selected_indices.size == 0:
+            raise ValueError("当前程序/刀具在实际负载中没有有效采样点")
+        if selected_indices.size > 1 and np.any(np.diff(selected_indices) != 1):
+            raise ValueError(
+                "当前程序/刀具的实际采样点不是单一连续行程，无法按顺序比例映射"
+            )
+        return selected_indices.astype(int, copy=False)
+
+    def _materialize_segmentation_sample_bounds_by_sequence(
+        self,
+        process_records,
+        sample_lines,
+    ):
+        """N 列缺失时，按过程点和当前采样行程的相对顺序投影。"""
+
+        selected_indices = self._get_current_sample_projection_indices(sample_lines)
+        process_bounds = []
+        previous_end = None
+        for record in process_records:
+            interval_id = record.get("interval_id") or record.get("zone_id") or "未知区间"
+            bounds = self._resolve_interval_process_bounds(record)
+            if not bounds:
+                raise ValueError(f"区间 {interval_id} 缺少有效的过程边界")
+            start_idx = int(bounds["start_idx"])
+            end_idx = int(bounds["end_idx"])
+            if end_idx < start_idx:
+                raise ValueError(f"区间 {interval_id} 的过程边界顺序无效")
+            if previous_end is not None and start_idx != previous_end + 1:
+                raise ValueError("六态过程区间存在空洞或重叠，无法按行程顺序投影")
+            process_bounds.append((start_idx, end_idx))
+            previous_end = end_idx
+
+        if not process_bounds:
+            return []
+        process_start = int(process_bounds[0][0])
+        process_end_exclusive = int(process_bounds[-1][1]) + 1
+        process_count = process_end_exclusive - process_start
+        sample_count = int(selected_indices.size)
+        if process_count <= 0:
+            raise ValueError("六态过程范围为空，无法按行程顺序投影")
+
+        process_boundaries = np.asarray(
+            [start for start, _end in process_bounds] + [process_end_exclusive],
+            dtype=float,
+        )
+        relative_boundaries = process_boundaries - float(process_start)
+        sample_cuts = np.floor(
+            relative_boundaries * float(sample_count) / float(process_count)
+        ).astype(int)
+        sample_cuts[0] = 0
+        sample_cuts[-1] = sample_count
+        sample_cuts = np.clip(sample_cuts, 0, sample_count)
+        if np.any(np.diff(sample_cuts) <= 0):
+            raise ValueError(
+                "实际采样点少于区间顺序投影所需点数，无法保证每个区间均有采样点"
+            )
+
+        point_indices = np.asarray(
+            getattr(self, "sample_data_point_indices", []),
+            dtype=int,
+        ).reshape(-1)
+        if point_indices.size != sample_lines.size:
+            blocks = list(getattr(self, "sample_data_base_blocks", None) or [])
+            point_builder = getattr(self, "compute_line_point_indices", None)
+            if callable(point_builder):
+                point_indices = np.asarray(
+                    point_builder(sample_lines, blocks=blocks),
+                    dtype=int,
+                ).reshape(-1)
+        if point_indices.size != sample_lines.size:
+            point_indices = np.zeros(sample_lines.size, dtype=int)
+
+        materialized = []
+        for record, cut_start, cut_end in zip(
+            process_records,
+            sample_cuts[:-1],
+            sample_cuts[1:],
+        ):
+            start_idx = int(selected_indices[int(cut_start)])
+            end_idx = int(selected_indices[int(cut_end) - 1])
+            start_line = int(sample_lines[start_idx])
+            end_line = int(sample_lines[end_idx])
+            start_point = int(point_indices[start_idx])
+            end_point = int(point_indices[end_idx])
+            start_label = self.format_rg_line_point(start_line, start_point)
+            end_label = self.format_rg_line_point(end_line, end_point)
+            current = dict(record)
+            current.update(
+                {
+                    "sample_start_idx": start_idx,
+                    "sample_end_idx": end_idx,
+                    "sample_start_line": start_line,
+                    "sample_end_line": end_line,
+                    "sample_start_point_index": start_point,
+                    "sample_end_point_index": end_point,
+                    "sample_start_label": start_label,
+                    "sample_end_label": end_label,
+                    "sample_interval_range": f"{start_label}-{end_label}",
+                    "sample_count": end_idx - start_idx + 1,
+                    "mapping_source": "journey_order_ratio_missing_n",
+                    "mapping_description": "按行程顺序比例映射（N列缺失）",
+                }
+            )
+            materialized.append(current)
+
+        expected_start = int(selected_indices[0])
+        expected_end = int(selected_indices[-1])
+        next_start = expected_start
+        for record in materialized:
+            start_idx = int(record["sample_start_idx"])
+            end_idx = int(record["sample_end_idx"])
+            if start_idx != next_start or end_idx < start_idx:
+                raise ValueError("按行程顺序投影后的采样区间存在空洞或重叠")
+            next_start = end_idx + 1
+        if next_start - 1 != expected_end:
+            raise ValueError("按行程顺序投影未完整覆盖当前程序/刀具实际负载")
+        return materialized
+
     def _materialize_segmentation_sample_bounds(self, records):
         """按过程边界把六态结果投影为实际负载的零基采样区间。"""
         sample_lines = self._get_segmentation_sample_lines()
         if not getattr(self, "data", None):
             raise ValueError("尚未处理工艺信息，无法投影实际采样点区间")
-        missing_raw = [
+        process_records = [dict(record) for record in records or [] if isinstance(record, dict)]
+        if not process_records:
+            return []
+        process_row_indices = [
             idx
             for idx, row in enumerate(self.data)
-            if isinstance(row, dict)
-            and not bool(row.get("_is_synthetic_fill"))
-            and row.get("line_no_raw") is None
+            if isinstance(row, dict) and not bool(row.get("_is_synthetic_fill"))
         ]
+        missing_raw = [
+            idx
+            for idx in process_row_indices
+            if self.data[idx].get("line_no_raw") is None
+        ]
+        if process_row_indices and len(missing_raw) == len(process_row_indices):
+            return self._materialize_segmentation_sample_bounds_by_sequence(
+                process_records,
+                sample_lines,
+            )
         if missing_raw:
             raise ValueError(
-                "工艺信息缺少真实程序行号；请提供 N 列或先加载匹配的 NC 文件"
+                "工艺信息 N 行号部分缺失；为保留已有行号的优先对齐语义，"
+                "请补齐 N 列或绑定原始 NC 文件后重试"
             )
 
         context = self._get_current_sample_line_point_context(line_numbers=sample_lines)
@@ -373,10 +548,6 @@ class AcademicWorkbenchMixin:
         sample_x = np.asarray(context.get("x_positions", []), dtype=float)
         if point_indices.size != sample_lines.size or sample_x.size != sample_lines.size:
             raise ValueError("实际负载的点号或坐标数量与采样数量不一致")
-
-        process_records = [dict(record) for record in records or [] if isinstance(record, dict)]
-        if not process_records:
-            return []
 
         process_starts = []
         previous_process_end = -1
@@ -467,6 +638,38 @@ class AcademicWorkbenchMixin:
         local_cuts = np.clip(local_cuts, local_domain_start, local_domain_end).astype(int)
         if np.any(np.diff(local_cuts) < 0):
             raise ValueError("六态采样切分点未保持单调")
+        interval_count = len(process_records)
+        available_sample_count = int(local_domain_end - local_domain_start)
+        if available_sample_count < interval_count:
+            raise ValueError(
+                "六态过程区间数多于可用实际采样点，无法保证每个区间至少对应一个采样点"
+            )
+
+        # 过程域短区间可能恰好落在两个实际采样点之间，导致相邻切分点重合。
+        # 在总体采样数充足时，将内部边界确定性地量化到相邻采样切点，既保持
+        # 全覆盖和区间顺序，也避免因为一个无落点的微小区间放弃整条实际曲线。
+        original_cuts = local_cuts.copy()
+        local_cuts[0] = int(local_domain_start)
+        local_cuts[-1] = int(local_domain_end)
+        for boundary_index in range(1, interval_count):
+            minimum_cut = int(local_cuts[boundary_index - 1]) + 1
+            remaining_intervals = interval_count - boundary_index
+            maximum_cut = int(local_domain_end) - remaining_intervals
+            local_cuts[boundary_index] = min(
+                max(int(original_cuts[boundary_index]), minimum_cut),
+                maximum_cut,
+            )
+        quantized_boundary_count = int(np.count_nonzero(local_cuts != original_cuts))
+        mapping_source = (
+            "program_line_and_point_order_quantized"
+            if quantized_boundary_count
+            else "program_line_and_point_order"
+        )
+        mapping_description = (
+            "按程序行号与点内顺序映射（短区间按相邻采样点量化）"
+            if quantized_boundary_count
+            else "按程序行号与点内顺序精确映射"
+        )
 
         pair_counts = {}
         for line_no, point_idx in zip(sample_lines, point_indices):
@@ -509,6 +712,9 @@ class AcademicWorkbenchMixin:
                     "sample_end_label": end_label,
                     "sample_interval_range": f"{start_label}-{end_label}",
                     "sample_count": end_idx - start_idx + 1,
+                    "mapping_source": mapping_source,
+                    "mapping_description": mapping_description,
+                    "quantized_boundary_count": quantized_boundary_count,
                 }
             )
 
@@ -2047,6 +2253,13 @@ class AcademicWorkbenchMixin:
         return mask_arr
 
     def _build_sampledata_prediction_payload(self):
+        """按应用模式选择 SampleData 预测策略。"""
+        strategy = getattr(self, "_build_sampledata_prediction_payload_for_mode", None)
+        if callable(strategy):
+            return strategy()
+        return self._build_forward_sampledata_prediction_payload()
+
+    def _build_forward_sampledata_prediction_payload(self):
         if getattr(self, "sample_data_mode", "") != "sampledata":
             return None
         if not self.sample_data_loaded or self.sample_data_values is None or not self.data:

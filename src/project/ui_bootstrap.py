@@ -66,6 +66,13 @@ class BootstrapUiMixin:
 
     def __init__(self, root):
         self.root = root
+        self.release_mode = bool(getattr(self, "release_mode", False))
+        self.enable_research_features = bool(
+            getattr(self, "enable_research_features", not self.release_mode)
+        )
+        self.enable_profile_config = bool(
+            getattr(self, "enable_profile_config", not self.release_mode)
+        )
         self.root.title("🔬 铣削工艺信息分析工具 - 智能分析系统")
         
         # 配置科技感主题样式
@@ -147,12 +154,16 @@ class BootstrapUiMixin:
         self.steady_gate_status_var = tk.StringVar(value="稳态门控: 未计算")
         self.segmentation_status_var = tk.StringVar(value="过程域六类划分: 未运行")
         self.sample_mapping_status_var = tk.StringVar(value="采样映射: 未导入实际采样文件")
+        self.interval_count_var = tk.StringVar(value="0")
+        self.interval_overview_success_var = tk.StringVar(value="当前划分：未运行")
+        self.interval_overview_total_var = tk.StringVar(value="总区间数：0")
+        self.interval_overview_counts_var = tk.StringVar(
+            value="六类数量：空载 0 | 进刀 0 | 稳态 0 | 过渡 0 | 退刀 0 | 非稳态 0"
+        )
+        self.interval_overview_mapping_var = tk.StringVar(value="采样映射：未导入实际采样文件")
         self.model_detail_collapsed = tk.BooleanVar(value=True)
         self.model_detail_toggle_text = tk.StringVar(value="展开详情")
-        self.interval_detail_collapsed = tk.BooleanVar(value=True)
-        self.interval_detail_toggle_text = tk.StringVar(value="展开显示设置")
         self._model_detail_widgets = []
-        self._interval_detail_widgets = []
         self.idle_power_model = None
         self.idle_model_signature = ""
         self.step_feed_model_signature = ""
@@ -186,8 +197,6 @@ class BootstrapUiMixin:
         self._current_mapping_signature = ""
         self._sample_mapping_status = "not_available"
         self._segmentation_sample_projection_records = []
-        self._ideal_tree_interval_payloads = {}
-        self._selected_interval_detail_item = ""
         self.pit_records = []
         self._process_model_state_version = 0
         self._last_process_application_context = ""
@@ -318,8 +327,11 @@ class BootstrapUiMixin:
         # 值: {"rg": float, "updated_at": str (ISO格式)}
         # 理想值 = 均值 × rg，运行时计算，不持久化
         self.ideal_store: Dict[Tuple[str, str], Dict] = {}
-        # 可变配置、运行状态、案例配置和输出均以项目根目录为基准分类存放。
-        for directory in (CONFIG_DIR, RUNTIME_DATA_DIR, PROFILE_DIR, PROFILE_CACHE_DIR, OUTPUT_DIR):
+        # 源码研究版写入 output/；冻结发布版的 OUTPUT_DIR 就是 EXE 所在目录。
+        runtime_directories = [CONFIG_DIR, RUNTIME_DATA_DIR, OUTPUT_DIR]
+        if self.enable_profile_config:
+            runtime_directories.extend((PROFILE_DIR, PROFILE_CACHE_DIR))
+        for directory in runtime_directories:
             directory.mkdir(parents=True, exist_ok=True)
         self.ideal_store_path = str(RUNTIME_DATA_DIR / "ideal_store.json")
         self.config_path = str(CONFIG_DIR / "app_config.json")
@@ -369,12 +381,14 @@ class BootstrapUiMixin:
         # 创建工艺信息分析标签页
         self.data_processing_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.data_processing_tab, text="工艺信息分析")
-        self.smif_pit_tab = ttk.Frame(self.notebook)
-        self.notebook.add(self.smif_pit_tab, text="PIT / SMIF")
+        if self.enable_research_features:
+            self.smif_pit_tab = ttk.Frame(self.notebook)
+            self.notebook.add(self.smif_pit_tab, text="PIT / SMIF")
 
         # 创建界面
         self.create_data_processing_tab()
-        self.create_smif_pit_tab()
+        if self.enable_research_features:
+            self.create_smif_pit_tab()
         # self.create_steady_state_tab()  # 已合并到工艺信息分析页
         
         # 初始化图表
@@ -383,7 +397,8 @@ class BootstrapUiMixin:
         
         # 添加窗口大小变化监听器
         self.root.bind("<Configure>", self.on_window_resize)
-        self.notebook.bind("<<NotebookTabChanged>>", self._on_main_notebook_tab_changed)
+        if self.enable_research_features:
+            self.notebook.bind("<<NotebookTabChanged>>", self._on_main_notebook_tab_changed)
         
         # 延迟调用图表大小自适应，确保所有组件都已创建完成
         self.root.after(100, self.adjust_figure_sizes)
@@ -426,18 +441,18 @@ class BootstrapUiMixin:
         # 优化子图边距以居中对称显示，数据占2/3以上
         self.fig_data.subplots_adjust(left=0.10, right=0.90, top=0.94, bottom=0.08)
         
-        # ⚠️ data_figure_frame 使用 grid 布局，这里必须用 grid，不能 pack
-        # 先清空占位内容，避免 grid/pack 混用报错（必须在创建新画布之前清空）
+        # 工具栏必须跨重绘持久存在，因此只替换专用画布容器中的内容。
+        canvas_parent = getattr(self, "data_plot_canvas_frame", self.data_figure_frame)
         try:
-            for w in self.data_figure_frame.winfo_children():
+            for w in canvas_parent.winfo_children():
                 w.destroy()
-            self.data_figure_frame.grid_rowconfigure(0, weight=1)
-            self.data_figure_frame.grid_columnconfigure(0, weight=1)
+            canvas_parent.grid_rowconfigure(0, weight=1)
+            canvas_parent.grid_columnconfigure(0, weight=1)
         except Exception:
             pass
         
         # 创建画布（在清空旧控件之后）
-        self.canvas_data = FigureCanvasTkAgg(self.fig_data, master=self.data_figure_frame)
+        self.canvas_data = FigureCanvasTkAgg(self.fig_data, master=canvas_parent)
         canvas_widget = self.canvas_data.get_tk_widget()
         canvas_widget.grid(row=0, column=0, sticky="nsew")
         canvas_widget.configure(relief=tk.FLAT, bd=0)
@@ -505,11 +520,17 @@ class BootstrapUiMixin:
             requested_h = int(controls.winfo_reqheight())
             if total_h <= 10 or requested_h <= 0:
                 return
-            minimum_preview_h = 260
-            baseline_ratio = 0.38 if bool(self.model_detail_collapsed.get()) and bool(self.interval_detail_collapsed.get()) else 0.46
-            baseline_h = int(total_h * baseline_ratio)
-            target_h = max(requested_h + 12, baseline_h)
-            target_h = max(220, min(target_h, max(total_h - minimum_preview_h, 220)))
+            minimum_preview_h = 300
+            if not self.enable_research_features:
+                # 发布版没有机理辨识区，按控件自然高度收拢，避免上半区
+                # 被固定比例撑出大块空白。
+                target_h = max(150, requested_h + 8)
+            else:
+                baseline_ratio = 0.36 if bool(self.model_detail_collapsed.get()) else 0.46
+                baseline_h = int(total_h * baseline_ratio)
+                target_h = max(requested_h + 12, baseline_h, 220)
+            maximum_controls_h = max(total_h - minimum_preview_h, 150)
+            target_h = min(target_h, maximum_controls_h)
             paned.sashpos(0, target_h)
             self.root.after_idle(self.adjust_figure_sizes)
         except Exception:
@@ -518,7 +539,6 @@ class BootstrapUiMixin:
     def _adapt_data_processing_layout(self):
         controls = getattr(self, "_data_controls", None)
         detail_frame = getattr(self, "ideal_detail_frame", None)
-        ideal_tree = getattr(self, "ideal_tree", None)
         if controls is None or detail_frame is None:
             return
         try:
@@ -529,29 +549,17 @@ class BootstrapUiMixin:
             if total_w <= 10:
                 return
             if total_w >= 1850:
-                detail_width = 900
+                detail_width = 510
             elif total_w >= 1600:
-                detail_width = 820
+                detail_width = 470
             elif total_w >= 1360:
-                detail_width = 720
+                detail_width = 440
             else:
-                detail_width = 620
+                detail_width = 400
             controls.grid_columnconfigure(1, weight=0, minsize=detail_width)
             detail_frame.configure(width=detail_width)
-            if ideal_tree is not None:
-                tree_width = max(detail_width - 24, 560)
-                ideal_tree.column("#0", width=max(int(tree_width * 0.18), 130), minwidth=110, stretch=True)
-                grouped_widths = {
-                    "process": max(int(tree_width * 0.24), 180),
-                    "sample": max(int(tree_width * 0.24), 180),
-                    "x_span": max(int(tree_width * 0.16), 120),
-                    "summary": max(int(tree_width * 0.28), 200),
-                }
-                for key, width in grouped_widths.items():
-                    try:
-                        ideal_tree.column(key, width=width, minwidth=max(int(width * 0.7), 80), stretch=True)
-                    except Exception:
-                        pass
+            for label in getattr(self, "interval_overview_labels", ()):
+                label.configure(wraplength=max(detail_width - 30, 280))
         except Exception:
             pass
 
@@ -565,19 +573,185 @@ class BootstrapUiMixin:
     def _toggle_model_detail_section(self):
         self._set_model_detail_collapsed(not bool(self.model_detail_collapsed.get()))
 
-    def _set_interval_detail_collapsed(self, collapsed):
-        collapsed = bool(collapsed)
-        self.interval_detail_collapsed.set(collapsed)
-        self.interval_detail_toggle_text.set("展开显示设置" if collapsed else "收起显示设置")
-        self._set_grid_widgets_visible(getattr(self, "_interval_detail_widgets", []), not collapsed)
-        self.root.after_idle(self._sync_data_controls_preview_ratio)
+    def _create_research_model_controls(self, parent, row):
+        """创建仅研究版可用的机理辨识区。
 
-    def _toggle_interval_detail_section(self):
-        self._set_interval_detail_collapsed(not bool(self.interval_detail_collapsed.get()))
+        发布版不调用本方法，从而不实例化辨识、profile 或 PIT 相关控件。
+        """
+        model_frame = ttk.LabelFrame(parent, text="🧠 机理辨识", padding=8, style='Tech.TLabelframe')
+        model_frame.grid(row=row, column=0, sticky="ew", pady=(0, 6))
+        model_frame.grid_columnconfigure(7, weight=1)
+        model_frame.grid_columnconfigure(9, weight=1)
+
+        model_action_frame = ttk.Frame(model_frame)
+        model_action_frame.grid(row=0, column=0, columnspan=10, sticky="ew", pady=(0, 6))
+        model_action_frame.grid_columnconfigure(4, weight=1)
+
+        self.import_nc_btn = ttk.Button(
+            model_action_frame, text="📄 导入G代码NC(可选)", command=self.browse_nc_file,
+            width=16, style='Tech.TButton'
+        )
+        self.import_nc_btn.grid(row=0, column=0, padx=(0, 6), pady=(0, 6), sticky="w")
+        self.identify_idle_btn = ttk.Button(
+            model_action_frame, text="🌀 辨识空载功率", command=self.identify_no_load_power,
+            width=14, style='Tech.TButton'
+        )
+        self.identify_idle_btn.grid(row=0, column=1, padx=(0, 6), pady=(0, 6), sticky="w")
+        self.identify_model_btn = ttk.Button(
+            model_action_frame, text="🔁 重新辨识", command=self.identify_model_parameters,
+            width=13, style='Tech.TButton'
+        )
+        self.identify_model_btn.grid(row=0, column=2, padx=(0, 6), pady=(0, 6), sticky="w")
+        self.identify_model_btn.bind(
+            "<ButtonPress-1>",
+            lambda _event: self._arm_model_param_commit_refresh_suppression(duration_seconds=1.2),
+            add="+",
+        )
+        self.pit_display_btn = ttk.Button(
+            model_action_frame, text="📋 PIT显示", command=self.show_pit_dialog,
+            width=11, style='Secondary.TButton', state="disabled"
+        )
+        self.pit_display_btn.grid(row=0, column=3, padx=(0, 6), pady=(0, 6), sticky="w")
+        self.model_detail_toggle_btn = ttk.Button(
+            model_action_frame, textvariable=self.model_detail_toggle_text,
+            command=self._toggle_model_detail_section, width=10, style='Secondary.TButton'
+        )
+        self.model_detail_toggle_btn.grid(row=0, column=5, padx=(6, 0), pady=(0, 6), sticky="e")
+
+        model_option_frame = ttk.Frame(model_frame)
+        model_option_frame.grid(row=1, column=0, columnspan=10, sticky="ew", pady=(0, 4))
+        model_option_frame.grid_columnconfigure(2, weight=1)
+        self.lock_ke_check = tk.Checkbutton(
+            model_option_frame, textvariable=self.lock_ke_check_text,
+            variable=self.lock_ke_during_identification, command=self.on_identification_mode_changed,
+            font=UI_FONT_NORMAL, bg=UI_COLOR_BG_LIGHT, fg=UI_COLOR_TEXT,
+            activebackground=UI_COLOR_BG_LIGHT, activeforeground=UI_COLOR_PRIMARY,
+            selectcolor="white", relief=tk.FLAT, bd=0, highlightthickness=0, anchor="w",
+        )
+        self.lock_ke_check.grid(row=0, column=0, padx=(0, 10), pady=(0, 6), sticky="w")
+        self._refresh_lock_ke_check_text()
+        self.lock_idle_check = tk.Checkbutton(
+            model_option_frame, textvariable=self.lock_idle_check_text,
+            variable=self.lock_idle_during_identification, command=self.on_identification_mode_changed,
+            font=UI_FONT_NORMAL, bg=UI_COLOR_BG_LIGHT, fg=UI_COLOR_TEXT,
+            activebackground=UI_COLOR_BG_LIGHT, activeforeground=UI_COLOR_PRIMARY,
+            selectcolor="white", relief=tk.FLAT, bd=0, highlightthickness=0, anchor="w",
+        )
+        self.lock_idle_check.grid(row=0, column=1, padx=(0, 10), pady=(0, 6), sticky="w")
+        self._refresh_lock_idle_check_text()
+        self.model_detail_hint_label = ttk.Label(
+            model_option_frame, text="导入NC后自动匹配参数配置；辨识完成后可选择覆盖或另存",
+            font=UI_FONT_SMALL, foreground=UI_COLOR_TEXT_MUTED,
+        )
+        self.model_detail_hint_label.grid(row=0, column=2, pady=(0, 6), sticky="e")
+
+        ttk.Label(model_frame, text="P_idle(W):", font=UI_FONT_NORMAL).grid(row=2, column=0, sticky="w", padx=(0, 4))
+        self.p_idle_entry = ttk.Entry(model_frame, textvariable=self.p_idle_var, width=10, font=UI_FONT_NORMAL)
+        self.p_idle_entry.grid(row=2, column=1, sticky="w", padx=(0, 10))
+        self.p_idle_entry.bind("<Return>", self.on_model_param_commit)
+        self.p_idle_entry.bind("<FocusOut>", self.on_model_param_commit)
+        ttk.Label(model_frame, text="全局K_c:", font=UI_FONT_NORMAL).grid(row=2, column=2, sticky="w", padx=(0, 4))
+        self.kc_entry = ttk.Entry(model_frame, textvariable=self.kc_coeff, width=10, font=UI_FONT_NORMAL)
+        self.kc_entry.grid(row=2, column=3, sticky="w", padx=(0, 10))
+        self.kc_entry.bind("<Return>", self.on_model_param_commit)
+        self.kc_entry.bind("<FocusOut>", self.on_model_param_commit)
+        ttk.Label(model_frame, text="全局K_e:", font=UI_FONT_NORMAL).grid(row=2, column=4, sticky="w", padx=(0, 4))
+        self.ke_entry = ttk.Entry(model_frame, textvariable=self.ke_coeff, width=10, font=UI_FONT_NORMAL)
+        self.ke_entry.grid(row=2, column=5, sticky="w", padx=(0, 10))
+        self.ke_entry.bind("<Return>", self.on_model_param_commit)
+        self.ke_entry.bind("<FocusOut>", self.on_model_param_commit)
+        ttk.Label(model_frame, text="程序空载:", font=UI_FONT_NORMAL).grid(row=2, column=6, sticky="w", padx=(0, 4))
+        self.program_idle_summary_entry = ttk.Entry(
+            model_frame, textvariable=self.current_program_idle_power_display,
+            width=30, font=UI_FONT_NORMAL, state="readonly"
+        )
+        self.program_idle_summary_entry.grid(row=2, column=7, sticky="ew", padx=(0, 6))
+        self.program_idle_detail_btn = ttk.Button(
+            model_frame, text="📊 查看明细", command=self.show_program_idle_detail_dialog,
+            width=12, style='Secondary.TButton', state="disabled"
+        )
+        self.program_idle_detail_btn.grid(row=2, column=8, sticky="w")
+
+        self.sigma_idle_label = ttk.Label(model_frame, text="σ_idle(W):", font=UI_FONT_NORMAL)
+        self.sigma_idle_label.grid(row=3, column=0, sticky="w", padx=(0, 4))
+        self.sigma_idle_entry = ttk.Entry(
+            model_frame, textvariable=self.sigma_idle_var, width=14, font=UI_FONT_NORMAL, state="readonly"
+        )
+        self.sigma_idle_entry.grid(row=3, column=1, sticky="w", padx=(0, 10))
+        self.delta_mrr_label = ttk.Label(model_frame, text="δ_MRR:", font=UI_FONT_NORMAL)
+        self.delta_mrr_label.grid(row=3, column=2, sticky="w", padx=(0, 4))
+        self.delta_mrr_entry = ttk.Entry(
+            model_frame, textvariable=self.delta_mrr_var, width=14, font=UI_FONT_NORMAL, state="readonly"
+        )
+        self.delta_mrr_entry.grid(row=3, column=3, sticky="w", padx=(0, 10))
+        self.steady_gate_status_label = ttk.Label(
+            model_frame, textvariable=self.steady_gate_status_var,
+            font=UI_FONT_SMALL, foreground=UI_COLOR_TEXT_MUTED
+        )
+        self.steady_gate_status_label.grid(row=3, column=4, columnspan=5, sticky="w", pady=(2, 0))
+        self.gcode_status_label = ttk.Label(
+            model_frame, textvariable=self.gcode_status_var,
+            font=UI_FONT_SMALL, foreground=UI_COLOR_TEXT_MUTED
+        )
+        self.gcode_status_label.grid(row=4, column=0, columnspan=10, sticky="w", pady=(2, 0))
+        self.no_load_status_label = ttk.Label(
+            model_frame, textvariable=self.no_load_status_var,
+            font=UI_FONT_SMALL, foreground=UI_COLOR_TEXT_MUTED
+        )
+        self.no_load_status_label.grid(row=5, column=0, columnspan=10, sticky="w", pady=(2, 0))
+        self.step_feed_status_label = ttk.Label(
+            model_frame, textvariable=self.step_feed_status_var,
+            font=UI_FONT_SMALL, foreground=UI_COLOR_TEXT_MUTED
+        )
+        self.step_feed_status_label.grid(row=6, column=0, columnspan=10, sticky="w", pady=(2, 0))
+        self.kc_profile_status_label = ttk.Label(
+            model_frame, textvariable=self.kc_profile_status_var,
+            font=UI_FONT_SMALL, foreground=UI_COLOR_TEXT_MUTED
+        )
+        self.kc_profile_status_label.grid(row=7, column=0, columnspan=10, sticky="w", pady=(2, 0))
+        self._model_detail_widgets = [
+            self.model_detail_hint_label, self.sigma_idle_label, self.sigma_idle_entry,
+            self.delta_mrr_label, self.delta_mrr_entry, self.steady_gate_status_label,
+            self.gcode_status_label, self.no_load_status_label, self.step_feed_status_label,
+            self.kc_profile_status_label,
+        ]
+
+        self.idle_curve_frame = ttk.LabelFrame(
+            model_frame, text="P_idle-S 图", padding=(6, 4), style='Tech.TLabelframe'
+        )
+        self.idle_curve_frame.grid(row=8, column=0, columnspan=10, sticky="ew", pady=(8, 0))
+        self.idle_curve_frame.grid_columnconfigure(0, weight=1)
+        self.idle_curve_frame.grid_rowconfigure(1, weight=1)
+        self.idle_curve_hint_label = ttk.Label(
+            self.idle_curve_frame,
+            text="导入空载辨识文件后显示 P_idle-S 关系；导入 NC 后会叠加当前 G 代码转速",
+            font=UI_FONT_SMALL, foreground=UI_COLOR_TEXT_MUTED,
+        )
+        self.idle_curve_hint_label.grid(row=0, column=0, sticky="w", pady=(0, 4))
+        self.fig_idle_curve, self.ax_idle_curve = plt.subplots(figsize=(6.2, 2.35), dpi=90)
+        self.fig_idle_curve.patch.set_facecolor(PLOT_FIG_BG)
+        self.ax_idle_curve.set_facecolor(PLOT_AX_BG)
+        self.fig_idle_curve.subplots_adjust(left=0.08, right=0.985, top=0.88, bottom=0.24)
+        self.canvas_idle_curve = FigureCanvasTkAgg(self.fig_idle_curve, master=self.idle_curve_frame)
+        idle_canvas_widget = self.canvas_idle_curve.get_tk_widget()
+        idle_canvas_widget.grid(row=1, column=0, sticky="ew")
+        idle_canvas_widget.configure(relief=tk.FLAT, bd=0)
+        if not self.idle_curve_visible:
+            self.idle_curve_frame.grid_remove()
+
+    def _create_plot_option_checkbutton(self, parent, text, variable, command, row, column):
+        """创建图形工具栏中样式一致的勾选项。"""
+        button = tk.Checkbutton(
+            parent, text=text, variable=variable, command=command,
+            font=UI_FONT_SMALL, bg=UI_COLOR_BG_LIGHT, fg=UI_COLOR_TEXT,
+            activebackground=UI_COLOR_BG_LIGHT, activeforeground=UI_COLOR_PRIMARY,
+            selectcolor="white", relief=tk.FLAT, bd=0, highlightthickness=0, anchor="w",
+        )
+        button.grid(row=row, column=column, sticky="e", padx=(6, 0), pady=1)
+        return button
 
     def create_data_processing_tab(self):
-        """工艺信息分析页面：科技蓝+白色风格，布局参考用户图片
-        布局：上方当前程序 -> 中间平均功率+区间分析 -> 右侧稳态区间详情 -> 下方图表预览"""
+        """工艺信息分析页面：主操作与图形显示分离的精简布局。"""
         # 页面总体：0=主体(可伸缩)，1=进度条，2=状态栏
         self.data_processing_tab.grid_columnconfigure(0, weight=1)
         self.data_processing_tab.grid_rowconfigure(0, weight=1)
@@ -598,7 +772,7 @@ class BootstrapUiMixin:
 
         # ===== 控件区布局 =====
         controls.grid_columnconfigure(0, weight=1)  # 左侧控件区自适应
-        controls.grid_columnconfigure(1, weight=0, minsize=620)  # 右侧详情区保留足够阅读宽度
+        controls.grid_columnconfigure(1, weight=0, minsize=340)
 
         # ===== 左侧主控件区 =====
         left_frame = ttk.Frame(controls)
@@ -628,228 +802,26 @@ class BootstrapUiMixin:
 
         self.sample_source_buttons = []
 
-        self.import_sample_btn = ttk.Button(
-            program_frame, text="📦 导入SampleData", command=self.browse_sample_bundle,
-            width=15, style='Tech.TButton'
-        )
-        self.import_sample_btn.grid(row=0, column=4, padx=(12, 6), sticky="w")
+        if self.enable_research_features:
+            self.import_sample_btn = ttk.Button(
+                program_frame, text="📦 导入SampleData", command=self.browse_sample_bundle,
+                width=15, style='Tech.TButton'
+            )
+            self.import_sample_btn.grid(row=0, column=4, padx=(12, 6), sticky="w")
+            self.import_experiment_btn = ttk.Button(
+                program_frame, text="📡 导入实验实测", command=self.browse_experiment_measurement_file,
+                width=15, style='Tech.TButton'
+            )
+            self.import_experiment_btn.grid(row=0, column=5, sticky="w")
 
-        self.import_experiment_btn = ttk.Button(
-            program_frame, text="📡 导入实验实测", command=self.browse_experiment_measurement_file,
-            width=15, style='Tech.TButton'
-        )
-        self.import_experiment_btn.grid(row=0, column=5, sticky="w")
-
-        # ===== 第二行：机理辨识 =====
-        model_frame = ttk.LabelFrame(left_frame, text="🧠 机理辨识", padding=8, style='Tech.TLabelframe')
-        model_frame.grid(row=1, column=0, sticky="ew", pady=(0, 6))
-        model_frame.grid_columnconfigure(7, weight=1)
-        model_frame.grid_columnconfigure(9, weight=1)
-
-        model_action_frame = ttk.Frame(model_frame)
-        model_action_frame.grid(row=0, column=0, columnspan=10, sticky="ew", pady=(0, 6))
-        model_action_frame.grid_columnconfigure(4, weight=1)
-
-        self.import_nc_btn = ttk.Button(
-            model_action_frame, text="📄 导入G代码NC(可选)", command=self.browse_nc_file, width=16, style='Tech.TButton'
-        )
-        self.import_nc_btn.grid(row=0, column=0, padx=(0, 6), pady=(0, 6), sticky="w")
-
-        self.identify_idle_btn = ttk.Button(
-            model_action_frame, text="🌀 辨识空载功率", command=self.identify_no_load_power, width=14, style='Tech.TButton'
-        )
-        self.identify_idle_btn.grid(row=0, column=1, padx=(0, 6), pady=(0, 6), sticky="w")
-
-        self.identify_model_btn = ttk.Button(
-            model_action_frame, text="🔁 重新辨识", command=self.identify_model_parameters, width=13, style='Tech.TButton'
-        )
-        self.identify_model_btn.grid(row=0, column=2, padx=(0, 6), pady=(0, 6), sticky="w")
-        self.identify_model_btn.bind(
-            "<ButtonPress-1>",
-            lambda _event: self._arm_model_param_commit_refresh_suppression(duration_seconds=1.2),
-            add="+",
-        )
-
-        self.pit_display_btn = ttk.Button(
-            model_action_frame, text="📋 PIT显示", command=self.show_pit_dialog, width=11, style='Secondary.TButton',
-            state="disabled"
-        )
-        self.pit_display_btn.grid(row=0, column=3, padx=(0, 6), pady=(0, 6), sticky="w")
-
-        self.model_detail_toggle_btn = ttk.Button(
-            model_action_frame,
-            textvariable=self.model_detail_toggle_text,
-            command=self._toggle_model_detail_section,
-            width=10,
-            style='Secondary.TButton'
-        )
-        self.model_detail_toggle_btn.grid(row=0, column=5, padx=(6, 0), pady=(0, 6), sticky="e")
-
-        model_option_frame = ttk.Frame(model_frame)
-        model_option_frame.grid(row=1, column=0, columnspan=10, sticky="ew", pady=(0, 4))
-        model_option_frame.grid_columnconfigure(2, weight=1)
-
-        self.lock_ke_check = tk.Checkbutton(
-            model_option_frame,
-            textvariable=self.lock_ke_check_text,
-            variable=self.lock_ke_during_identification,
-            command=self.on_identification_mode_changed,
-            font=UI_FONT_NORMAL,
-            bg=UI_COLOR_BG_LIGHT,
-            fg=UI_COLOR_TEXT,
-            activebackground=UI_COLOR_BG_LIGHT,
-            activeforeground=UI_COLOR_PRIMARY,
-            selectcolor="white",
-            relief=tk.FLAT,
-            bd=0,
-            highlightthickness=0,
-            anchor="w",
-        )
-        self.lock_ke_check.grid(row=0, column=0, padx=(0, 10), pady=(0, 6), sticky="w")
-        self._refresh_lock_ke_check_text()
-
-        self.lock_idle_check = tk.Checkbutton(
-            model_option_frame,
-            textvariable=self.lock_idle_check_text,
-            variable=self.lock_idle_during_identification,
-            command=self.on_identification_mode_changed,
-            font=UI_FONT_NORMAL,
-            bg=UI_COLOR_BG_LIGHT,
-            fg=UI_COLOR_TEXT,
-            activebackground=UI_COLOR_BG_LIGHT,
-            activeforeground=UI_COLOR_PRIMARY,
-            selectcolor="white",
-            relief=tk.FLAT,
-            bd=0,
-            highlightthickness=0,
-            anchor="w",
-        )
-        self.lock_idle_check.grid(row=0, column=1, padx=(0, 10), pady=(0, 6), sticky="w")
-        self._refresh_lock_idle_check_text()
-
-        self.model_detail_hint_label = ttk.Label(
-            model_option_frame,
-            text="导入NC后自动匹配参数配置；辨识完成后可选择覆盖或另存",
-            font=UI_FONT_SMALL,
-            foreground=UI_COLOR_TEXT_MUTED,
-        )
-        self.model_detail_hint_label.grid(row=0, column=2, padx=(0, 0), pady=(0, 6), sticky="e")
-
-        ttk.Label(model_frame, text="P_idle(W):", font=UI_FONT_NORMAL).grid(row=2, column=0, sticky="w", padx=(0, 4))
-        self.p_idle_entry = ttk.Entry(model_frame, textvariable=self.p_idle_var, width=10, font=UI_FONT_NORMAL)
-        self.p_idle_entry.grid(row=2, column=1, sticky="w", padx=(0, 10))
-        self.p_idle_entry.bind("<Return>", self.on_model_param_commit)
-        self.p_idle_entry.bind("<FocusOut>", self.on_model_param_commit)
-
-        ttk.Label(model_frame, text="全局K_c:", font=UI_FONT_NORMAL).grid(row=2, column=2, sticky="w", padx=(0, 4))
-        self.kc_entry = ttk.Entry(model_frame, textvariable=self.kc_coeff, width=10, font=UI_FONT_NORMAL)
-        self.kc_entry.grid(row=2, column=3, sticky="w", padx=(0, 10))
-        self.kc_entry.bind("<Return>", self.on_model_param_commit)
-        self.kc_entry.bind("<FocusOut>", self.on_model_param_commit)
-
-        ttk.Label(model_frame, text="全局K_e:", font=UI_FONT_NORMAL).grid(row=2, column=4, sticky="w", padx=(0, 4))
-        self.ke_entry = ttk.Entry(model_frame, textvariable=self.ke_coeff, width=10, font=UI_FONT_NORMAL)
-        self.ke_entry.grid(row=2, column=5, sticky="w", padx=(0, 10))
-        self.ke_entry.bind("<Return>", self.on_model_param_commit)
-        self.ke_entry.bind("<FocusOut>", self.on_model_param_commit)
-
-        ttk.Label(model_frame, text="程序空载:", font=UI_FONT_NORMAL).grid(row=2, column=6, sticky="w", padx=(0, 4))
-        self.program_idle_summary_entry = ttk.Entry(
-            model_frame, textvariable=self.current_program_idle_power_display,
-            width=30, font=UI_FONT_NORMAL, state="readonly"
-        )
-        self.program_idle_summary_entry.grid(row=2, column=7, sticky="ew", padx=(0, 6))
-
-        self.program_idle_detail_btn = ttk.Button(
-            model_frame, text="📊 查看明细", command=self.show_program_idle_detail_dialog,
-            width=12, style='Secondary.TButton', state="disabled"
-        )
-        self.program_idle_detail_btn.grid(row=2, column=8, sticky="w")
-
-        self.sigma_idle_label = ttk.Label(model_frame, text="σ_idle(W):", font=UI_FONT_NORMAL)
-        self.sigma_idle_label.grid(row=3, column=0, sticky="w", padx=(0, 4))
-        self.sigma_idle_entry = ttk.Entry(
-            model_frame, textvariable=self.sigma_idle_var, width=14, font=UI_FONT_NORMAL, state="readonly"
-        )
-        self.sigma_idle_entry.grid(row=3, column=1, sticky="w", padx=(0, 10))
-
-        self.delta_mrr_label = ttk.Label(model_frame, text="δ_MRR:", font=UI_FONT_NORMAL)
-        self.delta_mrr_label.grid(row=3, column=2, sticky="w", padx=(0, 4))
-        self.delta_mrr_entry = ttk.Entry(
-            model_frame, textvariable=self.delta_mrr_var, width=14, font=UI_FONT_NORMAL, state="readonly"
-        )
-        self.delta_mrr_entry.grid(row=3, column=3, sticky="w", padx=(0, 10))
-
-        self.steady_gate_status_label = ttk.Label(
-            model_frame, textvariable=self.steady_gate_status_var, font=UI_FONT_SMALL,
-            foreground=UI_COLOR_TEXT_MUTED
-        )
-        self.steady_gate_status_label.grid(row=3, column=4, columnspan=5, sticky="w", pady=(2, 0))
-
-        self.gcode_status_label = ttk.Label(
-            model_frame, textvariable=self.gcode_status_var, font=UI_FONT_SMALL,
-            foreground=UI_COLOR_TEXT_MUTED
-        )
-        self.gcode_status_label.grid(row=4, column=0, columnspan=10, sticky="w", pady=(2, 0))
-        self.no_load_status_label = ttk.Label(
-            model_frame, textvariable=self.no_load_status_var, font=UI_FONT_SMALL,
-            foreground=UI_COLOR_TEXT_MUTED
-        )
-        self.no_load_status_label.grid(row=5, column=0, columnspan=10, sticky="w", pady=(2, 0))
-        self.step_feed_status_label = ttk.Label(
-            model_frame, textvariable=self.step_feed_status_var, font=UI_FONT_SMALL,
-            foreground=UI_COLOR_TEXT_MUTED
-        )
-        self.step_feed_status_label.grid(row=6, column=0, columnspan=10, sticky="w", pady=(2, 0))
-        self.kc_profile_status_label = ttk.Label(
-            model_frame, textvariable=self.kc_profile_status_var, font=UI_FONT_SMALL,
-            foreground=UI_COLOR_TEXT_MUTED
-        )
-        self.kc_profile_status_label.grid(row=7, column=0, columnspan=10, sticky="w", pady=(2, 0))
-
-        self._model_detail_widgets = [
-            self.model_detail_hint_label,
-            self.sigma_idle_label,
-            self.sigma_idle_entry,
-            self.delta_mrr_label,
-            self.delta_mrr_entry,
-            self.steady_gate_status_label,
-            self.gcode_status_label,
-            self.no_load_status_label,
-            self.step_feed_status_label,
-            self.kc_profile_status_label,
-        ]
-
-        self.idle_curve_frame = ttk.LabelFrame(
-            model_frame, text="P_idle-S 图", padding=(6, 4), style='Tech.TLabelframe'
-        )
-        self.idle_curve_frame.grid(row=8, column=0, columnspan=10, sticky="ew", pady=(8, 0))
-        self.idle_curve_frame.grid_columnconfigure(0, weight=1)
-        self.idle_curve_frame.grid_rowconfigure(1, weight=1)
-
-        self.idle_curve_hint_label = ttk.Label(
-            self.idle_curve_frame,
-            text="导入空载辨识文件后显示 P_idle-S 关系；导入 NC 后会叠加当前 G 代码转速",
-            font=UI_FONT_SMALL,
-            foreground=UI_COLOR_TEXT_MUTED,
-        )
-        self.idle_curve_hint_label.grid(row=0, column=0, sticky="w", pady=(0, 4))
-
-        self.fig_idle_curve, self.ax_idle_curve = plt.subplots(figsize=(6.2, 2.35), dpi=90)
-        self.fig_idle_curve.patch.set_facecolor(PLOT_FIG_BG)
-        self.ax_idle_curve.set_facecolor(PLOT_AX_BG)
-        self.fig_idle_curve.subplots_adjust(left=0.08, right=0.985, top=0.88, bottom=0.24)
-
-        self.canvas_idle_curve = FigureCanvasTkAgg(self.fig_idle_curve, master=self.idle_curve_frame)
-        idle_canvas_widget = self.canvas_idle_curve.get_tk_widget()
-        idle_canvas_widget.grid(row=1, column=0, sticky="ew")
-        idle_canvas_widget.configure(relief=tk.FLAT, bd=0)
-        if not self.idle_curve_visible:
-            self.idle_curve_frame.grid_remove()
-
+        next_left_row = 1
+        if self.enable_research_features:
+            self._create_research_model_controls(left_frame, row=next_left_row)
+            next_left_row += 1
         # ===== 第三行：平均功率信息（无框头） =====
         power_frame = ttk.Frame(left_frame, padding=(8, 4))
-        power_frame.grid(row=2, column=0, sticky="ew", pady=(0, 6))
+        power_frame.grid(row=next_left_row, column=0, sticky="ew", pady=(0, 6))
+        next_left_row += 1
 
         # 平均功率显示
         ttk.Label(power_frame, text="⚡ 平均功率:", font=UI_FONT_BOLD, foreground=UI_COLOR_PRIMARY).pack(
@@ -884,312 +856,67 @@ class BootstrapUiMixin:
                                             font=UI_FONT_BOLD, foreground="#E67300")
         self.sample_ideal_label.pack(side=tk.LEFT)
 
-        # ===== 第四行：区间分析 =====
-        interval_frame = ttk.LabelFrame(left_frame, text="📐 区间分析", padding=8, style='Tech.TLabelframe')
-        interval_frame.grid(row=3, column=0, sticky="ew", pady=(0, 6))
-        interval_frame.grid_columnconfigure(4, weight=1)
-
-        # 第一行：最小样本点(已取消)、区间数量、[弹性空间]、导入工艺信息文件、保存结果
-        self.pred_power_min_length_label = ttk.Label(interval_frame, text="最小样本点(已取消):", font=UI_FONT_NORMAL)
-        self.pred_power_min_length_label.grid(row=0, column=0, sticky="w", padx=(0, 4))
-        self.pred_power_min_length_entry = ttk.Entry(interval_frame, textvariable=self.pred_power_min_length,
-                                                     width=10, font=UI_FONT_NORMAL)
-        self.pred_power_min_length_entry.grid(row=0, column=1, padx=(0, 20), sticky="w")
-        self.pred_power_min_length_entry.state(["disabled"])
-
-        # 区间数量显示
-        ttk.Label(interval_frame, text="区间数量:", font=UI_FONT_NORMAL).grid(row=0, column=2, sticky="w", padx=(0, 4))
-        self.interval_count_var = tk.StringVar(value="0")
-        self.interval_count_label = ttk.Label(interval_frame, textvariable=self.interval_count_var,
-                                             font=UI_FONT_BOLD, foreground="#2E7D32")
-        self.interval_count_label.grid(row=0, column=3, sticky="w", padx=(0, 20))
-
-        self.interval_detail_toggle_btn = ttk.Button(
-            interval_frame,
-            textvariable=self.interval_detail_toggle_text,
-            command=self._toggle_interval_detail_section,
-            width=14,
-            style='Secondary.TButton'
-        )
-        self.interval_detail_toggle_btn.grid(row=0, column=4, padx=(0, 8), sticky="e")
-
-        self.run_segmentation_btn = ttk.Button(
-            interval_frame,
-            text="🧭 全行程六类划分",
-            command=lambda: self.run_full_path_segmentation(export_outputs=False),
-            width=18,
-            style='Tech.TButton',
-        )
-        self.run_segmentation_btn.grid(row=0, column=5, padx=(0, 8), sticky="e")
-
-        # 导入工艺信息文件按钮（支持多选合并）
+        # 独立主操作栏：分类在导入工艺信息后自动执行，不再提供手动划分入口。
+        action_frame = ttk.Frame(left_frame, padding=(8, 6))
+        action_frame.grid(row=next_left_row, column=0, sticky="ew", pady=(0, 6))
+        action_frame.grid_columnconfigure(2, weight=1)
         self.choose_process_btn = ttk.Button(
-            interval_frame, text="📂 导入工艺信息文件",
+            action_frame, text="📂 导入工艺信息文件",
             command=self.choose_process_file_for_current_program,
             width=20, style='Orange.TButton'
         )
-        self.choose_process_btn.grid(row=0, column=6, padx=(0, 8), sticky="e")
-
-        # 保存结果按钮（橙色强调）- 移到最右边
-        self.export_i_code_btn = ttk.Button(interval_frame, text="💾 保存结果", 
-                                            command=self.save_interval_info, width=12,
-                                            style='Orange.TButton',
-                                            state="disabled")
-        self.export_i_code_btn.grid(row=0, column=7, sticky="e")
-
-        # 第二行：显示方式切换按钮
-        plot_switch_frame = ttk.Frame(interval_frame)
-        plot_switch_frame.grid(row=1, column=0, columnspan=8, pady=(8, 0), sticky="ew")
-        plot_switch_frame.grid_columnconfigure(0, weight=1)
-        plot_mode_row = ttk.Frame(plot_switch_frame)
-        plot_mode_row.grid(row=0, column=0, sticky="w")
-        overlay_row = ttk.Frame(plot_switch_frame)
-        overlay_row.grid(row=1, column=0, sticky="w", pady=(6, 0))
-
-        ttk.Label(plot_mode_row, text="图表预览:", font=UI_FONT_SMALL).pack(side=tk.LEFT, padx=(0, 6))
-        self.overlay_btn = ttk.Button(plot_mode_row, text="● 叠加显示", width=12,
-                                      style='Secondary.TButton', command=lambda: self._set_plot_mode("overlay"))
-        self.overlay_btn.pack(side=tk.LEFT, padx=2)
-        self.stacked_btn = ttk.Button(plot_mode_row, text="● 上下显示", width=12,
-                                      style='Secondary.TButton', command=lambda: self._set_plot_mode("stacked"))
-        self.stacked_btn.pack(side=tk.LEFT, padx=2)
-
-        ttk.Label(plot_mode_row, text="横轴:", font=UI_FONT_SMALL).pack(side=tk.LEFT, padx=(12, 6))
+        self.choose_process_btn.grid(row=0, column=0, padx=(0, 8), sticky="w")
+        self.export_i_code_btn = ttk.Button(
+            action_frame, text="💾 保存结果", command=self.save_interval_info,
+            width=12, style='Orange.TButton', state="disabled"
+        )
+        self.export_i_code_btn.grid(row=0, column=1, padx=(0, 12), sticky="w")
+        ttk.Label(action_frame, text="横轴:", font=UI_FONT_SMALL).grid(
+            row=0, column=3, padx=(8, 6), sticky="e"
+        )
         ttk.Radiobutton(
-            plot_mode_row, text="时域+指令域", variable=self.process_axis_mode, value="时域+指令域",
+            action_frame, text="时域+指令域", variable=self.process_axis_mode, value="时域+指令域",
             command=self.on_sample_selection_change, style='Tech.TRadiobutton'
-        ).pack(side=tk.LEFT, padx=(0, 4))
+        ).grid(row=0, column=4, padx=(0, 4), sticky="e")
         ttk.Radiobutton(
-            plot_mode_row, text="行程域+指令域", variable=self.process_axis_mode, value="行程域+指令域",
+            action_frame, text="行程域+指令域", variable=self.process_axis_mode, value="行程域+指令域",
             command=self.on_sample_selection_change, style='Tech.TRadiobutton'
-        ).pack(side=tk.LEFT, padx=(0, 8))
-
-        ttk.Label(overlay_row, text="附加曲线:", font=UI_FONT_SMALL).pack(side=tk.LEFT, padx=(0, 6))
-        self.show_measured_curve_btn = tk.Checkbutton(
-            overlay_row,
-            text="显示实测",
-            variable=self.show_measured_curve_var,
-            command=self.on_sample_selection_change,
-            font=UI_FONT_SMALL,
-            bg=UI_COLOR_BG_LIGHT,
-            fg=UI_COLOR_TEXT,
-            activebackground=UI_COLOR_BG_LIGHT,
-            activeforeground=UI_COLOR_PRIMARY,
-            selectcolor="white",
-            relief=tk.FLAT,
-            bd=0,
-            highlightthickness=0,
-            anchor="w",
+        ).grid(row=0, column=5, sticky="e")
+        # ===== 右侧：只读区间划分概况 =====
+        ideal_frame = ttk.LabelFrame(
+            controls, text="📌 区间划分详情", padding=10, style='Tech.TLabelframe'
         )
-        self.show_measured_curve_btn.pack(side=tk.LEFT, padx=(0, 6))
-        self.show_reconstructed_curve_btn = tk.Checkbutton(
-            overlay_row,
-            text="显示预测负载",
-            variable=self.show_reconstructed_curve_var,
-            command=self.on_sample_selection_change,
-            font=UI_FONT_SMALL,
-            bg=UI_COLOR_BG_LIGHT,
-            fg=UI_COLOR_TEXT,
-            activebackground=UI_COLOR_BG_LIGHT,
-            activeforeground=UI_COLOR_PRIMARY,
-            selectcolor="white",
-            relief=tk.FLAT,
-            bd=0,
-            highlightthickness=0,
-            anchor="w",
-        )
-        self.show_reconstructed_curve_btn.pack(side=tk.LEFT, padx=(0, 6))
-        self.show_feed_overlay_btn = tk.Checkbutton(
-            overlay_row,
-            text="显示F",
-            variable=self.show_feed_overlay_var,
-            command=self.on_optional_overlay_toggle,
-            font=UI_FONT_SMALL,
-            bg=UI_COLOR_BG_LIGHT,
-            fg=UI_COLOR_TEXT,
-            activebackground=UI_COLOR_BG_LIGHT,
-            activeforeground=UI_COLOR_PRIMARY,
-            selectcolor="white",
-            relief=tk.FLAT,
-            bd=0,
-            highlightthickness=0,
-            anchor="w",
-        )
-        self.show_feed_overlay_btn.pack(side=tk.LEFT, padx=(0, 6))
-        self.show_speed_overlay_btn = tk.Checkbutton(
-            overlay_row,
-            text="显示S",
-            variable=self.show_speed_overlay_var,
-            command=self.on_optional_overlay_toggle,
-            font=UI_FONT_SMALL,
-            bg=UI_COLOR_BG_LIGHT,
-            fg=UI_COLOR_TEXT,
-            activebackground=UI_COLOR_BG_LIGHT,
-            activeforeground=UI_COLOR_PRIMARY,
-            selectcolor="white",
-            relief=tk.FLAT,
-            bd=0,
-            highlightthickness=0,
-            anchor="w",
-        )
-        self.show_speed_overlay_btn.pack(side=tk.LEFT, padx=(0, 6))
-        self.show_ap_overlay_btn = tk.Checkbutton(
-            overlay_row,
-            text="显示ap",
-            variable=self.show_ap_overlay_var,
-            command=self.on_optional_overlay_toggle,
-            font=UI_FONT_SMALL,
-            bg=UI_COLOR_BG_LIGHT,
-            fg=UI_COLOR_TEXT,
-            activebackground=UI_COLOR_BG_LIGHT,
-            activeforeground=UI_COLOR_PRIMARY,
-            selectcolor="white",
-            relief=tk.FLAT,
-            bd=0,
-            highlightthickness=0,
-            anchor="w",
-        )
-        self.show_ap_overlay_btn.pack(side=tk.LEFT, padx=(0, 6))
-        self.show_ae_overlay_btn = tk.Checkbutton(
-            overlay_row,
-            text="显示ae",
-            variable=self.show_ae_overlay_var,
-            command=self.on_optional_overlay_toggle,
-            font=UI_FONT_SMALL,
-            bg=UI_COLOR_BG_LIGHT,
-            fg=UI_COLOR_TEXT,
-            activebackground=UI_COLOR_BG_LIGHT,
-            activeforeground=UI_COLOR_PRIMARY,
-            selectcolor="white",
-            relief=tk.FLAT,
-            bd=0,
-            highlightthickness=0,
-            anchor="w",
-        )
-        self.show_ae_overlay_btn.pack(side=tk.LEFT, padx=(0, 6))
-        self.show_interval_state_btn = tk.Checkbutton(
-            overlay_row,
-            text="显示区间状态",
-            variable=self.show_interval_state_var,
-            command=self.on_sample_selection_change,
-            font=UI_FONT_SMALL,
-            bg=UI_COLOR_BG_LIGHT,
-            fg=UI_COLOR_TEXT,
-            activebackground=UI_COLOR_BG_LIGHT,
-            activeforeground=UI_COLOR_PRIMARY,
-            selectcolor="white",
-            relief=tk.FLAT,
-            bd=0,
-            highlightthickness=0,
-            anchor="w",
-        )
-        self.show_interval_state_btn.pack(side=tk.LEFT, padx=(0, 6))
-
-        self.segmentation_status_label = ttk.Label(
-            interval_frame,
-            textvariable=self.segmentation_status_var,
-            font=UI_FONT_SMALL,
-            foreground=UI_COLOR_TEXT_MUTED,
-        )
-        self.segmentation_status_label.grid(
-            row=2,
-            column=0,
-            columnspan=8,
-            sticky="w",
-            pady=(6, 0),
-        )
-        self.sample_mapping_status_label = ttk.Label(
-            interval_frame,
-            textvariable=self.sample_mapping_status_var,
-            font=UI_FONT_SMALL,
-            foreground=UI_COLOR_TEXT_MUTED,
-        )
-        self.sample_mapping_status_label.grid(
-            row=3,
-            column=0,
-            columnspan=8,
-            sticky="w",
-            pady=(2, 0),
-        )
-
-        # 默认选择叠加显示
-        self.overlay_btn.state(['pressed'])
-        self.stacked_btn.state(['!pressed'])
-
-        self._interval_detail_widgets = [
-            self.pred_power_min_length_label,
-            self.pred_power_min_length_entry,
-            plot_switch_frame,
-        ]
-
-        # ===== 右侧：全行程六类区间详情 =====
-        ideal_frame = ttk.LabelFrame(controls, text="📌 全行程六类区间详情", padding=6, style='Tech.TLabelframe')
         ideal_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
-        ideal_frame.configure(width=900)
-        ideal_frame.grid_rowconfigure(1, weight=1)
+        ideal_frame.configure(width=470)
         ideal_frame.grid_columnconfigure(0, weight=1)
-        ideal_frame.grid_propagate(False)
         self.ideal_detail_frame = ideal_frame
 
-        detail_toolbar = ttk.Frame(ideal_frame)
-        detail_toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
-        detail_toolbar.grid_columnconfigure(0, weight=1)
         ttk.Label(
-            detail_toolbar,
-            text="按类别 / process / sample / x / Kc-P 显示；双击可查看完整详情。",
-            font=UI_FONT_SMALL,
-            foreground=UI_COLOR_TEXT_MUTED,
-        ).grid(row=0, column=0, sticky="w")
-        self.show_interval_detail_btn = ttk.Button(
-            detail_toolbar,
-            text="显示更多",
-            command=self._show_selected_interval_detail_dialog,
-            style="Secondary.TButton",
-            width=12,
+            ideal_frame, text="区间划分概况", font=UI_FONT_BOLD, foreground=UI_COLOR_PRIMARY
+        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+        overview_rows = (
+            self.interval_overview_success_var,
+            self.interval_overview_total_var,
+            self.interval_overview_counts_var,
+            self.interval_overview_mapping_var,
         )
-        self.show_interval_detail_btn.grid(row=0, column=1, sticky="e")
-        self.show_interval_detail_btn.state(["disabled"])
-
-        detail_columns = ("process", "sample", "x_span", "summary")
-        self.ideal_tree = ttk.Treeview(ideal_frame, columns=detail_columns, show="tree headings", height=20)
-        self.ideal_tree.grid(row=1, column=0, sticky="nsew")
-        self.ideal_tree.heading("#0", text="节点")
-        self.ideal_tree.heading("process", text="process")
-        self.ideal_tree.heading("sample", text="sample")
-        self.ideal_tree.heading("x_span", text="x")
-        self.ideal_tree.heading("summary", text="Kc / P")
-        self.ideal_tree.column("#0", width=136, minwidth=110, stretch=True)
-        self.ideal_tree.column("process", width=208, minwidth=168, stretch=True)
-        self.ideal_tree.column("sample", width=208, minwidth=168, stretch=True)
-        self.ideal_tree.column("x_span", width=148, minwidth=118, stretch=True, anchor="center")
-        self.ideal_tree.column("summary", width=236, minwidth=188, stretch=True)
-        ideal_scroll = ttk.Scrollbar(ideal_frame, orient=tk.VERTICAL, command=self.ideal_tree.yview)
-        ideal_scroll.grid(row=1, column=1, sticky="ns")
-        ideal_x_scroll = ttk.Scrollbar(ideal_frame, orient=tk.HORIZONTAL, command=self.ideal_tree.xview)
-        ideal_x_scroll.grid(row=2, column=0, sticky="ew")
-        self.ideal_tree.configure(yscrollcommand=ideal_scroll.set, xscrollcommand=ideal_x_scroll.set)
-        self.ideal_tree.bind("<<TreeviewSelect>>", self._on_ideal_tree_select)
-        self.ideal_tree.bind("<Double-1>", self._show_selected_interval_detail_dialog)
+        self.interval_overview_labels = []
+        for row_index, variable in enumerate(overview_rows, start=1):
+            label = ttk.Label(
+                ideal_frame, textvariable=variable, font=UI_FONT_NORMAL,
+                foreground=UI_COLOR_TEXT, justify=tk.LEFT, wraplength=370,
+            )
+            label.grid(row=row_index, column=0, sticky="w", pady=(0, 6))
+            self.interval_overview_labels.append(label)
         self._refresh_ideal_tree()
-
         # 收集控件引用
         self.sample_control_widgets = []
         self.sample_control_widgets.extend(self.sample_source_buttons)
-        self.sample_control_widgets.append(self.show_measured_curve_btn)
-        self.sample_control_widgets.append(self.show_reconstructed_curve_btn)
-        self.sample_control_widgets.append(self.show_feed_overlay_btn)
-        self.sample_control_widgets.append(self.show_speed_overlay_btn)
-        self.sample_control_widgets.append(self.show_ap_overlay_btn)
-        self.sample_control_widgets.append(self.show_ae_overlay_btn)
-        self.sample_control_widgets.append(self.show_interval_state_btn)
         self.sample_control_widgets.append(self.sample_program_combo)
         self.sample_control_widgets.append(self.sample_tool_combo)
-        # 过程域按钮不属于实测控件组，不得因未导入实测而禁用。
-        if hasattr(self, "_refresh_import_order_controls"):
-            self._refresh_import_order_controls()
 
-        self._set_model_detail_collapsed(True)
-        self._set_interval_detail_collapsed(True)
+        if self.enable_research_features:
+            self._set_model_detail_collapsed(True)
         self.root.after_idle(self._adapt_data_processing_layout)
 
         # ===== 预览区 =====
@@ -1203,15 +930,63 @@ class BootstrapUiMixin:
         self.figure_label = ttk.Label(nav_frame, text="", font=UI_FONT_LARGE, foreground=UI_COLOR_PRIMARY)
         self.figure_label.grid(row=0, column=0, sticky="w")
 
-        self.data_figure_frame = ttk.LabelFrame(preview, text="📈 负载图预览（滚轮：横向缩放；Ctrl+滚轮：纵向缩放）", padding=4, style='Tech.TLabelframe')
+        self.data_figure_frame = ttk.LabelFrame(
+            preview,
+            text="📈 图形显示（滚轮：横向缩放；Ctrl+滚轮：纵向缩放）",
+            padding=4,
+            style='Tech.TLabelframe',
+        )
         self.data_figure_frame.grid(row=1, column=0, sticky="nsew")
-        self.data_figure_frame.grid_rowconfigure(0, weight=1)
+        self.data_figure_frame.grid_rowconfigure(1, weight=1)
         self.data_figure_frame.grid_columnconfigure(0, weight=1)
         self.data_figure_frame.bind("<Configure>", self._on_preview_canvas_configure)
 
-        placeholder = ttk.Label(self.data_figure_frame, text="请先导入 SampleData 或实验实测文件，并生成图表",
+        # 图形选项常驻右上角；实际负载固定显示，不提供主曲线开关。
+        self.data_plot_toolbar = tk.Frame(self.data_figure_frame, bg=UI_COLOR_BG_LIGHT, bd=0)
+        self.data_plot_toolbar.grid(row=0, column=0, sticky="ew", padx=(4, 6), pady=(0, 3))
+        self.data_plot_toolbar.grid_columnconfigure(0, weight=1)
+        ttk.Label(self.data_plot_toolbar, text="显示:", font=UI_FONT_SMALL).grid(
+            row=0, column=1, sticky="e", padx=(0, 2)
+        )
+        self.show_feed_overlay_btn = self._create_plot_option_checkbutton(
+            self.data_plot_toolbar, "F", self.show_feed_overlay_var,
+            self.on_optional_overlay_toggle, 0, 2
+        )
+        self.show_speed_overlay_btn = self._create_plot_option_checkbutton(
+            self.data_plot_toolbar, "S", self.show_speed_overlay_var,
+            self.on_optional_overlay_toggle, 0, 3
+        )
+        self.show_ap_overlay_btn = self._create_plot_option_checkbutton(
+            self.data_plot_toolbar, "ap", self.show_ap_overlay_var,
+            self.on_optional_overlay_toggle, 0, 4
+        )
+        self.show_ae_overlay_btn = self._create_plot_option_checkbutton(
+            self.data_plot_toolbar, "ae", self.show_ae_overlay_var,
+            self.on_optional_overlay_toggle, 0, 5
+        )
+        self.show_interval_state_btn = self._create_plot_option_checkbutton(
+            self.data_plot_toolbar, "区间状态", self.show_interval_state_var,
+            self.on_sample_selection_change, 0, 6
+        )
+
+        self.data_plot_canvas_frame = ttk.Frame(self.data_figure_frame)
+        self.data_plot_canvas_frame.grid(row=1, column=0, sticky="nsew")
+        self.data_plot_canvas_frame.grid_rowconfigure(0, weight=1)
+        self.data_plot_canvas_frame.grid_columnconfigure(0, weight=1)
+        placeholder = ttk.Label(self.data_plot_canvas_frame, text="请先导入 SampleData 或实验实测文件，并生成图表",
                                 foreground="#5D6D7E", anchor="center")
         placeholder.grid(row=0, column=0, sticky="nsew")
+
+        self.sample_control_widgets.extend((
+            self.show_feed_overlay_btn,
+            self.show_speed_overlay_btn,
+            self.show_ap_overlay_btn,
+            self.show_ae_overlay_btn,
+            self.show_interval_state_btn,
+        ))
+        # 过程域按钮不属于实测控件组，不得因未导入实测而禁用。
+        if hasattr(self, "_refresh_import_order_controls"):
+            self._refresh_import_order_controls()
 
 
         # ===== 进度条与状态栏 =====
@@ -1240,8 +1015,11 @@ class BootstrapUiMixin:
                 if total_h <= 10:
                     return
                 requested_h = int(controls.winfo_reqheight()) if controls.winfo_reqheight() > 0 else 0
-                ctrl_h = max(requested_h + 12, int(total_h * 0.38))
-                ctrl_h = max(220, min(ctrl_h, max(total_h - 260, 220)))
+                if not self.enable_research_features:
+                    ctrl_h = max(150, requested_h + 8)
+                else:
+                    ctrl_h = max(requested_h + 12, int(total_h * 0.36), 220)
+                ctrl_h = min(ctrl_h, max(total_h - 300, 150))
                 paned.sashpos(0, ctrl_h)
                 self.root.after_idle(self._sync_data_controls_preview_ratio)
             except Exception:
@@ -1249,9 +1027,9 @@ class BootstrapUiMixin:
 
         self.root.after(60, _init_sash)
         self.on_sample_display_mode_change()
-        if hasattr(self, "refresh_prediction_mode_controls"):
+        if self.enable_research_features and hasattr(self, "refresh_prediction_mode_controls"):
             self.refresh_prediction_mode_controls()
-        if hasattr(self, "refresh_prediction_metrics_summary"):
+        if self.enable_research_features and hasattr(self, "refresh_prediction_metrics_summary"):
             self.refresh_prediction_metrics_summary()
         if hasattr(self, "_refresh_idle_power_chart"):
             self.root.after_idle(self._refresh_idle_power_chart)

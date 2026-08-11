@@ -12,5 +12,8 @@ htmlcov/
 /data/runtime/
 /profiles/cache/
 /output/
+/release_versions/
+/build/
+/dist/
 
 *.log

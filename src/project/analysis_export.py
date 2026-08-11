@@ -9,9 +9,19 @@ from .shared import *
 
 
 class AnalysisExportMixin:
+    def _default_segmentation_output_dir(self):
+        """发布 EXE 直接写同目录；源码研究版保留 output/segmentation。"""
+        if bool(getattr(self, "release_mode", False)) and IS_FROZEN:
+            return Path(OUTPUT_DIR)
+        return Path(OUTPUT_DIR) / "segmentation"
+
     def _clear_segmentation_output_artifacts(self, output_dir=None, *, scope="all"):
         """按过程域/映射域清理固定导出，避免实测变化误删过程结果。"""
-        target_dir = Path(output_dir) if output_dir is not None else OUTPUT_DIR / "segmentation"
+        target_dir = (
+            Path(output_dir)
+            if output_dir is not None
+            else self._default_segmentation_output_dir()
+        )
         if not target_dir.exists():
             return
         process_file_names = (
@@ -113,29 +123,15 @@ class AnalysisExportMixin:
         interval_records,
         output_path,
         *,
-        predicted_idle_power=None,
         background_payload=None,
         background_height_values=None,
-        predicted_values=None,
-        show_actual=True,
     ):
-        """保存与页面一致的单轴负载曲线及六态曲线高度填充。"""
+        """保存与页面一致的实际负载及六态区间背景。"""
         actual = np.asarray(sample_values, dtype=float).reshape(-1)
         if actual.size == 0 or not np.any(np.isfinite(actual)):
             raise ValueError("实际采样值为空，无法生成 sample_overview.png")
-        if predicted_values is None:
-            raise ValueError("预测负载不可用，无法生成 sample_overview.png")
-        display_prediction = np.asarray(
-            predicted_values,
-            dtype=float,
-        ).reshape(-1)
-        if (
-            display_prediction.size != actual.size
-            or not np.all(np.isfinite(display_prediction))
-        ):
-            raise ValueError("预测负载必须与实际负载等长且全部有效")
         if background_height_values is None:
-            fill_values = np.maximum(display_prediction, 0.0)
+            fill_values = np.maximum(actual, 0.0)
         else:
             fill_values = np.asarray(
                 background_height_values,
@@ -143,8 +139,6 @@ class AnalysisExportMixin:
             ).reshape(-1)
             if fill_values.size != actual.size:
                 raise ValueError("采样域填充高度与实际负载数量不一致")
-            if not np.all(np.isfinite(fill_values)):
-                raise ValueError("采样域填充高度包含无效值")
         if background_payload is None:
             background_payload = self.build_segmentation_sample_background_masks(
                 fill_values,
@@ -177,9 +171,9 @@ class AnalysisExportMixin:
                 dtype=bool,
             )
             if background_valid_mask.size != actual.size:
-                raise ValueError("六态背景有效掩码与预测负载数量不一致")
+                raise ValueError("六态背景有效掩码与实际负载数量不一致")
             actual_mask = np.isfinite(actual)
-            if bool(show_actual) and np.any(actual_mask):
+            if np.any(actual_mask):
                 actual_x, actual_plot_values = (
                     self._compress_plot_series_preserve_gaps(
                         x_values,
@@ -195,24 +189,8 @@ class AnalysisExportMixin:
                     label="实际负载",
                     zorder=4,
                 )
-            prediction_x, prediction_plot_values = (
-                self._compress_plot_series_preserve_gaps(
-                    x_values,
-                    display_prediction,
-                    int(getattr(self, "preview_plot_max_points", 60000) or 60000),
-                )
-            )
-            ax.plot(
-                prediction_x,
-                prediction_plot_values,
-                color=self.get_segmentation_predicted_line_color(),
-                linewidth=1.25,
-                linestyle="--",
-                label="预测负载",
-                zorder=5,
-            )
             ax.set_title(
-                "功率与区间状态",
+                "实际负载与区间划分",
                 fontsize=14,
                 fontweight="bold",
             )
@@ -405,10 +383,7 @@ class AnalysisExportMixin:
                 ).reshape(-1)
             except Exception:
                 return None
-            if (
-                values.size != int(sample_count)
-                or not np.all(np.isfinite(values))
-            ):
+            if values.size != int(sample_count) or not np.any(np.isfinite(values)):
                 return None
             return values
 
@@ -450,10 +425,11 @@ class AnalysisExportMixin:
                 else False
             )
             builder = getattr(self, "_build_sampledata_prediction_payload", None)
-            if model_ready and callable(builder):
+            if (model_ready or bool(getattr(self, "release_mode", False))) and callable(builder):
                 try:
                     candidate = builder()
-                except Exception:
+                except Exception as exc:
+                    self._segmentation_display_prediction_error = str(exc)
                     candidate = None
                 if isinstance(candidate, dict):
                     prediction_payload = candidate
@@ -476,7 +452,7 @@ class AnalysisExportMixin:
         *,
         save=False,
     ):
-        """在单轴上绘制实际/预测负载及已有过程域六态投影。"""
+        """把 MRR 得到的六态区间投影到实际负载曲线上。"""
 
         result = getattr(self, "_latest_segmentation_result", None)
         values = np.asarray(getattr(self, "sample_data_values", []), dtype=float)
@@ -495,8 +471,6 @@ class AnalysisExportMixin:
             actual_values = values.reshape(-1)
         actual_values = np.asarray(actual_values, dtype=float).reshape(-1)
         actual_finite = np.isfinite(actual_values)
-        if not np.any(actual_finite):
-            return False
 
         sample_x = None
         x_label = "实际采样点索引（0 基）"
@@ -531,17 +505,13 @@ class AnalysisExportMixin:
         if sample_x is None:
             sample_x = np.arange(actual_values.size, dtype=float)
 
-        predicted_values = self._resolve_segmentation_display_prediction(
-            actual_values.size
-        )
-        if predicted_values is None:
-            return False
-        fill_values = np.maximum(predicted_values, 0.0)
+        # 六态分类只来自过程域 MRR，背景高度跟随实际负载。
+        fill_values = np.maximum(actual_values, 0.0)
         background_payload = self.build_segmentation_sample_background_masks(
             fill_values,
             None,
             mapping_records,
-            valid_mask=np.isfinite(fill_values),
+            valid_mask=actual_finite,
         )
         projected_mask = np.asarray(
             background_payload.get(
@@ -552,20 +522,12 @@ class AnalysisExportMixin:
         )
         overlay_context_mask = np.isfinite(sample_x)
 
-        show_measured_curve = self._plot_option_enabled(
-            "show_measured_curve_var",
-            True,
-        )
-        show_reconstructed_curve = self._plot_option_enabled(
-            "show_reconstructed_curve_var",
-            True,
-        )
         show_interval_states = self._plot_option_enabled(
             "show_interval_state_var",
             True,
         )
 
-        fig, sample_ax = plt.subplots(figsize=(16, 8), dpi=100)
+        fig, sample_ax = plt.subplots(figsize=(16, 7.2), dpi=100)
         fig.patch.set_facecolor(PLOT_FIG_BG)
         self.apply_plot_style(sample_ax, grid=True)
         if show_interval_states:
@@ -574,7 +536,7 @@ class AnalysisExportMixin:
                 sample_x,
                 fill_values,
                 background_payload.get("state_masks", {}),
-                alpha=0.26,
+                alpha=0.20,
                 show_labels=True,
                 zorder=1,
             )
@@ -585,34 +547,15 @@ class AnalysisExportMixin:
             actual_values,
             preview_limit,
         )
-        if show_measured_curve:
-            sample_ax.plot(
-                plot_x,
-                plot_values,
-                color=STYLE_MEASURED["color"],
-                linewidth=1.0,
-                linestyle="-",
-                label="实际负载",
-                zorder=4,
-            )
-        predicted_x, predicted_plot_values = (
-            self._compress_plot_series_preserve_gaps(
-                sample_x,
-                predicted_values,
-                preview_limit,
-            )
+        sample_ax.plot(
+            plot_x,
+            plot_values,
+            color=STYLE_MEASURED["color"],
+            linewidth=1.35,
+            linestyle="-",
+            label="实际负载",
+            zorder=4,
         )
-        if show_reconstructed_curve:
-            sample_ax.plot(
-                predicted_x,
-                predicted_plot_values,
-                color=self.get_segmentation_predicted_line_color(),
-                linewidth=1.25,
-                linestyle="--",
-                label="预测负载",
-                zorder=5,
-            )
-
         aux_axes = []
         overlay_plotter = getattr(
             self,
@@ -629,11 +572,11 @@ class AnalysisExportMixin:
                 )
                 or []
             )
-        if not show_measured_curve and not show_reconstructed_curve and not aux_axes:
+        if not np.any(actual_finite):
             sample_ax.text(
                 0.5,
                 0.5,
-                "当前未启用任何曲线显示",
+                "当前实际负载没有可显示的有效数值",
                 ha="center",
                 va="center",
                 transform=sample_ax.transAxes,
@@ -641,10 +584,18 @@ class AnalysisExportMixin:
                 color="#666666",
             )
 
-        sample_ax.set_title("功率与区间状态")
+        sample_ax.set_title(
+            "实际负载与区间划分",
+            fontsize=PLOT_FONT_BASE + 1,
+            fontweight="bold",
+            pad=6,
+        )
         sample_ax.set_xlabel(x_label)
         sample_ax.set_ylabel("功率 (W)")
-        finite_x = sample_x[np.isfinite(sample_x)]
+        visible_x_mask = np.isfinite(sample_x) & projected_mask
+        if not np.any(visible_x_mask):
+            visible_x_mask = np.isfinite(sample_x)
+        finite_x = sample_x[visible_x_mask]
         if finite_x.size:
             x_min = float(np.min(finite_x))
             x_max = float(np.max(finite_x))
@@ -666,9 +617,12 @@ class AnalysisExportMixin:
         )
         legend_style = {
             "loc": "upper left",
-            "ncol": min(7, max(legend_count, 1)),
+            "ncol": min(5, max(legend_count, 1)),
             "fontsize": PLOT_FONT_BASE - 1,
-            "framealpha": 0.95,
+            "framealpha": 0.88,
+            "borderpad": 0.35,
+            "labelspacing": 0.3,
+            "columnspacing": 0.9,
         }
         legend_applier = getattr(self, "_apply_optional_overlay_legend", None)
         if callable(legend_applier):
@@ -692,10 +646,10 @@ class AnalysisExportMixin:
                 )
 
         subplot_adjust = {
-            "left": 0.07,
+            "left": 0.06,
             "right": 0.985,
-            "top": 0.90,
-            "bottom": 0.10,
+            "top": 0.94,
+            "bottom": 0.09,
         }
         layout_applier = getattr(self, "_apply_optional_overlay_layout", None)
         if callable(layout_applier):
@@ -717,7 +671,7 @@ class AnalysisExportMixin:
                 subplot_adjust=subplot_adjust,
             )
         self.figures = [fig]
-        self.figure_names = ["功率与区间状态"]
+        self.figure_names = ["实际负载与区间划分"]
         self.current_figure_index = 0
         if hasattr(self, "interval_count_var"):
             self.interval_count_var.set(str(len(mapping_records)))
@@ -785,7 +739,11 @@ class AnalysisExportMixin:
 
         if result is None:
             raise ValueError("缺少需要导出的六态失败诊断")
-        target_dir = Path(output_dir) if output_dir is not None else OUTPUT_DIR / "segmentation"
+        target_dir = (
+            Path(output_dir)
+            if output_dir is not None
+            else self._default_segmentation_output_dir()
+        )
         target_dir.mkdir(parents=True, exist_ok=True)
         self._clear_segmentation_output_artifacts(target_dir)
         diagnostics = dict(getattr(result, "diagnostics", {}) or {})
@@ -844,7 +802,11 @@ class AnalysisExportMixin:
         ):
             raise ValueError("六态结果未通过结构复查，不能导出普通结果")
 
-        target_dir = Path(output_dir) if output_dir is not None else OUTPUT_DIR / "segmentation"
+        target_dir = (
+            Path(output_dir)
+            if output_dir is not None
+            else self._default_segmentation_output_dir()
+        )
         target_dir.mkdir(parents=True, exist_ok=True)
         self._clear_segmentation_output_artifacts(target_dir)
         paths = {
@@ -988,11 +950,8 @@ class AnalysisExportMixin:
                 predicted_load,
                 projected_records,
                 temporary_paths["overview"],
-                predicted_idle_power=predicted_idle_power,
                 background_payload=background_payload,
                 background_height_values=np.maximum(predicted_load, 0.0),
-                predicted_values=predicted_load,
-                show_actual=False,
             )
             with temporary_paths["diagnostics"].open(
                 "w",
@@ -1118,7 +1077,11 @@ class AnalysisExportMixin:
         if not process_signature:
             raise ValueError("过程域结果缺少 process_signature")
 
-        target_dir = Path(output_dir) if output_dir is not None else OUTPUT_DIR / "segmentation"
+        target_dir = (
+            Path(output_dir)
+            if output_dir is not None
+            else self._default_segmentation_output_dir()
+        )
         target_dir.mkdir(parents=True, exist_ok=True)
         process_paths = {
             "point_labels": target_dir / "point_labels.csv",
@@ -1285,22 +1248,7 @@ class AnalysisExportMixin:
                     projection_frame,
                     mapping_temporary_paths["sample_projection"],
                 )
-                predicted_values = self._resolve_segmentation_display_prediction(
-                    actual_values.size
-                )
-                if predicted_values is None:
-                    prediction_error = str(
-                        getattr(
-                            self,
-                            "_segmentation_display_prediction_error",
-                            "预测负载不可用",
-                        )
-                        or "预测负载不可用"
-                    )
-                    raise ValueError(
-                        f"{prediction_error}，无法导出实际/预测负载叠图"
-                    )
-                background_height_values = np.maximum(predicted_values, 0.0)
+                background_height_values = np.maximum(actual_values, 0.0)
                 background_payload = self.build_segmentation_sample_background_masks(
                     background_height_values,
                     None,
@@ -1313,7 +1261,6 @@ class AnalysisExportMixin:
                     mapping_temporary_paths["sample_overview"],
                     background_payload=background_payload,
                     background_height_values=background_height_values,
-                    predicted_values=predicted_values,
                 )
                 self._replace_segmentation_bundle(
                     mapping_paths,
@@ -2236,7 +2183,7 @@ class AnalysisExportMixin:
             messagebox.showwarning("无稳态区间", "请先生成稳态区间")
             return
 
-        # 统一保存到项目输出目录，避免生成文件散落在根目录或数据目录。
+        # 源码研究版写项目 output/；冻结发布版直接写 EXE 同目录。
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         output_dir = str(OUTPUT_DIR)
         if not output_dir:
@@ -3340,18 +3287,9 @@ class AnalysisExportMixin:
                     save=save,
                 )
                 if not rendered:
-                    rendered = self._render_process_domain_segmentation_view(save=save)
-                    prediction_error = str(
-                        getattr(
-                            self,
-                            "_segmentation_display_prediction_error",
-                            "预测负载暂不可用",
-                        )
-                        or "预测负载暂不可用"
-                    )
                     return self._finish_segmentation_fast_plot(
-                        rendered,
-                        f"{prediction_error}；已保留程序 MRR 图",
+                        False,
+                        "实际负载与区间映射图生成失败",
                     )
                 return self._finish_segmentation_fast_plot(
                     rendered,
@@ -3360,7 +3298,8 @@ class AnalysisExportMixin:
 
             model_ready = self.has_prediction_model_ready() if hasattr(self, "has_prediction_model_ready") else self.has_identified_kc_ke()
             self.figures = []
-            self.refresh_pit_button_state()
+            if hasattr(self, "refresh_pit_button_state"):
+                self.refresh_pit_button_state()
             current_sample_mode = str(getattr(self, "sample_data_mode", "") or "").strip()
             resolved_policy = str(interval_policy or "").strip()
             measurement_display_mode = None
@@ -3688,7 +3627,8 @@ class AnalysisExportMixin:
                     )
                 else:
                     self._refresh_manual_measurement_prediction(display_mode=measurement_display_mode)
-            self.refresh_pit_button_state()
+            if hasattr(self, "refresh_pit_button_state"):
+                self.refresh_pit_button_state()
             if hasattr(self, "_refresh_ideal_tree"):
                 self._refresh_ideal_tree()
             
@@ -3990,7 +3930,10 @@ class AnalysisExportMixin:
                 self._interval_background_artists.extend(artists)
             
             # 预测负载 + 实测负载图
-            plot_mode = self.sample_plot_mode.get()
+            # 公共页面只保留单图叠加模式；兼容旧配置中的 stacked 值但不再采用。
+            plot_mode = "overlay"
+            if self.sample_plot_mode.get() != plot_mode:
+                self.sample_plot_mode.set(plot_mode)
             if plot_mode == "stacked":
                 fig2, (axes_act, axes_pred) = plt.subplots(2, 1, sharex=True, figsize=(16, 9), dpi=100)
                 overlay_secondary = False
@@ -4077,7 +4020,18 @@ class AnalysisExportMixin:
                     return float(process_display_start_bounds[start_idx_iv]), float(process_display_end_bounds[end_idx_iv])
                 return float(start_line), float(end_line + 1)
 
-            def _plot_process_step_blocks(ax, blocks, start_bounds, end_bounds, color, linewidth, alpha, label=None, zorder=5):
+            def _plot_process_step_blocks(
+                ax,
+                blocks,
+                start_bounds,
+                end_bounds,
+                color,
+                linewidth,
+                alpha,
+                label=None,
+                zorder=5,
+                linestyle="-",
+            ):
                 first = True
                 for block_start, block_end in blocks:
                     segment_x = []
@@ -4093,6 +4047,7 @@ class AnalysisExportMixin:
                                     "linewidth": linewidth,
                                     "alpha": alpha,
                                     "zorder": zorder,
+                                    "linestyle": linestyle,
                                 }
                                 if first and label:
                                     plot_kwargs["label"] = label
@@ -4108,6 +4063,7 @@ class AnalysisExportMixin:
                                 "linewidth": linewidth,
                                 "alpha": alpha,
                                 "zorder": zorder,
+                                "linestyle": linestyle,
                             }
                             if first and label:
                                 plot_kwargs["label"] = label
@@ -4125,6 +4081,7 @@ class AnalysisExportMixin:
                             "linewidth": linewidth,
                             "alpha": alpha,
                             "zorder": zorder,
+                            "linestyle": linestyle,
                         }
                         if first and label:
                             plot_kwargs["label"] = label
@@ -4158,7 +4115,8 @@ class AnalysisExportMixin:
                             linewidth=pred_style.get("linewidth", 1.0),
                             alpha=0.95,
                             label=pred_style.get("label"),
-                            zorder=5
+                            zorder=5,
+                            linestyle=pred_style.get("linestyle", "--"),
                         )
                     axes_pred.set_ylabel('基准预测负载 P_base (W)', fontsize=PLOT_FONT_BASE,
                                          fontweight='bold', color=PLOT_TEXT_COLOR)
@@ -4622,8 +4580,9 @@ class AnalysisExportMixin:
 
         self.current_figure_index = index
 
-        # 清空预览区域（销毁旧的canvas组件）
-        for widget in self.data_figure_frame.winfo_children():
+        # 只替换画布；右上角的持久显示开关不得随重绘销毁。
+        canvas_frame = getattr(self, "data_plot_canvas_frame", self.data_figure_frame)
+        for widget in canvas_frame.winfo_children():
             widget.destroy()
 
         fig = self.figures[index]
@@ -4632,7 +4591,7 @@ class AnalysisExportMixin:
         # 默认取主轴（缩放时会同步作用到同一Figure的其它轴）
         self.ax_data = fig.axes[0] if getattr(fig, 'axes', None) else None
 
-        self.canvas_data = FigureCanvasTkAgg(fig, master=self.data_figure_frame)
+        self.canvas_data = FigureCanvasTkAgg(fig, master=canvas_frame)
         canvas_widget = self.canvas_data.get_tk_widget()
         canvas_widget.grid(row=0, column=0, sticky="nsew")
         canvas_widget.configure(relief=tk.FLAT, bd=0)

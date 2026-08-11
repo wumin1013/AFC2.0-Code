@@ -87,7 +87,7 @@ UI_COLOR_TEXT_MUTED = "#5D6D7E"
 UI_COLOR_HEADER_BG = "#E8F4FD"
 
 STYLE_MEASURED = {"color": "#00B4D8", "linestyle": "-", "linewidth": 1.5, "label": "实测"}
-STYLE_PREDICTED = {"color": "#FF6B6B", "linestyle": "-", "linewidth": 1.5, "label": "预测"}
+STYLE_PREDICTED = {"color": "#E63946", "linestyle": "--", "linewidth": 1.7, "label": "预测"}
 
 PLOT_FONT_BASE = 12
 PLOT_TEXT_COLOR = "#1C2833"
@@ -120,7 +120,9 @@ SMIF_COLORBAR_RECT = (0.90, 0.14, 0.018, 0.68)
 INTERVAL_COLORS = ["#3498DB", "#E74C3C", "#2ECC71", "#F39C12", "#9B59B6", "#1ABC9C"]
 TOOL_BG_COLORS = ["#AED6F1", "#F5B7B1", "#ABEBC6", "#FAD7A0", "#D7BDE2", "#A3E4D7"]
 
-if getattr(sys, "frozen", False):
+IS_FROZEN = bool(getattr(sys, "frozen", False))
+
+if IS_FROZEN:
     app_dir = os.path.dirname(os.path.abspath(sys.executable))
     base_dir = getattr(sys, "_MEIPASS", app_dir)
     os.chdir(app_dir)
@@ -131,25 +133,26 @@ else:
     base_dir = app_dir
 
 PROJECT_ROOT = Path(app_dir).resolve()
+APP_DIR = PROJECT_ROOT
+RESOURCE_ROOT = Path(base_dir).resolve()
 CONFIG_DIR = PROJECT_ROOT / "config"
 SAMPLE_DATA_DIR = PROJECT_ROOT / "data" / "sample"
 RUNTIME_DATA_DIR = PROJECT_ROOT / "data" / "runtime"
 PROFILE_DIR = PROJECT_ROOT / "profiles"
 PROFILE_CACHE_DIR = PROFILE_DIR / "cache"
-OUTPUT_DIR = PROJECT_ROOT / "output"
+# 冻结发布版的结果直接写到 EXE 同目录；源码研究版继续集中写入项目 output/。
+OUTPUT_DIR = PROJECT_ROOT if IS_FROZEN else PROJECT_ROOT / "output"
 
-simhei_path = os.path.join(base_dir, "SimHei.ttf")
-if os.path.exists(simhei_path):
-    import matplotlib.font_manager as fm
-
-    fm.fontManager.addfont(simhei_path)
-    plt.rcParams["font.family"] = "sans-serif"
-    plt.rcParams["font.sans-serif"] = ["SimHei"]
-    plt.rcParams["axes.unicode_minus"] = False
-else:
-    print(f"警告: 字体文件 {simhei_path} 未找到，将使用系统默认字体")
-
-matplotlib.rcParams["font.sans-serif"] = ["SimHei"]
+# 仅使用目标 Windows 已安装字体的回退链。发布包不携带来源不明的字体文件。
+simhei_path = ""
+matplotlib.rcParams["font.family"] = "sans-serif"
+matplotlib.rcParams["font.sans-serif"] = [
+    "Microsoft YaHei UI",
+    "Microsoft YaHei",
+    "SimSun",
+    "Arial Unicode MS",
+    "DejaVu Sans",
+]
 matplotlib.rcParams["axes.unicode_minus"] = False
 
 
@@ -233,15 +236,15 @@ class PITEntry:
 
 
 __all__ = [
-    "AutoLocator", "Dict", "FigureCanvasTkAgg", "INTERVAL_COLORS", "Line2D", "List", "MaxNLocator",
-    "CONFIG_DIR", "NavigationToolbar2Tk", "Optional", "OUTPUT_DIR", "PITEntry", "PLOT_AX_BG",
+    "AutoLocator", "Dict", "FigureCanvasTkAgg", "INTERVAL_COLORS", "IS_FROZEN", "Line2D", "List", "MaxNLocator",
+    "APP_DIR", "CONFIG_DIR", "NavigationToolbar2Tk", "Optional", "OUTPUT_DIR", "PITEntry", "PLOT_AX_BG",
     "PLOT_FIG_BG", "PLOT_FONT_BASE", "PROFILE_CACHE_DIR", "PROFILE_DIR", "PROJECT_ROOT",
     "PLOT_GRID_COLOR", "PLOT_SPINE_COLOR", "PLOT_TEXT_COLOR", "SMIF_ANNOTATION_COLOR", "SMIF_AX_BG",
     "SMIF_AXES_RECT", "SMIF_BOX_MIN_RATIO", "SMIF_BOX_ZOOM", "SMIF_COLORBAR_RECT", "SMIF_FIG_BG",
     "SMIF_GRID_COLOR", "SMIF_IDLE_COLOR", "SMIF_MAIN_AZIM", "SMIF_MAIN_ELEV", "SMIF_METRIC_IDLE_FILL",
     "SMIF_METRIC_NONSTEADY_FILL", "SMIF_METRIC_STEADY_FILL", "SMIF_NONSTEADY_COLOR", "SMIF_PANEL_BG",
     "SMIF_PANEL_EDGE", "SMIF_PANE_BG", "SMIF_PANE_EDGE", "SMIF_TEXT_COLOR", "SMIF_TEXT_MUTED",
-    "RUNTIME_DATA_DIR", "SAMPLE_DATA_DIR", "STYLE_MEASURED",
+    "RESOURCE_ROOT", "RUNTIME_DATA_DIR", "SAMPLE_DATA_DIR", "STYLE_MEASURED",
     "STYLE_PREDICTED", "TOOL_BG_COLORS", "Tuple", "UI_BTN_PADX", "UI_BTN_PADY", "UI_BTN_WIDTH",
     "UI_COLOR_BG_DARK", "UI_COLOR_BG_LIGHT", "UI_COLOR_BG_PANEL", "UI_COLOR_BORDER", "UI_COLOR_DANGER",
     "UI_COLOR_HEADER_BG", "UI_COLOR_PRIMARY", "UI_COLOR_PRIMARY_DARK", "UI_COLOR_PRIMARY_LIGHT",

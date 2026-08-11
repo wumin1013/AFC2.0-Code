@@ -13,6 +13,10 @@ class ConfigStateMixin:
         "exit": (5, "退刀"),
     }
 
+    def _profile_config_enabled(self):
+        release_mode = bool(getattr(self, "release_mode", False))
+        return bool(getattr(self, "enable_profile_config", not release_mode))
+
     def _get_interval_state_display(self, record):
         """返回兼容旧记录的六态类型、编码和中文名称。"""
         segment_type = str(record.get("segment_type") or "").strip().lower()
@@ -137,28 +141,34 @@ class ConfigStateMixin:
                     )
                 if "kc_beta" in self.app_config:
                     self.kc_beta.set(float(self.app_config.get("kc_beta", self.kc_beta.get()) or 0.0))
-                saved_profile_index = self.app_config.get("saved_kc_profile_index")
-                if isinstance(saved_profile_index, dict):
-                    self.saved_kc_profile_index = saved_profile_index
-                saved_profiles = self.app_config.get("saved_kc_profiles")
-                if isinstance(saved_profiles, dict) and saved_profiles:
-                    if hasattr(self, "_migrate_legacy_saved_kc_profiles"):
-                        try:
-                            self._migrate_legacy_saved_kc_profiles(saved_profiles, persist=False)
-                        except Exception:
-                            pass
-                gcode_bindings = self.app_config.get("gcode_profile_bindings")
-                if isinstance(gcode_bindings, dict):
-                    normalized_bindings = {}
-                    for gcode_path, profile_paths in gcode_bindings.items():
-                        if isinstance(profile_paths, str):
-                            profile_list = [profile_paths]
-                        elif isinstance(profile_paths, list):
-                            profile_list = [str(item).strip() for item in profile_paths if str(item).strip()]
-                        else:
-                            continue
-                        normalized_bindings[str(gcode_path)] = profile_list
-                    self.gcode_profile_bindings = normalized_bindings
+                if self._profile_config_enabled():
+                    saved_profile_index = self.app_config.get("saved_kc_profile_index")
+                    if isinstance(saved_profile_index, dict):
+                        self.saved_kc_profile_index = saved_profile_index
+                    saved_profiles = self.app_config.get("saved_kc_profiles")
+                    if isinstance(saved_profiles, dict) and saved_profiles:
+                        if hasattr(self, "_migrate_legacy_saved_kc_profiles"):
+                            try:
+                                self._migrate_legacy_saved_kc_profiles(saved_profiles, persist=False)
+                            except Exception:
+                                pass
+                    gcode_bindings = self.app_config.get("gcode_profile_bindings")
+                    if isinstance(gcode_bindings, dict):
+                        normalized_bindings = {}
+                        for gcode_path, profile_paths in gcode_bindings.items():
+                            if isinstance(profile_paths, str):
+                                profile_list = [profile_paths]
+                            elif isinstance(profile_paths, list):
+                                profile_list = [str(item).strip() for item in profile_paths if str(item).strip()]
+                            else:
+                                continue
+                            normalized_bindings[str(gcode_path)] = profile_list
+                        self.gcode_profile_bindings = normalized_bindings
+                else:
+                    # 发布版可读取其他通用设置，但 profile 数据不进入运行态。
+                    self.app_config.pop("saved_kc_profile_index", None)
+                    self.app_config.pop("saved_kc_profiles", None)
+                    self.app_config.pop("gcode_profile_bindings", None)
             except Exception as e:
                 print(f"加载 app_config 失败: {e}")
                 self.app_config = {}
@@ -192,11 +202,16 @@ class ConfigStateMixin:
             self.app_config["lock_ke_during_identification"] = bool(self.lock_ke_during_identification.get())
             self.app_config["lock_idle_during_identification"] = bool(self.lock_idle_during_identification.get())
             self.app_config["kc_beta"] = float(self.kc_beta.get())
-            if hasattr(self, "_prune_saved_kc_profile_index"):
-                self._prune_saved_kc_profile_index()
-            self.app_config.pop("saved_kc_profiles", None)
-            self.app_config["saved_kc_profile_index"] = dict(getattr(self, "saved_kc_profile_index", {}) or {})
-            self.app_config["gcode_profile_bindings"] = dict(getattr(self, "gcode_profile_bindings", {}) or {})
+            if self._profile_config_enabled():
+                if hasattr(self, "_prune_saved_kc_profile_index"):
+                    self._prune_saved_kc_profile_index()
+                self.app_config.pop("saved_kc_profiles", None)
+                self.app_config["saved_kc_profile_index"] = dict(getattr(self, "saved_kc_profile_index", {}) or {})
+                self.app_config["gcode_profile_bindings"] = dict(getattr(self, "gcode_profile_bindings", {}) or {})
+            else:
+                self.app_config.pop("saved_kc_profiles", None)
+                self.app_config.pop("saved_kc_profile_index", None)
+                self.app_config.pop("gcode_profile_bindings", None)
             with open(self.config_path, "w", encoding="utf-8") as f:
                 json.dump(self.app_config, f, ensure_ascii=False, indent=2)
         except Exception as e:
@@ -273,478 +288,95 @@ class ConfigStateMixin:
         except Exception:
             pass
 
-    def _format_interval_tree_metric(self, value, digits=3, default="--"):
-        try:
-            numeric = float(value)
-        except Exception:
-            return default
-        if not np.isfinite(numeric):
-            return default
-        return f"{numeric:.{int(digits)}f}"
-
-    def _normalize_interval_detail_value(self, value):
-        if isinstance(value, dict):
-            return {str(key): self._normalize_interval_detail_value(item) for key, item in value.items()}
-        if isinstance(value, (list, tuple)):
-            return [self._normalize_interval_detail_value(item) for item in value]
-        if isinstance(value, (np.bool_, bool)):
-            return bool(value)
-        if isinstance(value, (np.integer, int)):
-            return int(value)
-        if isinstance(value, (np.floating, float)):
-            numeric = float(value)
-            return numeric if np.isfinite(numeric) else str(value)
-        if value is None or isinstance(value, str):
-            return value
-        return str(value)
-
-    def _build_interval_summary_values(self, record):
-        start_label = str(record.get("sample_start_label") or "--")
-        end_label = str(record.get("sample_end_label") or "--")
-        try:
-            sample_count = int(record.get("point_count", record.get("sample_count", 0)) or 0)
-        except Exception:
-            sample_count = 0
-        point_count_text = str(sample_count) if sample_count > 0 else "--"
-        avg_load_text = self._format_interval_tree_metric(record.get("p_meas"), digits=3)
-        if avg_load_text != "--":
-            avg_load_text = f"{avg_load_text} W"
-        return start_label, end_label, point_count_text, avg_load_text
-
-    def _build_interval_tree_row_values(self, record):
-        segment_type, state_code, state_label = self._get_interval_state_display(record)
-        process_start = str(record.get("process_start_label") or record.get("start_line_raw") or record.get("start_line") or "--")
-        process_end = str(record.get("process_end_label") or record.get("end_line_raw") or record.get("end_line") or "--")
-        sample_start = str(record.get("sample_start_label") or "").strip()
-        sample_end = str(record.get("sample_end_label") or "").strip()
-        sample_status = str(record.get("_sample_projection_status") or "").strip()
-        sample_text = (
-            f"{sample_start} -> {sample_end}"
-            if sample_start and sample_end
-            else (sample_status or "无采样投影")
-        )
-        x_start = self._format_interval_tree_metric(record.get("display_start_x", record.get("start_s")), digits=3)
-        x_end = self._format_interval_tree_metric(record.get("display_end_x", record.get("end_s")), digits=3)
-        point_count_text = self._build_interval_summary_values(record)[2]
-        kc_text = self._format_interval_tree_metric(record.get("K_c_hat"), digits=6)
-        p_pred_text = self._format_interval_tree_metric(record.get("p_pred"), digits=3)
-        p_meas_text = self._format_interval_tree_metric(record.get("p_meas"), digits=3)
-        summary_parts = [f"{state_label}[{state_code}]", f"n={point_count_text}"]
-        if kc_text != "--":
-            summary_parts.append(f"Kc={kc_text}")
-        if p_pred_text != "--":
-            summary_parts.append(f"Pp={p_pred_text}W")
-        if p_meas_text != "--":
-            summary_parts.append(f"Pm={p_meas_text}W")
-        if bool(record.get("review_required")):
-            summary_parts.append("需复核")
-        return (
-            f"{process_start} -> {process_end}",
-            sample_text,
-            f"{x_start} -> {x_end}",
-            " | ".join(summary_parts),
-        )
-
-    def _build_interval_detail_text(self, interval_id, subtype_text, record):
-        segment_type, state_code, state_label = self._get_interval_state_display(record)
-        process_start_label = str(record.get("process_start_label") or record.get("start_line") or "--")
-        process_end_label = str(record.get("process_end_label") or record.get("end_line") or "--")
-        sample_start_label = str(record.get("sample_start_label") or "").strip()
-        sample_end_label = str(record.get("sample_end_label") or "").strip()
-        sample_projection_status = str(
-            record.get("_sample_projection_status") or "无采样投影"
-        ).strip()
-        sample_interval_text = (
-            f"{sample_start_label} -> {sample_end_label}"
-            if sample_start_label and sample_end_label
-            else sample_projection_status
-        )
-        anchor_start_label = str(record.get("sample_anchor_start_label") or "--")
-        anchor_end_label = str(record.get("sample_anchor_end_label") or "--")
-        kc_source = str(record.get("kc_source") or "").strip()
-        if kc_source.startswith("interval"):
-            kc_source = "区间中值"
-        normalized_record = {
-            str(key): self._normalize_interval_detail_value(value)
-            for key, value in sorted(dict(record).items(), key=lambda item: str(item[0]))
-        }
-        lines = [
-            f"{interval_id} | {subtype_text}",
-            "",
-            "摘要",
-            f"区间编号: {interval_id}",
-            f"区间类型: {segment_type} ({state_label})",
-            f"state_code: {state_code}",
-            f"review_required: {bool(record.get('review_required', False))}",
-            f"decision_reason: {str(record.get('decision_reason') or '--')}",
-            f"sample 区间: {sample_interval_text}",
-            f"sample 投影状态: {sample_projection_status}",
-            f"sample 投影原因: {str(record.get('_sample_projection_reason') or '--')}",
-            f"anchor 区间: {anchor_start_label} -> {anchor_end_label}",
-            f"process 区间: {process_start_label} -> {process_end_label}",
-            f"点数: {self._build_interval_summary_values(record)[2]}",
-            f"物理长度: {self._format_interval_tree_metric(record.get('length_mm'), digits=3)} mm",
-            f"规则置信: {str(record.get('confidence_level') or '--')} (margin={self._format_interval_tree_metric(record.get('score_margin'), digits=6)})",
-            f"平均负载 P_meas: {self._format_interval_tree_metric(record.get('p_meas'), digits=3)} W",
-            f"预测负载 P_pred: {self._format_interval_tree_metric(record.get('p_pred'), digits=3)} W",
-            "",
-            "关键统计",
-            f"K_c_hat: {self._format_interval_tree_metric(record.get('K_c_hat'), digits=6)}",
-            f"K_c_UCB: {self._format_interval_tree_metric(record.get('K_c_UCB'), digits=6)}",
-            f"sigma_Kc: {self._format_interval_tree_metric(record.get('sigma_Kc'), digits=6)}",
-            f"kc_source: {kc_source or '--'}",
-            f"valid_kc_count: {int(record.get('valid_kc_count', 0) or 0)}",
-            f"gated_out_count: {int(record.get('gated_out_count', 0) or 0)}",
-            f"actual_load_std: {self._format_interval_tree_metric(record.get('actual_load_std'), digits=3)}",
-            f"actual_load_diff_std: {self._format_interval_tree_metric(record.get('actual_load_diff_std'), digits=3)}",
-            f"sigma_idle: {self._format_interval_tree_metric(record.get('sigma_idle'), digits=3)}",
-            f"delta_mrr: {self._format_interval_tree_metric(record.get('delta_mrr'), digits=6)}",
-            "",
-            "几何/工艺",
-            f"x(sample): {self._format_interval_tree_metric(record.get('display_start_x'), digits=3)} -> {self._format_interval_tree_metric(record.get('display_end_x'), digits=3)}",
-            f"x(process): {self._format_interval_tree_metric(record.get('process_start_x'), digits=3)} -> {self._format_interval_tree_metric(record.get('process_end_x'), digits=3)}",
-            f"t(sample): {self._format_interval_tree_metric(record.get('display_start_t'), digits=3)} -> {self._format_interval_tree_metric(record.get('display_end_t'), digits=3)}",
-            f"a_p: {self._format_interval_tree_metric(record.get('ap_mean', record.get('a_p')), digits=3)}",
-            f"a_e: {self._format_interval_tree_metric(record.get('ae_mean', record.get('a_e')), digits=3)}",
-            f"F_program: {self._format_interval_tree_metric(record.get('F_program_mean', record.get('F_plan')), digits=3)}",
-            f"MRR_program: {self._format_interval_tree_metric(record.get('MRR_program_mean'), digits=6)}",
-            f"P_idle: {self._format_interval_tree_metric(record.get('p_idle'), digits=3)} W",
-            "",
-            "原始记录字段",
-            json.dumps(normalized_record, ensure_ascii=False, indent=2, allow_nan=True),
-        ]
-        return "\n".join(lines)
-
-    def _set_interval_detail_button_enabled(self, enabled):
-        button = getattr(self, "show_interval_detail_btn", None)
-        if button is None:
+    @staticmethod
+    def _set_overview_text(target, text):
+        if target is None:
             return
         try:
-            if enabled:
-                button.state(["!disabled"])
-            else:
-                button.state(["disabled"])
+            target.set(str(text))
         except Exception:
             pass
 
-    def _get_selected_interval_detail_payload(self):
-        payload_map = getattr(self, "_ideal_tree_interval_payloads", {}) or {}
-        if not payload_map:
-            return None
-        tree = getattr(self, "ideal_tree", None)
-        if tree is not None:
-            try:
-                selection = tree.selection()
-            except Exception:
-                selection = ()
-            if selection:
-                item_id = str(selection[0])
-                self._selected_interval_detail_item = item_id
-                return payload_map.get(item_id)
-        item_id = str(getattr(self, "_selected_interval_detail_item", "") or "")
-        return payload_map.get(item_id)
+    @staticmethod
+    def _read_status_text(value):
+        if value is None:
+            return ""
+        try:
+            return str(value.get() or "").strip()
+        except Exception:
+            return str(value or "").strip()
 
-    def _show_selected_interval_detail_dialog(self, event=None):
-        payload = self._get_selected_interval_detail_payload()
-        if not payload:
-            self._set_interval_detail_button_enabled(False)
-            return None
-
-        dialog = tk.Toplevel(self.root)
-        dialog.title(f"区间完整信息 - {payload['title']}")
-        dialog.geometry("1100x720")
-        dialog.minsize(860, 560)
-        dialog.transient(self.root)
-        dialog.grab_set()
-        center_dialog_on_parent(dialog, self.root)
-
-        container = ttk.Frame(dialog, padding=8)
-        container.pack(fill=tk.BOTH, expand=True)
-        container.grid_rowconfigure(1, weight=1)
-        container.grid_columnconfigure(0, weight=1)
-
-        ttk.Label(container, text=payload["title"], font=UI_FONT_LARGE).grid(row=0, column=0, sticky="w", pady=(0, 6))
-
-        text_frame = ttk.Frame(container)
-        text_frame.grid(row=1, column=0, sticky="nsew")
-        text_frame.grid_rowconfigure(0, weight=1)
-        text_frame.grid_columnconfigure(0, weight=1)
-
-        detail_text = tk.Text(text_frame, wrap="none", font=UI_FONT_NORMAL)
-        detail_text.grid(row=0, column=0, sticky="nsew")
-        y_scroll = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=detail_text.yview)
-        y_scroll.grid(row=0, column=1, sticky="ns")
-        x_scroll = ttk.Scrollbar(text_frame, orient=tk.HORIZONTAL, command=detail_text.xview)
-        x_scroll.grid(row=1, column=0, sticky="ew")
-        detail_text.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
-        detail_text.insert("1.0", payload["text"])
-        detail_text.configure(state="disabled")
-
-        ttk.Button(container, text="关闭", command=dialog.destroy, width=10).grid(row=2, column=0, sticky="e", pady=(8, 0))
-        return "break" if event is not None else None
+    @staticmethod
+    def _prefixed_overview_status(prefix, value, fallback):
+        text = str(value or "").strip() or str(fallback)
+        normalized_prefix = str(prefix).rstrip("：:")
+        if text.startswith(normalized_prefix):
+            _, separator, suffix = text.partition("：")
+            if not separator:
+                _, separator, suffix = text.partition(":")
+            text = suffix.strip() if separator else text[len(normalized_prefix):].strip()
+        return f"{normalized_prefix}：{text or fallback}"
 
     def _refresh_ideal_tree(self):
-        """刷新右侧全行程六类区间详情树。"""
-        if not hasattr(self, 'ideal_tree'):
-            return
-        for item in self.ideal_tree.get_children():
-            self.ideal_tree.delete(item)
-        self._ideal_tree_interval_payloads = {}
-        self._selected_interval_detail_item = ""
-        self._set_interval_detail_button_enabled(False)
-
-        def _row_values(*values):
-            try:
-                column_count = len(tuple(self.ideal_tree.cget("columns")))
-            except Exception:
-                column_count = 4
-            padded = list(values[:column_count])
-            while len(padded) < column_count:
-                padded.append("")
-            return tuple(padded)
-
-        current_program = ""
-        if hasattr(self, "get_current_program_key"):
-            current_program = str(self.get_current_program_key() or "").strip()
-        if not current_program and hasattr(self, "sample_program_name"):
-            try:
-                current_program = str(self.sample_program_name.get() or "").strip()
-            except Exception:
-                current_program = ""
-
-        interval_records = self._get_current_interval_records(allow_profile_fallback=False)
-        if bool(getattr(self, "_current_interval_ready", False)) and not interval_records:
-            self.ideal_tree.insert("", "end", text="当前没有全行程划分结果", values=_row_values("当前没有全行程划分结果"))
-
-        # 权威区间始终保留在 ProcessInfo 过程域。右侧详情只使用
-        # 投影副本显示 sample 坐标，投影失败时不得回退成过程点标签。
-        display_interval_records = [dict(record) for record in interval_records]
-        segmentation_authoritative = bool(
-            getattr(self, "_current_interval_ready", False)
-            and str(getattr(self, "_current_interval_source", "") or "")
-            == "segmentation"
-        )
-        if segmentation_authoritative and display_interval_records:
-            mapping_status = str(
-                getattr(self, "_sample_mapping_status", "not_available")
-                or "not_available"
-            )
-            mapping_status_labels = {
-                "not_available": "未导入实际采样文件",
-                "pending": "待建立采样映射",
-                "valid": "已建立采样映射",
-                "failed": "采样映射失败",
-            }
-            result = getattr(self, "_latest_segmentation_result", None)
-            diagnostics = getattr(result, "diagnostics", None)
-            projection_diagnostics = (
-                dict(diagnostics.get("sample_projection") or {})
-                if isinstance(diagnostics, dict)
-                else {}
-            )
-            projection_reason = str(projection_diagnostics.get("reason") or "")
-            projected_records = []
-            if mapping_status == "valid":
-                try:
-                    projected_records = self._get_authoritative_segmentation_sample_records()
-                except Exception as projection_exc:
-                    projected_records = []
-                    projection_reason = str(projection_exc)
-                    mapping_status = "failed"
-
-            projected_by_id = {}
-            for projected in projected_records:
-                projected_id = str(
-                    projected.get("zone_id") or projected.get("interval_id") or ""
-                ).strip()
-                if projected_id:
-                    projected_by_id[projected_id] = projected
-
-            sample_projection_keys = (
-                "sample_start_idx",
-                "sample_end_idx",
-                "sample_start_line",
-                "sample_end_line",
-                "sample_start_point_index",
-                "sample_end_point_index",
-                "sample_start_label",
-                "sample_end_label",
-                "sample_interval_range",
-                "sample_count",
-            )
-            for display_record in display_interval_records:
-                for key in sample_projection_keys:
-                    display_record.pop(key, None)
-                interval_id = str(
-                    display_record.get("zone_id")
-                    or display_record.get("interval_id")
-                    or ""
-                ).strip()
-                projected = projected_by_id.get(interval_id)
-                if isinstance(projected, dict):
-                    for key in sample_projection_keys:
-                        if key in projected:
-                            display_record[key] = projected[key]
-                    display_record["_sample_projection_status"] = "已投影"
-                    display_record["_sample_projection_reason"] = ""
-                else:
-                    if mapping_status == "valid":
-                        display_record["_sample_projection_status"] = "无独立采样投影（已折叠或合并）"
-                        display_record["_sample_projection_reason"] = "该过程区间没有独立的实际采样点"
-                    else:
-                        display_record["_sample_projection_status"] = mapping_status_labels.get(
-                            mapping_status,
-                            "无采样投影",
-                        )
-                        display_record["_sample_projection_reason"] = (
-                            projection_reason
-                            or mapping_status_labels.get(mapping_status, "采样映射当前不可用")
-                        )
-
-        programs: Dict[str, Dict[str, Optional[Dict]]] = {}
-        for prog, program_info in (self.sample_programs or {}).items():
-            tools = program_info.get("tools", {})
-            prog_tools = programs.setdefault(prog, {})
-            for tool_id in tools.keys():
-                store = self.ideal_store.get((prog, tool_id))
-                prog_tools[tool_id] = store
-
-        if not programs:
-            fallback_name = current_program or "当前工艺"
-            programs[fallback_name] = {}
-        if not current_program and len(programs) == 1:
-            current_program = next(iter(programs.keys()))
-
-        for prog in sorted(programs.keys()):
-            is_active_program = bool(current_program) and str(prog) == str(current_program)
-            program_text = str(prog)
-            if is_active_program and interval_records:
-                program_text = f"{program_text}  [当前全行程区间 {len(interval_records)} 段]"
-            prog_node = self.ideal_tree.insert("", "end", text=program_text, open=True, values=_row_values())
-            tool_map = programs[prog]
-
-            process_path = self.program_process_file_map.get(prog)
-            if is_active_program and not process_path and hasattr(self, "get_primary_input_file"):
-                process_path = self.get_primary_input_file()
-            has_process_file = bool(process_path and os.path.exists(process_path))
-            has_processed = self._has_processed_result_for(process_path)
-            process_name = os.path.basename(process_path) if has_process_file else "未绑定"
-            status_text = "已导入并分析完成" if has_process_file and has_processed else "待导入或待分析"
-            self.ideal_tree.insert(
-                prog_node,
-                "end",
-                text=f"工艺信息：{status_text} | 文件：{process_name}",
-                values=_row_values(process_name, status_text),
-            )
-
-            if is_active_program:
-                kc_text = self._format_interval_tree_metric(self.get_kc_value(), digits=6)
-                ke_text = self._format_interval_tree_metric(self.get_ke_value(), digits=6)
-                sigma_text = self._format_interval_tree_metric(getattr(self, "kc_sigma", None).get() if hasattr(getattr(self, "kc_sigma", None), "get") else float("nan"), digits=6)
-                self.ideal_tree.insert(
-                    prog_node,
-                    "end",
-                    text=f"当前模型：K_c={kc_text} | K_e={ke_text} | σ_Kc={sigma_text}",
-                    values=_row_values(f"K_c={kc_text}", f"K_e={ke_text}", "", f"σ_Kc={sigma_text}"),
-                )
-                if segmentation_authoritative:
-                    mapping_text = str(
-                        self.sample_mapping_status_var.get()
-                        if hasattr(self, "sample_mapping_status_var")
-                        else "采样映射: 未知"
-                    )
-                    self.ideal_tree.insert(
-                        prog_node,
-                        "end",
-                        text=mapping_text,
-                        values=_row_values("", mapping_text, "", ""),
-                    )
-
-            if is_active_program and interval_records:
-                state_counts = {state: 0 for state in self._SEGMENT_STATE_LABELS}
-                for record in interval_records:
-                    segment_type, _state_code, _state_label = self._get_interval_state_display(record)
-                    state_counts[segment_type] += 1
-                count_text = " | ".join(
-                    f"{label} {state_counts[state]}"
-                    for state, (_code, label) in self._SEGMENT_STATE_LABELS.items()
-                )
-                interval_root = self.ideal_tree.insert(
-                    prog_node,
-                    "end",
-                    text=f"全行程区间：共 {len(interval_records)} 段 | {count_text}",
-                    open=True,
-                    values=_row_values("", "", str(len(interval_records)), ""),
-                )
-                sorted_records = sorted(
-                    display_interval_records,
-                    key=lambda item: (
-                        int(item.get("start_idx", 0) or 0),
-                        int(item.get("start_line", 0) or 0),
-                    ),
-                )
-                for idx, record in enumerate(sorted_records, 1):
-                    interval_id = str(record.get("zone_id") or record.get("interval_id") or f"Z{idx:03d}")
-                    _segment_type, state_code, state_label = self._get_interval_state_display(record)
-                    subtype_text = f"{state_label}[{state_code}]"
-                    process_text, sample_text, x_text, summary_text = self._build_interval_tree_row_values(record)
-                    interval_node = self.ideal_tree.insert(
-                        interval_root,
-                        "end",
-                        text=f"{interval_id} | {subtype_text}",
-                        open=False,
-                        values=_row_values(
-                            process_text,
-                            sample_text,
-                            x_text,
-                            summary_text,
-                        ),
-                    )
-                    self._ideal_tree_interval_payloads[interval_node] = {
-                        "title": f"{interval_id} | {subtype_text}",
-                        "text": self._build_interval_detail_text(interval_id, subtype_text, record),
-                    }
-            elif is_active_program and has_process_file and has_processed:
-                self.ideal_tree.insert(
-                    prog_node,
-                    "end",
-                    text="全行程区间：当前尚未生成，请运行六类划分",
-                    values=_row_values("当前尚未生成"),
-                )
-
-            tool_root = self.ideal_tree.insert(prog_node, "end", text="刀具理想值", open=False, values=_row_values())
-            if not tool_map:
-                self.ideal_tree.insert(tool_root, "end", text="当前没有可显示的刀具理想值", values=_row_values("当前没有可显示的刀具理想值"))
-                continue
-            for tool in sorted(tool_map.keys()):
-                store = tool_map[tool]
-                tool_label = self.format_tool_label(tool)
-                if store:
-                    rg = store.get("rg", 1.0)
-                    mean_val, _, _ = self.compute_tool_measured_mean(prog, tool)
-                    if mean_val is not None:
-                        ideal_val = mean_val * rg
-                        display = f"{tool_label}：理想值 {ideal_val:.2f} | rg={rg:.2f}"
-                    else:
-                        display = f"{tool_label}：理想值 未计算 | rg={rg:.2f}"
-                else:
-                    display = f"{tool_label}：理想值 未设定"
-                self.ideal_tree.insert(tool_root, "end", text=tool_label, values=_row_values(display))
-
-    def _on_ideal_tree_select(self, event=None):
-        """右侧详情树仅作展示；若选中区间摘要，则允许弹出完整详情。"""
-        tree = getattr(self, "ideal_tree", None)
-        if tree is None:
-            self._selected_interval_detail_item = ""
-            self._set_interval_detail_button_enabled(False)
-            return
+        """刷新右侧区间划分概况；保留旧方法名以兼容既有调用点。"""
         try:
-            selection = tree.selection()
+            interval_records = list(
+                self._get_current_interval_records(allow_profile_fallback=False) or []
+            )
         except Exception:
-            selection = ()
-        self._selected_interval_detail_item = str(selection[0]) if selection else ""
-        self._set_interval_detail_button_enabled(self._selected_interval_detail_item in getattr(self, "_ideal_tree_interval_payloads", {}))
-        return
+            interval_records = list(getattr(self, "current_interval_records", []) or [])
+
+        ready = bool(getattr(self, "_current_interval_ready", False))
+        segmentation_text = self._read_status_text(getattr(self, "segmentation_status_var", None))
+        if ready:
+            division_status = "成功"
+        elif "失败" in segmentation_text:
+            division_status = "失败"
+        elif "正在" in segmentation_text:
+            division_status = "进行中"
+        else:
+            division_status = "未运行"
+
+        state_counts = {state: 0 for state in self._SEGMENT_STATE_LABELS}
+        for record in interval_records:
+            try:
+                segment_type, _state_code, _state_label = self._get_interval_state_display(record)
+            except Exception:
+                continue
+            state_counts[segment_type] = state_counts.get(segment_type, 0) + 1
+        count_rows = (
+            ("idle", "entry", "steady"),
+            ("transition", "exit", "nonsteady"),
+        )
+        count_text = "\n　　　　　　".join(
+            " | ".join(
+                f"{self._SEGMENT_STATE_LABELS[state][1]} {state_counts.get(state, 0)}"
+                for state in row
+            )
+            for row in count_rows
+        )
+
+        total = len(interval_records)
+        self._set_overview_text(
+            getattr(self, "interval_overview_success_var", None),
+            f"当前划分：{division_status}",
+        )
+        self._set_overview_text(
+            getattr(self, "interval_overview_total_var", None),
+            f"总区间数：{total}",
+        )
+        self._set_overview_text(
+            getattr(self, "interval_overview_counts_var", None),
+            f"六类数量：{count_text}",
+        )
+        mapping_text = self._read_status_text(getattr(self, "sample_mapping_status_var", None))
+        self._set_overview_text(
+            getattr(self, "interval_overview_mapping_var", None),
+            self._prefixed_overview_status(
+                "采样映射", mapping_text, "未导入实际采样文件"
+            ),
+        )
+        self._set_overview_text(getattr(self, "interval_count_var", None), str(total))
 
     def _refresh_current_ideal_display(self):
         """刷新当前选中刀具的理想值显示"""
@@ -817,17 +449,8 @@ class ConfigStateMixin:
         return
 
     def _set_plot_mode(self, mode: str):
-        """设置显示模式（叠加/上下）"""
-        self.sample_plot_mode.set(mode)
-        # 更新按钮视觉状态
-        if hasattr(self, 'overlay_btn') and hasattr(self, 'stacked_btn'):
-            if mode == "overlay":
-                self.overlay_btn.state(['pressed'])
-                self.stacked_btn.state(['!pressed'])
-            else:
-                self.overlay_btn.state(['!pressed'])
-                self.stacked_btn.state(['pressed'])
-        # 刷新图表
+        """旧调用兼容入口；精简页面固定使用单图模式。"""
+        self.sample_plot_mode.set("overlay")
         self.on_sample_selection_change()
 
     def reimport_sample_data(self):
