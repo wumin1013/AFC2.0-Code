@@ -265,25 +265,15 @@ class PlotSupportMixin:
             artists.append(collection)
         return artists
 
-    def draw_process_mrr_segmentation(
-        self,
-        ax,
-        point_labels,
-        intervals,
-        *,
-        show_labels=True,
-    ):
-        """绘制不依赖实际采样或预测模型的程序 MRR 过程域视图。"""
-
-        if ax is None or point_labels is None:
-            return []
+    def _resolve_process_segmentation_coordinates(self, point_labels):
         frame = (
             point_labels.copy()
             if isinstance(point_labels, pd.DataFrame)
             else pd.DataFrame(point_labels)
         )
-        if frame.empty or "MRR_program" not in frame:
-            return []
+        if frame.empty:
+            return frame, np.asarray([], dtype=float), None, None
+
         cell_left_values = None
         cell_right_values = None
         if "path_start" in frame and "path_end" in frame:
@@ -297,51 +287,81 @@ class PlotSupportMixin:
             ).to_numpy(dtype=float)
             x_values = (cell_left_values + cell_right_values) * 0.5
         elif "s" in frame:
-            x_values = pd.to_numeric(frame["s"], errors="coerce").to_numpy(dtype=float)
+            x_values = pd.to_numeric(
+                frame["s"],
+                errors="coerce",
+            ).to_numpy(dtype=float)
         else:
             x_values = np.arange(len(frame), dtype=float)
+        return frame, x_values, cell_left_values, cell_right_values
+
+    def draw_process_mrr_segmentation(
+        self,
+        ax,
+        point_labels,
+        intervals,
+        *,
+        show_labels=True,
+        show_states=True,
+    ):
+        """绘制不依赖实际采样或预测模型的程序 MRR 过程域视图。"""
+
+        if ax is None or point_labels is None:
+            return []
+        (
+            frame,
+            x_values,
+            cell_left_values,
+            cell_right_values,
+        ) = self._resolve_process_segmentation_coordinates(point_labels)
+        if frame.empty or "MRR_program" not in frame:
+            return []
         mrr_values = pd.to_numeric(
             frame["MRR_program"],
             errors="coerce",
         ).to_numpy(dtype=float)
-        state_masks = {
-            state: np.zeros(len(frame), dtype=bool)
-            for state in SEGMENTATION_STATE_ORDER
-        }
-        if "segment_type" in frame:
-            point_states = (
-                frame["segment_type"].fillna("").astype(str).str.strip().str.lower()
+        artists = []
+        if show_states:
+            state_masks = {
+                state: np.zeros(len(frame), dtype=bool)
+                for state in SEGMENTATION_STATE_ORDER
+            }
+            if "segment_type" in frame:
+                point_states = (
+                    frame["segment_type"].fillna("").astype(str).str.strip().str.lower()
+                )
+                for state in SEGMENTATION_STATE_ORDER:
+                    state_masks[state] = point_states.eq(state).to_numpy(dtype=bool)
+            else:
+                records = (
+                    intervals.to_dict(orient="records")
+                    if hasattr(intervals, "to_dict")
+                    else list(intervals or [])
+                )
+                for record in records:
+                    if not isinstance(record, dict):
+                        continue
+                    try:
+                        start_idx = max(0, int(record.get("start_idx")))
+                        end_idx = min(len(frame) - 1, int(record.get("end_idx")))
+                    except (TypeError, ValueError):
+                        continue
+                    state = str(record.get("segment_type") or "").strip().lower()
+                    if state in state_masks and end_idx >= start_idx:
+                        state_masks[state][start_idx:end_idx + 1] = True
+            artists.extend(
+                self.draw_segmentation_curve_background(
+                    ax,
+                    x_values,
+                    mrr_values,
+                    state_masks,
+                    cell_left_values=cell_left_values,
+                    cell_right_values=cell_right_values,
+                    alpha=0.30,
+                    show_labels=show_labels,
+                    zorder=1,
+                )
             )
-            for state in SEGMENTATION_STATE_ORDER:
-                state_masks[state] = point_states.eq(state).to_numpy(dtype=bool)
-        else:
-            records = (
-                intervals.to_dict(orient="records")
-                if hasattr(intervals, "to_dict")
-                else list(intervals or [])
-            )
-            for record in records:
-                if not isinstance(record, dict):
-                    continue
-                try:
-                    start_idx = max(0, int(record.get("start_idx")))
-                    end_idx = min(len(frame) - 1, int(record.get("end_idx")))
-                except (TypeError, ValueError):
-                    continue
-                state = str(record.get("segment_type") or "").strip().lower()
-                if state in state_masks and end_idx >= start_idx:
-                    state_masks[state][start_idx:end_idx + 1] = True
-        artists = self.draw_segmentation_curve_background(
-            ax,
-            x_values,
-            mrr_values,
-            state_masks,
-            cell_left_values=cell_left_values,
-            cell_right_values=cell_right_values,
-            alpha=0.30,
-            show_labels=show_labels,
-            zorder=1,
-        )
         finite = np.isfinite(x_values) & np.isfinite(mrr_values)
         if np.any(finite):
             line_values = np.where(finite, mrr_values, np.nan)
@@ -354,9 +374,9 @@ class PlotSupportMixin:
                 zorder=3,
             )
             artists.append(line)
-        ax.set_title("程序 MRR 与过程域六态区间")
-        ax.set_xlabel("过程行程 s (mm)")
-        ax.set_ylabel("MRR_program (mm³/s)")
+        ax.set_title("工艺信息与区间状态")
+        ax.set_xlabel("行程")
+        ax.set_ylabel(r"MRR_program ($\mathrm{mm^3/s}$)")
         ax.margins(x=0)
         return artists
 

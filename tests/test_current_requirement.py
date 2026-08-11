@@ -24,6 +24,7 @@ from project.plot_support import PlotSupportMixin
 from project.processing_core import ProcessingCoreMixin
 from project.sample_manager import SampleManagerMixin
 from project.segmentation import SegmentationConfig, SegmentationPipeline
+from project.ui_bootstrap import BootstrapUiMixin
 
 
 def _process_frame(mrr_values: list[float], *, step_mm: float = 0.1) -> pd.DataFrame:
@@ -149,6 +150,44 @@ class _ValueVar:
         self.value = value
 
 
+class _ImmediateRoot:
+    def after(self, _delay, callback):
+        callback()
+        return None
+
+    def after_cancel(self, _job):
+        return None
+
+
+class _CanvasStub:
+    def __init__(self):
+        self.draw_count = 0
+
+    def draw_idle(self):
+        self.draw_count += 1
+
+
+class _SizedWidgetStub:
+    def __init__(self, width, height):
+        self.width = width
+        self.height = height
+
+    def winfo_width(self):
+        return self.width
+
+    def winfo_height(self):
+        return self.height
+
+
+class _SizedCanvasStub(_CanvasStub):
+    def __init__(self, width, height):
+        super().__init__()
+        self.widget = _SizedWidgetStub(width, height)
+
+    def get_tk_widget(self):
+        return self.widget
+
+
 class _SampleSelectionHarness(SampleManagerMixin):
     def __init__(self):
         self.sample_program_name = _ValueVar("PHONE")
@@ -232,6 +271,40 @@ class _VisualizationHarness(AnalysisExportMixin, PlotSupportMixin):
                 dtype=float,
             )
         return self.manual_measurement_data
+
+
+class _OptionalOverlayVisualizationHarness(
+    _VisualizationHarness,
+    SampleManagerMixin,
+):
+    def __init__(self, process_result):
+        super().__init__(process_result)
+        self.show_measured_curve_var = _ValueVar(True)
+        self.show_reconstructed_curve_var = _ValueVar(True)
+        self.show_feed_overlay_var = _ValueVar(False)
+        self.show_speed_overlay_var = _ValueVar(False)
+        self.show_ap_overlay_var = _ValueVar(False)
+        self.show_ae_overlay_var = _ValueVar(False)
+        self.show_interval_state_var = _ValueVar(True)
+        self._optional_overlay_contexts = {}
+        self.sample_display_mode = _ValueVar("none")
+        self.sample_program_name = _ValueVar("")
+        self.sample_tool_name = _ValueVar("")
+        self.sample_plot_mode = _ValueVar("overlay")
+        self.root = _ImmediateRoot()
+        self._selection_change_job = None
+        self._pending_selection_signature = None
+        self._last_selection_signature = None
+        self._loading_sample_data = False
+
+    def _build_aligned_process_geometry_frame(self, raw_line_numbers):
+        point_count = len(raw_line_numbers)
+        return pd.DataFrame({
+            "ap": np.linspace(0.5, 1.5, point_count),
+            "ae": np.linspace(1.0, 2.0, point_count),
+            "feed_plan": np.linspace(500.0, 800.0, point_count),
+            "speed_plan": np.linspace(3500.0, 4500.0, point_count),
+        })
 
 
 class _ProcessExportHarness(AnalysisExportMixin):
@@ -948,6 +1021,326 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
             [row["s"] for row in no_geometry_rows],
             [1.0, 1.0],
         )
+
+    def test_08_process_preview_supports_all_optional_curves_and_state_toggle(self):
+        process_result = _run(
+            [0.0] * 3
+            + [1.0, 2.0, 3.0, 2.0]
+            + [4.0] * 12
+            + [3.0, 2.0, 1.0]
+            + [0.0] * 3
+        )
+        visualization = _OptionalOverlayVisualizationHarness(process_result)
+        point_count = len(process_result.point_labels)
+        visualization.data = [
+            {"S": 4000.0 + index * 10.0}
+            for index in range(point_count)
+        ]
+
+        expected_labels = {
+            "show_feed_overlay_var": "F(程序进给)",
+            "show_speed_overlay_var": "S(主轴转速)",
+            "show_ap_overlay_var": "ap(切深)",
+            "show_ae_overlay_var": "ae(切宽)",
+        }
+        curve_variables = [
+            visualization.show_feed_overlay_var,
+            visualization.show_speed_overlay_var,
+            visualization.show_ap_overlay_var,
+            visualization.show_ae_overlay_var,
+        ]
+        for variable_name, expected_label in expected_labels.items():
+            for variable in curve_variables:
+                variable.set(False)
+            getattr(visualization, variable_name).set(True)
+            overlays = visualization.get_optional_process_overlays(
+                process_result.point_labels
+            )
+            self.assertEqual([expected_label], [item["label"] for item in overlays])
+
+        for variable in curve_variables:
+            variable.set(True)
+        self.assertTrue(visualization.generate_plots(silent=True))
+        process_figure = visualization.figures[0]
+        process_axis = process_figure.axes[0]
+        try:
+            self.assertEqual(5, len(process_figure.axes))
+            self.assertEqual("工艺信息与区间状态", process_axis.get_title())
+            self.assertEqual("行程", process_axis.get_xlabel())
+            self.assertIn(r"\mathrm{mm^3/s}", process_axis.get_ylabel())
+            overlay_labels = {
+                line.get_label()
+                for axis in process_figure.axes[1:]
+                for line in axis.lines
+            }
+            self.assertEqual(set(expected_labels.values()), overlay_labels)
+            process_figure.canvas.draw()
+        finally:
+            plt.close(process_figure)
+
+        for variable in curve_variables:
+            variable.set(False)
+        visualization.show_interval_state_var.set(False)
+        self.assertTrue(visualization.generate_plots(silent=True))
+        states_hidden_figure = visualization.figures[0]
+        try:
+            state_fills = [
+                artist
+                for artist in states_hidden_figure.axes[0].collections
+                if isinstance(artist, PolyCollection)
+            ]
+            self.assertEqual([], state_fills)
+        finally:
+            plt.close(states_hidden_figure)
+
+        visualization.show_interval_state_var.set(True)
+        visualization.show_feed_overlay_var.set(True)
+        visualization.on_optional_overlay_toggle()
+        callback_figure = visualization.figures[0]
+        try:
+            self.assertIsNot(states_hidden_figure, callback_figure)
+            self.assertEqual(2, len(callback_figure.axes))
+            self.assertIn(
+                "F(程序进给)",
+                [line.get_label() for line in callback_figure.axes[-1].lines],
+            )
+        finally:
+            plt.close(callback_figure)
+
+    def test_09_mapped_preview_respects_curve_and_state_toggles(self):
+        process_result = _run(
+            [0.0] * 3
+            + [1.0, 2.0, 3.0, 2.0]
+            + [4.0] * 12
+            + [3.0, 2.0, 1.0]
+            + [0.0] * 3
+        )
+        point_count = len(process_result.point_labels)
+        actual_load = np.linspace(50.0, 80.0, point_count)
+        predicted_load = np.linspace(10.0, 40.0, point_count)
+        actual_speed = np.linspace(4000.0, 5000.0, point_count)
+        actual_feed = np.linspace(600.0, 900.0, point_count)
+        mapping_records = [
+            {
+                **record,
+                "sample_start_idx": int(record["start_idx"]),
+                "sample_end_idx": int(record["end_idx"]),
+            }
+            for record in process_result.intervals.to_dict(orient="records")
+        ]
+
+        visualization = _OptionalOverlayVisualizationHarness(process_result)
+        visualization.data = [
+            {
+                "ap": float(process_result.point_labels.iloc[index]["ap"]),
+                "ae": float(process_result.point_labels.iloc[index]["ae"]),
+                "S": float(actual_speed[index]),
+            }
+            for index in range(point_count)
+        ]
+        visualization.sample_data_loaded = True
+        visualization.sample_data_values = np.column_stack(
+            [actual_load, actual_speed, actual_feed]
+        )
+        visualization.sample_data_line_numbers = np.arange(
+            100,
+            100 + point_count,
+            dtype=int,
+        )
+        visualization.sample_data_time_indices = np.arange(
+            point_count,
+            dtype=float,
+        )
+        visualization.sample_data_mode = "experiment_measurement"
+        visualization.manual_measurement_data = {
+            "actual_load": actual_load,
+            "predicted_load": predicted_load,
+        }
+        visualization._sample_mapping_status = "valid"
+        visualization._current_mapping_signature = "mapping-valid"
+        visualization._segmentation_sample_projection_records = mapping_records
+
+        self.assertTrue(visualization.generate_plots(silent=True))
+        figure = visualization.figures[0]
+        try:
+            self.assertEqual("功率与区间状态", figure.axes[0].get_title())
+            self.assertIn(id(figure), visualization._optional_overlay_contexts)
+            self.assertEqual(1, len(figure.axes))
+            visualization._current_preview_fig = figure
+            visualization.canvas_data = _CanvasStub()
+
+            visualization.show_feed_overlay_var.set(True)
+            visualization.show_speed_overlay_var.set(True)
+            visualization.show_ap_overlay_var.set(True)
+            visualization.show_ae_overlay_var.set(True)
+            visualization.on_optional_overlay_toggle()
+            self.assertEqual(5, len(figure.axes))
+            self.assertEqual(1, visualization.canvas_data.draw_count)
+            overlay_labels = {
+                line.get_label()
+                for axis in figure.axes[1:]
+                for line in axis.lines
+            }
+            self.assertEqual(
+                {
+                    "F(实际进给)",
+                    "S(实际转速)",
+                    "ap(切深)",
+                    "ae(切宽)",
+                },
+                overlay_labels,
+            )
+
+            visualization.show_feed_overlay_var.set(False)
+            visualization.show_speed_overlay_var.set(False)
+            visualization.show_ap_overlay_var.set(False)
+            visualization.show_ae_overlay_var.set(False)
+            visualization.on_optional_overlay_toggle()
+            self.assertEqual(1, len(figure.axes))
+            self.assertEqual(2, visualization.canvas_data.draw_count)
+        finally:
+            plt.close(figure)
+
+        visualization.show_measured_curve_var.set(False)
+        visualization.show_interval_state_var.set(False)
+        self.assertTrue(visualization.generate_plots(silent=True))
+        toggled_figure = visualization.figures[0]
+        try:
+            labels = [
+                line.get_label()
+                for line in toggled_figure.axes[0].lines
+            ]
+            self.assertNotIn("实际负载", labels)
+            self.assertIn("预测负载", labels)
+            state_fills = [
+                artist
+                for artist in toggled_figure.axes[0].collections
+                if isinstance(artist, PolyCollection)
+            ]
+            self.assertEqual([], state_fills)
+        finally:
+            plt.close(toggled_figure)
+
+        visualization.show_measured_curve_var.set(True)
+        visualization.show_reconstructed_curve_var.set(False)
+        self.assertTrue(visualization.generate_plots(silent=True))
+        prediction_hidden_figure = visualization.figures[0]
+        try:
+            labels = [
+                line.get_label()
+                for line in prediction_hidden_figure.axes[0].lines
+            ]
+            self.assertIn("实际负载", labels)
+            self.assertNotIn("预测负载", labels)
+        finally:
+            plt.close(prediction_hidden_figure)
+
+        visualization.sample_data_mode = "sampledata"
+        visualization.show_feed_overlay_var.set(True)
+        visualization.show_speed_overlay_var.set(True)
+        visualization.show_ap_overlay_var.set(True)
+        visualization.show_ae_overlay_var.set(True)
+        sampledata_labels = {
+            item["label"]
+            for item in visualization.get_optional_measurement_overlays()
+        }
+        self.assertEqual(
+            {
+                "F(程序进给)",
+                "S(主轴转速)",
+                "ap(切深)",
+                "ae(切宽)",
+            },
+            sampledata_labels,
+        )
+
+    def test_10_optional_axes_stay_compact_and_do_not_overlap_after_resize(self):
+        process_result = _run(
+            [0.0] * 3
+            + [1.0, 2.0, 3.0, 2.0]
+            + [4.0] * 12
+            + [3.0, 2.0, 1.0]
+            + [0.0] * 3
+        )
+        visualization = _OptionalOverlayVisualizationHarness(process_result)
+        visualization.data = [
+            {"S": 4000.0 + index * 10.0}
+            for index in range(len(process_result.point_labels))
+        ]
+        visualization.show_ap_overlay_var.set(True)
+        visualization.show_ae_overlay_var.set(True)
+
+        self.assertTrue(visualization.generate_plots(silent=True))
+        figure = visualization.figures[0]
+        visualization.canvas_data = _SizedCanvasStub(700, 520)
+        try:
+            BootstrapUiMixin.adjust_figure_sizes(visualization)
+            figure.canvas.draw()
+
+            self.assertGreater(figure.subplotpars.right, 0.75)
+            ap_axis, ae_axis = figure.axes[1:]
+            renderer = figure.canvas.get_renderer()
+            ap_label_bounds = ap_axis.yaxis.label.get_window_extent(renderer)
+            ae_tick_bounds = [
+                tick_label.get_window_extent(renderer)
+                for tick_label in ae_axis.get_yticklabels()
+                if tick_label.get_visible() and tick_label.get_text()
+            ]
+            self.assertTrue(ae_tick_bounds)
+            self.assertFalse(
+                any(
+                    ap_label_bounds.overlaps(tick_bounds)
+                    for tick_bounds in ae_tick_bounds
+                )
+            )
+            ae_label_bounds = ae_axis.yaxis.label.get_window_extent(renderer)
+            self.assertLessEqual(ae_label_bounds.x1, figure.bbox.x1)
+        finally:
+            plt.close(figure)
+
+        visualization.show_feed_overlay_var.set(True)
+        visualization.show_speed_overlay_var.set(True)
+        self.assertTrue(visualization.generate_plots(silent=True))
+        wide_figure = visualization.figures[0]
+        visualization.canvas_data = _SizedCanvasStub(2048, 520)
+        try:
+            BootstrapUiMixin.adjust_figure_sizes(visualization)
+            wide_figure.canvas.draw()
+
+            self.assertEqual(5, len(wide_figure.axes))
+            self.assertGreater(wide_figure.subplotpars.right, 0.84)
+            self.assertGreater(wide_figure.axes[0].get_position().width, 0.75)
+            renderer = wide_figure.canvas.get_renderer()
+            aux_axes = wide_figure.axes[1:]
+            for index, axis in enumerate(aux_axes):
+                self.assertEqual(
+                    (
+                        "outward",
+                        visualization._OPTIONAL_OVERLAY_SPINE_STEP_POINTS * index,
+                    ),
+                    axis.spines["right"].get_position(),
+                )
+            for inner_axis, outer_axis in zip(aux_axes, aux_axes[1:]):
+                inner_label_bounds = inner_axis.yaxis.label.get_window_extent(
+                    renderer
+                )
+                outer_tick_bounds = [
+                    tick_label.get_window_extent(renderer)
+                    for tick_label in outer_axis.get_yticklabels()
+                    if tick_label.get_visible() and tick_label.get_text()
+                ]
+                self.assertFalse(
+                    any(
+                        inner_label_bounds.overlaps(tick_bounds)
+                        for tick_bounds in outer_tick_bounds
+                    )
+                )
+            outer_label_bounds = aux_axes[-1].yaxis.label.get_window_extent(
+                renderer
+            )
+            self.assertLessEqual(outer_label_bounds.x1, wide_figure.bbox.x1)
+        finally:
+            plt.close(wide_figure)
 
 
 if __name__ == "__main__":

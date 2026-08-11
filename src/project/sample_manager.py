@@ -4,6 +4,9 @@ from .shared import *
 
 
 class SampleManagerMixin:
+    _OPTIONAL_OVERLAY_SPINE_STEP_POINTS = 52.0
+    _OPTIONAL_OVERLAY_EDGE_PADDING_POINTS = 64.0
+
     def show_sample_preview(self):
         """仅显示实测数据预览"""
         if not self.sample_data_loaded or self.sample_data_values is None:
@@ -122,12 +125,6 @@ class SampleManagerMixin:
             linewidth=0.8,
         )
 
-        fig.subplots_adjust(
-            left=0.06,
-            right=self._resolve_optional_overlay_right_margin(len(aux_axes)),
-            top=0.88,
-            bottom=0.09
-        )
         self._register_optional_overlay_context(
             fig,
             parent_ax=ax,
@@ -168,7 +165,7 @@ class SampleManagerMixin:
         return default_labels[0]
 
     def _get_optional_process_geometry_values(self):
-        """获取与当前样本逐点对齐的工艺几何量。"""
+        """获取与当前样本逐点对齐的程序工艺量。"""
         if not self.sample_data_loaded or self.sample_data_line_numbers is None or not self.data:
             return {}
 
@@ -185,12 +182,117 @@ class SampleManagerMixin:
             return {}
 
         overlays = {}
-        for key in ("ap", "ae"):
-            if key not in process_df.columns:
+        for source_key, overlay_key in (
+            ("ap", "ap"),
+            ("ae", "ae"),
+            ("feed_plan", "feed"),
+            ("speed_plan", "speed"),
+        ):
+            if source_key not in process_df.columns:
                 continue
-            values = pd.to_numeric(process_df[key], errors="coerce").to_numpy(dtype=float)
+            values = pd.to_numeric(
+                process_df[source_key],
+                errors="coerce",
+            ).to_numpy(dtype=float)
             if values.shape[0] == raw_lines.size:
-                overlays[key] = values
+                overlays[overlay_key] = values
+        return overlays
+
+    def _optional_curve_enabled(self, variable_name, default=False):
+        variable = getattr(self, variable_name, None)
+        if variable is None:
+            return bool(default)
+        try:
+            return bool(variable.get())
+        except Exception:
+            return bool(default)
+
+    def get_optional_process_overlays(self, point_labels):
+        """获取仅工艺信息视图可选显示的 F、S、ap 和 ae 曲线。"""
+        frame = (
+            point_labels.copy()
+            if isinstance(point_labels, pd.DataFrame)
+            else pd.DataFrame(point_labels)
+        )
+        if frame.empty:
+            return []
+
+        def _numeric_column(*names):
+            for name in names:
+                if name in frame:
+                    return pd.to_numeric(
+                        frame[name],
+                        errors="coerce",
+                    ).to_numpy(dtype=float)
+            return np.full(len(frame), np.nan, dtype=float)
+
+        speed_values = _numeric_column("S", "S_program", "spindle_speed")
+        if not np.any(np.isfinite(speed_values)):
+            source_indices = pd.to_numeric(
+                frame.get("source_index", pd.Series(range(len(frame)))),
+                errors="coerce",
+            ).to_numpy(dtype=float)
+            process_rows = list(getattr(self, "data", None) or [])
+            speed_values = np.full(len(frame), np.nan, dtype=float)
+            for output_index, source_index in enumerate(source_indices):
+                if not np.isfinite(source_index):
+                    continue
+                source_index = int(source_index)
+                if not 0 <= source_index < len(process_rows):
+                    continue
+                row = process_rows[source_index]
+                if not isinstance(row, dict):
+                    continue
+                for key in ("S", "S_program", "spindle_speed"):
+                    try:
+                        value = float(row.get(key))
+                    except (TypeError, ValueError):
+                        continue
+                    if np.isfinite(value):
+                        speed_values[output_index] = value
+                        break
+
+        overlays = []
+        feed_values = _numeric_column("F_program", "F", "feed_effective")
+        if (
+            self._optional_curve_enabled("show_feed_overlay_var")
+            and np.any(np.isfinite(feed_values))
+        ):
+            overlays.append({
+                "values": feed_values,
+                "label": "F(程序进给)",
+                "unit": "mm/min",
+                "color": "#E67E22",
+                "linestyle": "--",
+            })
+        if (
+            self._optional_curve_enabled("show_speed_overlay_var")
+            and np.any(np.isfinite(speed_values))
+        ):
+            overlays.append({
+                "values": speed_values,
+                "label": "S(主轴转速)",
+                "unit": "r/min",
+                "color": "#16A085",
+                "linestyle": "-.",
+            })
+
+        for key, variable_name, label, color, linestyle in (
+            ("ap", "show_ap_overlay_var", "ap(切深)", "#7E57C2", "-"),
+            ("ae", "show_ae_overlay_var", "ae(切宽)", "#C0392B", "--"),
+        ):
+            values = _numeric_column(key)
+            if (
+                self._optional_curve_enabled(variable_name)
+                and np.any(np.isfinite(values))
+            ):
+                overlays.append({
+                    "values": values,
+                    "label": label,
+                    "unit": "mm",
+                    "color": color,
+                    "linestyle": linestyle,
+                })
         return overlays
 
     def get_optional_measurement_overlays(self):
@@ -206,7 +308,7 @@ class SampleManagerMixin:
             source_idx = int(self.sample_data_source.get())
             if (
                 values.shape[1] > 2
-                and bool(getattr(self, "show_feed_overlay_var", tk.BooleanVar(value=False)).get())
+                and self._optional_curve_enabled("show_feed_overlay_var")
                 and source_idx != 2
             ):
                 overlays.append({
@@ -218,7 +320,7 @@ class SampleManagerMixin:
                 })
             if (
                 values.shape[1] > 1
-                and bool(getattr(self, "show_speed_overlay_var", tk.BooleanVar(value=False)).get())
+                and self._optional_curve_enabled("show_speed_overlay_var")
                 and source_idx != 1
             ):
                 overlays.append({
@@ -230,7 +332,32 @@ class SampleManagerMixin:
                 })
 
         process_overlays = self._get_optional_process_geometry_values()
-        if bool(getattr(self, "show_ap_overlay_var", tk.BooleanVar(value=False)).get()) and "ap" in process_overlays:
+        existing_labels = {str(item.get("label") or "") for item in overlays}
+        if (
+            self._optional_curve_enabled("show_feed_overlay_var")
+            and "feed" in process_overlays
+            and "F(实际进给)" not in existing_labels
+        ):
+            overlays.append({
+                "values": process_overlays["feed"],
+                "label": "F(程序进给)",
+                "unit": "mm/min",
+                "color": "#E67E22",
+                "linestyle": "--",
+            })
+        if (
+            self._optional_curve_enabled("show_speed_overlay_var")
+            and "speed" in process_overlays
+            and "S(实际转速)" not in existing_labels
+        ):
+            overlays.append({
+                "values": process_overlays["speed"],
+                "label": "S(主轴转速)",
+                "unit": "r/min",
+                "color": "#16A085",
+                "linestyle": "-.",
+            })
+        if self._optional_curve_enabled("show_ap_overlay_var") and "ap" in process_overlays:
             overlays.append({
                 "values": process_overlays["ap"],
                 "label": "ap(切深)",
@@ -238,7 +365,7 @@ class SampleManagerMixin:
                 "color": "#7E57C2",
                 "linestyle": "-",
             })
-        if bool(getattr(self, "show_ae_overlay_var", tk.BooleanVar(value=False)).get()) and "ae" in process_overlays:
+        if self._optional_curve_enabled("show_ae_overlay_var") and "ae" in process_overlays:
             overlays.append({
                 "values": process_overlays["ae"],
                 "label": "ae(切宽)",
@@ -248,9 +375,17 @@ class SampleManagerMixin:
             })
         return overlays
 
-    def plot_optional_measurement_overlays(self, parent_ax, x_values, context_mask, valid_mask=None):
+    def plot_optional_measurement_overlays(
+        self,
+        parent_ax,
+        x_values,
+        context_mask,
+        valid_mask=None,
+        overlays=None,
+    ):
         """在当前图上叠加附加曲线，返回创建的辅助坐标轴。"""
-        overlays = self.get_optional_measurement_overlays()
+        if overlays is None:
+            overlays = self.get_optional_measurement_overlays()
         if not overlays or x_values is None or context_mask is None:
             return []
 
@@ -278,7 +413,10 @@ class SampleManagerMixin:
             aux_ax.grid(False)
             aux_ax.set_zorder(parent_ax.get_zorder() + idx + 1)
             try:
-                aux_ax.spines["right"].set_position(("axes", 1.0 + 0.085 * idx))
+                aux_ax.spines["right"].set_position((
+                    "outward",
+                    self._OPTIONAL_OVERLAY_SPINE_STEP_POINTS * idx,
+                ))
             except Exception:
                 pass
             self.apply_plot_style(aux_ax, grid=False, text_color=overlay["color"], transparent=True)
@@ -308,9 +446,68 @@ class SampleManagerMixin:
 
         return aux_axes
 
-    def _resolve_optional_overlay_right_margin(self, overlay_count):
+    def _resolve_optional_overlay_right_margin(
+        self,
+        fig,
+        overlay_count,
+        base_right=0.94,
+        left=0.07,
+    ):
         overlay_count = max(0, int(overlay_count or 0))
-        return max(0.78, 0.94 - 0.045 * overlay_count)
+        base_right = float(base_right)
+        if fig is None or overlay_count <= 0:
+            return base_right
+
+        try:
+            figure_width_points = float(fig.get_figwidth()) * 72.0
+        except Exception:
+            return base_right
+        if not np.isfinite(figure_width_points) or figure_width_points <= 0:
+            return base_right
+
+        reserved_points = (
+            self._OPTIONAL_OVERLAY_EDGE_PADDING_POINTS
+            + self._OPTIONAL_OVERLAY_SPINE_STEP_POINTS * (overlay_count - 1)
+        )
+        responsive_right = 1.0 - reserved_points / figure_width_points
+        minimum_right = min(base_right, float(left) + 0.20)
+        return min(base_right, max(minimum_right, responsive_right))
+
+    def _apply_optional_overlay_layout(self, fig, overlay_count, subplot_adjust=None):
+        if fig is None:
+            return None
+
+        layout = dict(getattr(fig, "_optional_overlay_layout", {}) or {})
+        incoming = dict(subplot_adjust or {})
+        if "right" in incoming:
+            layout["base_right"] = incoming.pop("right")
+        layout.update(incoming)
+        layout.setdefault("left", fig.subplotpars.left)
+        layout.setdefault("base_right", 0.94)
+        layout.setdefault("top", fig.subplotpars.top)
+        layout.setdefault("bottom", fig.subplotpars.bottom)
+        layout.setdefault("hspace", fig.subplotpars.hspace)
+        layout["overlay_count"] = max(0, int(overlay_count or 0))
+
+        right_margin = (
+            self._resolve_optional_overlay_right_margin(
+                fig,
+                layout["overlay_count"],
+                base_right=layout["base_right"],
+                left=layout["left"],
+            )
+            if layout["overlay_count"] > 0
+            else float(layout["base_right"])
+        )
+        fig.subplots_adjust(
+            left=float(layout["left"]),
+            right=right_margin,
+            top=float(layout["top"]),
+            bottom=float(layout["bottom"]),
+            hspace=float(layout["hspace"]),
+        )
+        fig._optional_overlay_layout = layout
+        return layout
 
     def _apply_optional_overlay_legend(self, legend_host, legend_base_axes, aux_axes, **style):
         if legend_host is None:
@@ -394,6 +591,11 @@ class SampleManagerMixin:
             "legend_style": dict(legend_style or {}),
             "subplot_adjust": dict(subplot_adjust or {}),
         }
+        self._apply_optional_overlay_layout(
+            fig,
+            len(aux_axes or []),
+            subplot_adjust,
+        )
 
     def refresh_optional_measurement_overlays(self, fig=None, redraw=True):
         fig = fig or getattr(self, "_current_preview_fig", None)
@@ -439,14 +641,11 @@ class SampleManagerMixin:
         )
 
         adjust_style = dict(context.get("subplot_adjust") or {})
-        if adjust_style:
-            fig.subplots_adjust(
-                left=adjust_style.get("left", fig.subplotpars.left),
-                right=self._resolve_optional_overlay_right_margin(len(aux_axes)),
-                top=adjust_style.get("top", fig.subplotpars.top),
-                bottom=adjust_style.get("bottom", fig.subplotpars.bottom),
-                hspace=adjust_style.get("hspace", fig.subplotpars.hspace),
-            )
+        self._apply_optional_overlay_layout(
+            fig,
+            len(aux_axes),
+            adjust_style,
+        )
 
         if redraw and getattr(self, "_current_preview_fig", None) is fig and hasattr(self, "canvas_data") and self.canvas_data:
             self.canvas_data.draw_idle()
@@ -938,12 +1137,13 @@ class SampleManagerMixin:
             self.sample_tool_name.get(),
             self.sample_plot_mode.get(),
             self.sample_data_source.get(),
-            bool(getattr(self, "show_measured_curve_var", tk.BooleanVar(value=True)).get()),
-            bool(getattr(self, "show_reconstructed_curve_var", tk.BooleanVar(value=True)).get()),
-            bool(getattr(self, "show_feed_overlay_var", tk.BooleanVar(value=False)).get()),
-            bool(getattr(self, "show_speed_overlay_var", tk.BooleanVar(value=False)).get()),
-            bool(getattr(self, "show_ap_overlay_var", tk.BooleanVar(value=False)).get()),
-            bool(getattr(self, "show_ae_overlay_var", tk.BooleanVar(value=False)).get()),
+            self._optional_curve_enabled("show_measured_curve_var", True),
+            self._optional_curve_enabled("show_reconstructed_curve_var", True),
+            self._optional_curve_enabled("show_feed_overlay_var"),
+            self._optional_curve_enabled("show_speed_overlay_var"),
+            self._optional_curve_enabled("show_ap_overlay_var"),
+            self._optional_curve_enabled("show_ae_overlay_var"),
+            self._optional_curve_enabled("show_interval_state_var", True),
         )
 
     def _cancel_pending_sample_selection_change(self):

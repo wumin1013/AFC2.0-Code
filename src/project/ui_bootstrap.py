@@ -267,6 +267,7 @@ class BootstrapUiMixin:
         self.show_speed_overlay_var = tk.BooleanVar(value=False)
         self.show_ap_overlay_var = tk.BooleanVar(value=False)
         self.show_ae_overlay_var = tk.BooleanVar(value=False)
+        self.show_interval_state_var = tk.BooleanVar(value=True)
         self.sample_program_name = tk.StringVar()
         self.sample_tool_name = tk.StringVar()
         self.sample_avg_var = tk.StringVar(value="-")
@@ -1066,6 +1067,23 @@ class BootstrapUiMixin:
             anchor="w",
         )
         self.show_ae_overlay_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.show_interval_state_btn = tk.Checkbutton(
+            overlay_row,
+            text="显示区间状态",
+            variable=self.show_interval_state_var,
+            command=self.on_sample_selection_change,
+            font=UI_FONT_SMALL,
+            bg=UI_COLOR_BG_LIGHT,
+            fg=UI_COLOR_TEXT,
+            activebackground=UI_COLOR_BG_LIGHT,
+            activeforeground=UI_COLOR_PRIMARY,
+            selectcolor="white",
+            relief=tk.FLAT,
+            bd=0,
+            highlightthickness=0,
+            anchor="w",
+        )
+        self.show_interval_state_btn.pack(side=tk.LEFT, padx=(0, 6))
 
         self.segmentation_status_label = ttk.Label(
             interval_frame,
@@ -1163,6 +1181,7 @@ class BootstrapUiMixin:
         self.sample_control_widgets.append(self.show_speed_overlay_btn)
         self.sample_control_widgets.append(self.show_ap_overlay_btn)
         self.sample_control_widgets.append(self.show_ae_overlay_btn)
+        self.sample_control_widgets.append(self.show_interval_state_btn)
         self.sample_control_widgets.append(self.sample_program_combo)
         self.sample_control_widgets.append(self.sample_tool_combo)
         # 过程域按钮不属于实测控件组，不得因未导入实测而禁用。
@@ -1974,6 +1993,21 @@ class BootstrapUiMixin:
     def adjust_figure_sizes(self):
         """根据当前窗口大小调整图表大小 - 让图表随容器实时放缩、尽量铺满"""
         try:
+            def _apply_responsive_layout(fig, pad=0.6):
+                overlay_layout = getattr(fig, "_optional_overlay_layout", None)
+                layout_applier = getattr(
+                    self,
+                    "_apply_optional_overlay_layout",
+                    None,
+                )
+                if isinstance(overlay_layout, dict) and callable(layout_applier):
+                    layout_applier(
+                        fig,
+                        overlay_layout.get("overlay_count", 0),
+                    )
+                    return
+                fig.tight_layout(pad=pad)
+
             def _resize_figure_by_canvas(fig_attr, canvas_attr, pad_px=0, apply_tight_layout=True):
                 if not hasattr(self, fig_attr) or not hasattr(self, canvas_attr):
                     return
@@ -1998,7 +2032,7 @@ class BootstrapUiMixin:
                 fig.set_size_inches(width_px / dpi, height_px / dpi, forward=True)
                 if apply_tight_layout:
                     try:
-                        fig.tight_layout(pad=0.6)
+                        _apply_responsive_layout(fig)
                     except Exception:
                         pass
                 canvas.draw_idle()
@@ -2033,7 +2067,7 @@ class BootstrapUiMixin:
                         fig.set_size_inches(w_px / dpi, h_px / dpi, forward=True)
                         # tight_layout 的 pad 过大会显得“没铺满”
                         try:
-                            fig.tight_layout(pad=0.6)
+                            _apply_responsive_layout(fig)
                         except Exception:
                             pass
 

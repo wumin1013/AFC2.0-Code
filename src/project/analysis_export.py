@@ -212,11 +212,7 @@ class AnalysisExportMixin:
                 zorder=5,
             )
             ax.set_title(
-                (
-                    "实际负载、预测负载与过程域六态投影"
-                    if show_actual
-                    else "预测负载与过程域六态投影"
-                ),
+                "功率与区间状态",
                 fontsize=14,
                 fontweight="bold",
             )
@@ -240,6 +236,15 @@ class AnalysisExportMixin:
             fig.savefig(output_path, dpi=180, bbox_inches="tight", facecolor=fig.get_facecolor())
         finally:
             plt.close(fig)
+
+    def _plot_option_enabled(self, variable_name, default=False):
+        variable = getattr(self, variable_name, None)
+        if variable is None:
+            return bool(default)
+        try:
+            return bool(variable.get())
+        except Exception:
+            return bool(default)
 
     def _save_segmentation_process_overview(
         self,
@@ -299,28 +304,82 @@ class AnalysisExportMixin:
         fig, ax = plt.subplots(figsize=(16, 8), dpi=100)
         fig.patch.set_facecolor(PLOT_FIG_BG)
         self.apply_plot_style(ax, grid=True)
+        show_interval_states = self._plot_option_enabled(
+            "show_interval_state_var",
+            True,
+        )
         self.draw_process_mrr_segmentation(
             ax,
             point_labels,
             intervals,
             show_labels=True,
+            show_states=show_interval_states,
         )
-        handles, labels = ax.get_legend_handles_labels()
-        if handles:
-            unique = {}
-            for handle, label in zip(handles, labels):
-                if label and label not in unique:
-                    unique[label] = handle
-            ax.legend(
-                list(unique.values()),
-                list(unique.keys()),
-                loc="upper left",
-                framealpha=0.95,
-                fontsize=PLOT_FONT_BASE - 1,
+        process_frame, process_x, _cell_left, _cell_right = (
+            self._resolve_process_segmentation_coordinates(point_labels)
+        )
+        process_mask = np.isfinite(process_x)
+        process_overlays = []
+        overlay_getter = getattr(self, "get_optional_process_overlays", None)
+        if callable(overlay_getter):
+            process_overlays = list(overlay_getter(process_frame) or [])
+        aux_axes = []
+        overlay_plotter = getattr(
+            self,
+            "plot_optional_measurement_overlays",
+            None,
+        )
+        if callable(overlay_plotter):
+            aux_axes = list(
+                overlay_plotter(
+                    ax,
+                    process_x,
+                    process_mask,
+                    process_mask,
+                    overlays=process_overlays,
+                )
+                or []
             )
-        fig.subplots_adjust(left=0.07, right=0.985, top=0.92, bottom=0.11)
+
+        legend_axes = [ax, *aux_axes]
+        legend_count = sum(
+            len(axis.get_legend_handles_labels()[0])
+            for axis in legend_axes
+        )
+        legend_style = {
+            "loc": "upper left",
+            "ncol": min(7, max(legend_count, 1)),
+            "framealpha": 0.95,
+            "fontsize": PLOT_FONT_BASE - 1,
+        }
+        legend_applier = getattr(self, "_apply_optional_overlay_legend", None)
+        if callable(legend_applier):
+            legend_applier(ax, [ax], aux_axes, **legend_style)
+        else:
+            handles, labels = ax.get_legend_handles_labels()
+            if handles:
+                unique = {}
+                for handle, label in zip(handles, labels):
+                    if label and label not in unique:
+                        unique[label] = handle
+                ax.legend(
+                    list(unique.values()),
+                    list(unique.keys()),
+                    **legend_style,
+                )
+        subplot_adjust = {
+            "left": 0.07,
+            "right": 0.985,
+            "top": 0.92,
+            "bottom": 0.11,
+        }
+        layout_applier = getattr(self, "_apply_optional_overlay_layout", None)
+        if callable(layout_applier):
+            layout_applier(fig, len(aux_axes), subplot_adjust)
+        else:
+            fig.subplots_adjust(**subplot_adjust)
         self.figures = [fig]
-        self.figure_names = ["过程域 MRR 与六态区间"]
+        self.figure_names = ["工艺信息与区间状态"]
         self.current_figure_index = 0
         if hasattr(self, "interval_count_var"):
             self.interval_count_var.set(str(len(intervals)))
@@ -484,19 +543,41 @@ class AnalysisExportMixin:
             mapping_records,
             valid_mask=np.isfinite(fill_values),
         )
+        projected_mask = np.asarray(
+            background_payload.get(
+                "process_projected_mask",
+                np.zeros(actual_values.size, dtype=bool),
+            ),
+            dtype=bool,
+        )
+        overlay_context_mask = np.isfinite(sample_x)
+
+        show_measured_curve = self._plot_option_enabled(
+            "show_measured_curve_var",
+            True,
+        )
+        show_reconstructed_curve = self._plot_option_enabled(
+            "show_reconstructed_curve_var",
+            True,
+        )
+        show_interval_states = self._plot_option_enabled(
+            "show_interval_state_var",
+            True,
+        )
 
         fig, sample_ax = plt.subplots(figsize=(16, 8), dpi=100)
         fig.patch.set_facecolor(PLOT_FIG_BG)
         self.apply_plot_style(sample_ax, grid=True)
-        self.draw_segmentation_curve_background(
-            sample_ax,
-            sample_x,
-            fill_values,
-            background_payload.get("state_masks", {}),
-            alpha=0.26,
-            show_labels=True,
-            zorder=1,
-        )
+        if show_interval_states:
+            self.draw_segmentation_curve_background(
+                sample_ax,
+                sample_x,
+                fill_values,
+                background_payload.get("state_masks", {}),
+                alpha=0.26,
+                show_labels=True,
+                zorder=1,
+            )
 
         preview_limit = int(getattr(self, "preview_plot_max_points", 60000) or 60000)
         plot_x, plot_values = self._compress_plot_series_preserve_gaps(
@@ -504,15 +585,16 @@ class AnalysisExportMixin:
             actual_values,
             preview_limit,
         )
-        sample_ax.plot(
-            plot_x,
-            plot_values,
-            color=STYLE_MEASURED["color"],
-            linewidth=1.0,
-            linestyle="-",
-            label="实际负载",
-            zorder=4,
-        )
+        if show_measured_curve:
+            sample_ax.plot(
+                plot_x,
+                plot_values,
+                color=STYLE_MEASURED["color"],
+                linewidth=1.0,
+                linestyle="-",
+                label="实际负载",
+                zorder=4,
+            )
         predicted_x, predicted_plot_values = (
             self._compress_plot_series_preserve_gaps(
                 sample_x,
@@ -520,17 +602,46 @@ class AnalysisExportMixin:
                 preview_limit,
             )
         )
-        sample_ax.plot(
-            predicted_x,
-            predicted_plot_values,
-            color=self.get_segmentation_predicted_line_color(),
-            linewidth=1.25,
-            linestyle="--",
-            label="预测负载",
-            zorder=5,
-        )
+        if show_reconstructed_curve:
+            sample_ax.plot(
+                predicted_x,
+                predicted_plot_values,
+                color=self.get_segmentation_predicted_line_color(),
+                linewidth=1.25,
+                linestyle="--",
+                label="预测负载",
+                zorder=5,
+            )
 
-        sample_ax.set_title("实际负载、预测负载与过程域六态投影")
+        aux_axes = []
+        overlay_plotter = getattr(
+            self,
+            "plot_optional_measurement_overlays",
+            None,
+        )
+        if callable(overlay_plotter):
+            aux_axes = list(
+                overlay_plotter(
+                    sample_ax,
+                    sample_x,
+                    overlay_context_mask,
+                    projected_mask,
+                )
+                or []
+            )
+        if not show_measured_curve and not show_reconstructed_curve and not aux_axes:
+            sample_ax.text(
+                0.5,
+                0.5,
+                "当前未启用任何曲线显示",
+                ha="center",
+                va="center",
+                transform=sample_ax.transAxes,
+                fontsize=PLOT_FONT_BASE,
+                color="#666666",
+            )
+
+        sample_ax.set_title("功率与区间状态")
         sample_ax.set_xlabel(x_label)
         sample_ax.set_ylabel("功率 (W)")
         finite_x = sample_x[np.isfinite(sample_x)]
@@ -543,36 +654,70 @@ class AnalysisExportMixin:
         sample_ax.set_ylim(bottom=0.0)
         sample_ax.margins(x=0)
 
-        projected_mask = np.asarray(
-            background_payload.get(
-                "process_projected_mask",
-                np.zeros(actual_values.size, dtype=bool),
-            ),
-            dtype=bool,
-        )
         if x_label == "时间 (ms)" and hasattr(self, "apply_line_axis_on_time"):
             self.apply_line_axis_on_time(sample_ax, projected_mask)
         elif hasattr(self, "apply_line_axis_on_path"):
             self.apply_line_axis_on_path(sample_ax, sample_x, projected_mask)
 
-        sample_handles, sample_labels = sample_ax.get_legend_handles_labels()
-        if sample_handles:
-            unique = {}
-            for handle, label in zip(sample_handles, sample_labels):
-                if label and label not in unique:
-                    unique[label] = handle
-            sample_ax.legend(
-                list(unique.values()),
-                list(unique.keys()),
-                loc="upper left",
-                ncol=min(7, max(len(unique), 1)),
-                fontsize=PLOT_FONT_BASE - 1,
-                framealpha=0.95,
+        legend_axes = [sample_ax, *aux_axes]
+        legend_count = sum(
+            len(axis.get_legend_handles_labels()[0])
+            for axis in legend_axes
+        )
+        legend_style = {
+            "loc": "upper left",
+            "ncol": min(7, max(legend_count, 1)),
+            "fontsize": PLOT_FONT_BASE - 1,
+            "framealpha": 0.95,
+        }
+        legend_applier = getattr(self, "_apply_optional_overlay_legend", None)
+        if callable(legend_applier):
+            legend_applier(
+                sample_ax,
+                [sample_ax],
+                aux_axes,
+                **legend_style,
             )
+        else:
+            sample_handles, sample_labels = sample_ax.get_legend_handles_labels()
+            if sample_handles:
+                unique = {}
+                for handle, label in zip(sample_handles, sample_labels):
+                    if label and label not in unique:
+                        unique[label] = handle
+                sample_ax.legend(
+                    list(unique.values()),
+                    list(unique.keys()),
+                    **legend_style,
+                )
 
-        fig.subplots_adjust(left=0.07, right=0.985, top=0.90, bottom=0.10)
+        subplot_adjust = {
+            "left": 0.07,
+            "right": 0.985,
+            "top": 0.90,
+            "bottom": 0.10,
+        }
+        layout_applier = getattr(self, "_apply_optional_overlay_layout", None)
+        if callable(layout_applier):
+            layout_applier(fig, len(aux_axes), subplot_adjust)
+        else:
+            fig.subplots_adjust(**subplot_adjust)
+        context_register = getattr(self, "_register_optional_overlay_context", None)
+        if callable(context_register):
+            context_register(
+                fig,
+                parent_ax=sample_ax,
+                x_values=sample_x,
+                context_mask=overlay_context_mask,
+                valid_mask=projected_mask,
+                legend_host=sample_ax,
+                legend_base_axes=[sample_ax],
+                aux_axes=aux_axes,
+                legend_style=legend_style,
+                subplot_adjust=subplot_adjust,
+            )
         self.figures = [fig]
-        self.figure_names = ["负载图"]
+        self.figure_names = ["功率与区间状态"]
         self.current_figure_index = 0
         if hasattr(self, "interval_count_var"):
             self.interval_count_var.set(str(len(mapping_records)))
