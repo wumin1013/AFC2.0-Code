@@ -44,6 +44,24 @@ function Test-PathWithin {
     return $candidatePath.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
+function Get-FileSha256WithRetry {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $lastFailure = $null
+    for ($attempt = 1; $attempt -le 10; $attempt++) {
+        try {
+            return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+        catch {
+            $lastFailure = $_
+            if ($attempt -lt 10) {
+                Start-Sleep -Milliseconds 500
+            }
+        }
+    }
+    throw "多次重试后仍无法读取文件 SHA-256: $Path；$($lastFailure.Exception.Message)"
+}
+
 function Remove-SafeDirectory {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -60,9 +78,35 @@ function Remove-SafeDirectory {
     }
     $targetItem = Get-Item -LiteralPath $resolvedPath -Force
     if (($targetItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "拒绝递归清理重解析点目录: $resolvedPath"
+        # 同步存储提供程序会给普通目录附加云占位重解析标记，此时
+        # LinkType/Target 均为空；它不是会跳出已验证父目录的文件系统链接。
+        # Junction/SymbolicLink 等真实链接仍一律拒绝递归清理。
+        $hasLinkType = -not [string]::IsNullOrWhiteSpace([string]$targetItem.LinkType)
+        $hasLinkTarget = @($targetItem.Target).Count -gt 0 -and -not [string]::IsNullOrWhiteSpace(
+            [string](@($targetItem.Target) -join "")
+        )
+        if ($hasLinkType -or $hasLinkTarget) {
+            throw "拒绝递归清理文件系统链接目录: $resolvedPath"
+        }
     }
-    Remove-Item -LiteralPath $resolvedPath -Recurse -Force
+    $lastRemovalFailure = $null
+    for ($attempt = 1; $attempt -le 10; $attempt++) {
+        try {
+            Remove-Item -LiteralPath $resolvedPath -Recurse -Force
+            return
+        }
+        catch {
+            $lastRemovalFailure = $_
+            if ($attempt -lt 10 -and (Test-Path -LiteralPath $resolvedPath)) {
+                Start-Sleep -Milliseconds 500
+                continue
+            }
+            if (-not (Test-Path -LiteralPath $resolvedPath)) {
+                return
+            }
+        }
+    }
+    throw "多次重试后仍无法清理专用构建目录: $resolvedPath；$($lastRemovalFailure.Exception.Message)"
 }
 
 function Resolve-AfcPython {
@@ -235,6 +279,28 @@ New-Item -ItemType Directory -Path $OutputRoot -Force | Out-Null
 
 $FinalReleaseDirectory = Join-Path $OutputRoot $ProductName
 $ReleaseBuildRoot = Join-Path $OutputRoot ".build-$ProductName"
+$RuntimeInputNames = @(
+    "SampleData.csv",
+    "SampleData.txt",
+    "iipinc.txt",
+    "SampleData.rg",
+    "ProcessDataPath.txt"
+)
+$RuntimeInputPatterns = @("*.csv", "SampleData*.txt")
+
+function Test-RuntimeInputName {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    if ($RuntimeInputNames -icontains $Name) {
+        return $true
+    }
+    foreach ($pattern in $RuntimeInputPatterns) {
+        if ($Name -like $pattern) {
+            return $true
+        }
+    }
+    return $false
+}
 <#
 候选构建可复用上次失败遗留的 PyInstaller work 缓存；正式归档或显式
 -CleanBuild 时清空整个版本构建目录。每次构建验证成功后都会删除 work。
@@ -267,9 +333,15 @@ $SpecArgument = "packaging\AFC2_onedir.spec"
 $WorkArgument = (Get-PortableRelativePath -BasePath $ProjectRoot -TargetPath $WorkPath).Replace("/", "\")
 $DistArgument = (Get-PortableRelativePath -BasePath $ProjectRoot -TargetPath $DistPath).Replace("/", "\")
 $PreviousPythonUtf8 = $env:PYTHONUTF8
+$PreviousProcessPath = $env:PATH
+$AfcLibraryBin = Join-Path $BuildEnvironment.python_prefix "Library\bin"
+if (-not (Test-Path -LiteralPath $AfcLibraryBin -PathType Container)) {
+    throw "AFC 环境缺少 Conda 动态库目录: $AfcLibraryBin"
+}
 Push-Location -LiteralPath $ProjectRoot
 try {
     $env:PYTHONUTF8 = "1"
+    $env:PATH = $AfcLibraryBin + [System.IO.Path]::PathSeparator + $PreviousProcessPath
     & $ResolvedPython -m PyInstaller `
         --noconfirm `
         --log-level WARN `
@@ -287,6 +359,7 @@ finally {
     else {
         $env:PYTHONUTF8 = $PreviousPythonUtf8
     }
+    $env:PATH = $PreviousProcessPath
     Pop-Location
 }
 
@@ -341,7 +414,7 @@ $PayloadFiles = Get-ChildItem -LiteralPath $ReleaseDirectory -Recurse -Force -Fi
     Sort-Object FullName
 foreach ($file in $PayloadFiles) {
     $relativePath = Get-PortableRelativePath -BasePath $ReleaseDirectory -TargetPath $file.FullName
-    $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    $hash = Get-FileSha256WithRetry -Path $file.FullName
     $ChecksumLines.Add("$hash  $relativePath")
 }
 Write-Utf8NoBom -Path (Join-Path $ReleaseDirectory "SHA256SUMS.txt") -Content (($ChecksumLines -join [Environment]::NewLine) + [Environment]::NewLine)
@@ -355,11 +428,38 @@ if ($LASTEXITCODE -ne 0) {
     throw "发布目录验证失败。"
 }
 
+$RuntimeInputBackupDirectory = Join-Path $ReleaseBuildRoot "runtime-input-backup"
+$RuntimeInputHashes = @{}
+if (Test-Path -LiteralPath $FinalReleaseDirectory -PathType Container) {
+    New-Item -ItemType Directory -Path $RuntimeInputBackupDirectory -Force | Out-Null
+    $RuntimeInputFiles = Get-ChildItem -LiteralPath $FinalReleaseDirectory -Force -File |
+        Where-Object { Test-RuntimeInputName -Name $_.Name }
+    foreach ($runtimeInputFile in $RuntimeInputFiles) {
+        $runtimeInputName = $runtimeInputFile.Name
+        $backupPath = Join-Path $RuntimeInputBackupDirectory $runtimeInputName
+        Copy-Item -LiteralPath $runtimeInputFile.FullName -Destination $backupPath -Force
+        $RuntimeInputHashes[$runtimeInputName] = Get-FileSha256WithRetry -Path $runtimeInputFile.FullName
+        if ($RuntimeInputNames -inotcontains $runtimeInputName) {
+            $RuntimeInputNames += $runtimeInputName
+        }
+    }
+}
+
 if (Test-Path -LiteralPath $FinalReleaseDirectory) {
     Remove-SafeDirectory -Path $FinalReleaseDirectory -AllowedParent $OutputRoot
 }
 [System.IO.Directory]::Move($StagedReleaseDirectory, $FinalReleaseDirectory)
 $ReleaseDirectory = $FinalReleaseDirectory
+foreach ($runtimeInputName in $RuntimeInputHashes.Keys) {
+    $backupPath = Join-Path $RuntimeInputBackupDirectory $runtimeInputName
+    $restoredPath = Join-Path $ReleaseDirectory $runtimeInputName
+    Copy-Item -LiteralPath $backupPath -Destination $restoredPath -Force
+    $restoredHash = Get-FileSha256WithRetry -Path $restoredPath
+    if ($restoredHash -cne $RuntimeInputHashes[$runtimeInputName]) {
+        throw "运行输入恢复后 SHA-256 不一致: $runtimeInputName"
+    }
+    Write-Host "已原样恢复运行输入: $runtimeInputName ($restoredHash)"
+}
 if (Test-Path -LiteralPath $ReleaseBuildRoot) {
     Remove-SafeDirectory -Path $ReleaseBuildRoot -AllowedParent $OutputRoot
 }
@@ -378,6 +478,9 @@ if ($ResolvedArchiveDestination) {
     try {
         New-Item -ItemType Directory -Path $TemporaryArchive | Out-Null
         Get-ChildItem -LiteralPath $ReleaseDirectory -Force | ForEach-Object {
+            if ((-not $_.PSIsContainer) -and ($RuntimeInputNames -icontains $_.Name)) {
+                return
+            }
             Copy-Item -LiteralPath $_.FullName -Destination $TemporaryArchive -Recurse -Force
         }
 

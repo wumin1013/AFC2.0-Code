@@ -9,7 +9,7 @@ from .segmentation import STATE_CODE_BY_TYPE
 
 
 class IntervalRuntimeMixin:
-    """PIT/SMIF 与发布版共用的区间状态、边界和工艺点对齐层。"""
+    """主页面、PIT 查看器与发布版共用的区间状态和工艺点对齐层。"""
 
     @staticmethod
     def _normalize_runtime_prediction_source(source) -> str:
@@ -270,7 +270,7 @@ class IntervalRuntimeMixin:
                 return 1
             return 2
 
-    def _resolve_smif_state_code(self, record):
+    def _resolve_interval_display_state_code(self, record):
         if not isinstance(record, dict):
             return 0
         segment_type = str(record.get("segment_type") or "").strip().lower()

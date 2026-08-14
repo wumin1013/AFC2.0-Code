@@ -1148,6 +1148,7 @@ class SampleManagerMixin:
             self._optional_curve_enabled("show_ap_overlay_var"),
             self._optional_curve_enabled("show_ae_overlay_var"),
             self._optional_curve_enabled("show_interval_state_var", True),
+            self._optional_curve_enabled("show_prediction_load_var"),
         )
 
     def _cancel_pending_sample_selection_change(self):

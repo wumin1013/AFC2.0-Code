@@ -105,7 +105,6 @@ def main() -> int:
             root.update_idletasks()
             return 0
         root.protocol("WM_DELETE_WINDOW", components["cleanup"])
-        root.after(100, app.adjust_figure_sizes)
         root.deiconify()
         try:
             root.state("zoomed")

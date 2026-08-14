@@ -80,11 +80,9 @@ class InputIdleMixin:
                         self.sample_auto_status_var.set("未找到SampleData，可手动导入实验实测文件；当前保留已加载实测数据")
                     if hasattr(self, "status_var_data"):
                         self.status_var_data.set("未找到SampleData，可手动导入实验实测文件；当前保留已加载实测数据")
-            if self.sample_data_loaded:
-                self.show_sample_preview()
-            else:
-                self.show_initial_message()
             if not getattr(self, "_loading_sample_data", False):
+                # 工艺文件会在随后的单次处理里直接生成最终图。这里不再先画一遍
+                # SampleData 预览，避免用户看到“先刷新预览、再刷新结果”的闪动。
                 self._schedule_input_process_preview(delay_ms=50)
             return effective_input_path
         else:
@@ -312,8 +310,41 @@ class InputIdleMixin:
             )
         return True
 
+    def resolve_experiment_measurement_file(self, base_dir):
+        """从指定目录定位唯一的实验实测 CSV，不递归搜索。"""
+        self._experiment_measurement_resolution_error = ""
+        if not base_dir or not os.path.isdir(base_dir):
+            self._experiment_measurement_resolution_error = "未提供有效的实验实测目录"
+            return None
+
+        matches = []
+        try:
+            with os.scandir(base_dir) as entries:
+                for entry in entries:
+                    if not entry.is_file() or not entry.name.casefold().endswith(".csv"):
+                        continue
+                    if entry.name.casefold() == "sampledata.csv":
+                        continue
+                    if self._looks_like_channel_export(entry.path):
+                        matches.append(entry.path)
+        except OSError as exc:
+            self._experiment_measurement_resolution_error = f"实验实测目录不可读取：{exc}"
+            return None
+
+        matches.sort(key=lambda path: os.path.basename(path).casefold())
+        if len(matches) == 1:
+            return matches[0]
+        if not matches:
+            self._experiment_measurement_resolution_error = "未找到可识别的实验实测 CSV"
+        else:
+            names = "、".join(os.path.basename(path) for path in matches)
+            self._experiment_measurement_resolution_error = (
+                f"找到多个实验实测 CSV，请仅保留一个：{names}"
+            )
+        return None
+
     def auto_load_sample_bundle(self):
-        """启动后自动加载 SampleData 并自动执行处理"""
+        """启动后优先加载 SampleData，发布版缺失时回退实验实测 CSV。"""
         if bool(getattr(self, "_sampledata_startup_attempted", False)):
             return
         self._sampledata_startup_attempted = True
@@ -327,6 +358,27 @@ class InputIdleMixin:
             strict_root=release_mode,
             clear_on_failure=release_mode,
         )
+        if release_mode and not success:
+            sample_reason = str(
+                getattr(self, "_sampledata_resolution_error", "")
+                or "未找到完整的 SampleData.csv 和 SampleData.txt 文件对"
+            )
+            experiment_path = self.resolve_experiment_measurement_file(str(sample_root))
+            if experiment_path:
+                success = self.load_experiment_measurement_file(
+                    experiment_path,
+                    silent=True,
+                )
+            else:
+                experiment_reason = str(
+                    getattr(self, "_experiment_measurement_resolution_error", "")
+                    or "未找到可识别的实验实测 CSV"
+                )
+                status_text = f"实测数据未加载：{sample_reason}；{experiment_reason}"
+                if hasattr(self, "sample_auto_status_var"):
+                    self.sample_auto_status_var.set(status_text)
+                if hasattr(self, "status_var_data"):
+                    self.status_var_data.set(f"{status_text}；工艺信息仍可独立分析")
         if success and self.get_input_files():
             # 自动执行处理
             self.root.after(100, self._auto_process_after_load)
@@ -2136,10 +2188,6 @@ class InputIdleMixin:
         self._update_program_idle_summary()
         if hasattr(self, "refresh_mechanism_status_summary"):
             self.refresh_mechanism_status_summary()
-        if hasattr(self, "_schedule_smif_refresh"):
-            self._schedule_smif_refresh(delay_ms=0)
-        else:
-            self.refresh_smif_view()
         return True
 
     def browse_nc_file(self):
@@ -2160,10 +2208,6 @@ class InputIdleMixin:
                 status_handled = True
             if not status_handled:
                 self.set_status("G代码NC文件已导入", 3000)
-            if hasattr(self, "_schedule_smif_refresh"):
-                self._schedule_smif_refresh(delay_ms=0)
-            else:
-                self.refresh_smif_view()
             self._refresh_import_order_controls()
             if self.get_primary_input_file():
                 self._process_current_input_for_preview()

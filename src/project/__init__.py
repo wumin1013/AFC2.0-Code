@@ -14,7 +14,7 @@ __all__ = [
 
 
 def __getattr__(name):
-    """延迟导入研究版主类，避免发布入口加载 PIT/SMIF 与 sklearn。"""
+    """延迟导入研究版主类，避免发布入口加载机理模型与 sklearn。"""
     if name == "MillingAnalysisTool":
         from .app import MillingAnalysisTool
 

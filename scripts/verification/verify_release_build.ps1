@@ -40,6 +40,24 @@ function Test-PathWithin {
     return $candidatePath.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
+function Get-FileSha256WithRetry {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $lastFailure = $null
+    for ($attempt = 1; $attempt -le 10; $attempt++) {
+        try {
+            return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+        catch {
+            $lastFailure = $_
+            if ($attempt -lt 10) {
+                Start-Sleep -Milliseconds 500
+            }
+        }
+    }
+    throw "多次重试后仍无法读取文件 SHA-256: $Path；$($lastFailure.Exception.Message)"
+}
+
 function Get-PortableRelativePath {
     param(
         [Parameter(Mandatory = $true)][string]$BasePath,
@@ -147,10 +165,43 @@ if ([string]$Manifest.dependencies.PyInstaller -ne "6.12.0") {
 
 $ForbiddenRootSegments = @("config", "data", "profiles", "output", "src", "tests", "archive")
 $ForbiddenDependencyTokens = @("sklearn", "scikit_learn", "scipy", "joblib", "threadpoolctl")
+$RuntimeInputNames = @(
+    "SampleData.csv",
+    "SampleData.txt",
+    "iipinc.txt",
+    "SampleData.rg",
+    "ProcessDataPath.txt"
+)
+$RuntimeInputPatterns = @("*.csv", "SampleData*.txt")
+
+function Test-IsRootRuntimeInput {
+    param(
+        [Parameter(Mandatory = $true)]$Entry,
+        [Parameter(Mandatory = $true)][string]$RelativePath
+    )
+
+    if ($Entry.PSIsContainer -or $RelativePath -cne $Entry.Name) {
+        return $false
+    }
+    if ($RuntimeInputNames -icontains $Entry.Name) {
+        return $true
+    }
+    foreach ($pattern in $RuntimeInputPatterns) {
+        if ($Entry.Name -like $pattern) {
+            return $true
+        }
+    }
+    return $false
+}
+
 $ForbiddenFiles = New-Object System.Collections.Generic.List[string]
 $AllEntries = Get-ChildItem -LiteralPath $ReleaseDirectory -Recurse -Force
 foreach ($entry in $AllEntries) {
     $relativePath = Get-PortableRelativePath -BasePath $ReleaseDirectory -TargetPath $entry.FullName
+    $isRootRuntimeInput = Test-IsRootRuntimeInput -Entry $entry -RelativePath $relativePath
+    if ($isRootRuntimeInput) {
+        continue
+    }
     $segments = @($relativePath -split "[/\\]")
     foreach ($segment in $segments) {
         if ($ForbiddenRootSegments -icontains $segment) {
@@ -171,7 +222,7 @@ foreach ($entry in $AllEntries) {
         if ($lowerName.EndsWith(".py") -or $lowerName.EndsWith(".kcke") -or $lowerName.EndsWith(".kcke.json")) {
             $ForbiddenFiles.Add("禁止文件类型: $relativePath")
         }
-        if ($lowerName -in @("sampledata.csv", "sampledata.txt", "app_config.json", "ideal_store.json")) {
+        if ($lowerName -in @("app_config.json", "ideal_store.json")) {
             $ForbiddenFiles.Add("禁止项目/用户数据: $relativePath")
         }
         if ($lowerName.StartsWith("processinfo") -or $lowerName.EndsWith(".log")) {
@@ -208,7 +259,7 @@ foreach ($line in $ChecksumLines) {
     if (-not (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {
         throw "校验清单中的文件不存在: $relativePath"
     }
-    $actualHash = (Get-FileHash -LiteralPath $candidatePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $actualHash = Get-FileSha256WithRetry -Path $candidatePath
     if ($actualHash -cne $expectedHash) {
         throw "SHA-256 不匹配: $relativePath"
     }
@@ -217,7 +268,13 @@ foreach ($line in $ChecksumLines) {
 
 $UnlistedFiles = New-Object System.Collections.Generic.List[string]
 $ReleaseFiles = Get-ChildItem -LiteralPath $ReleaseDirectory -Recurse -Force -File |
-    Where-Object { $_.FullName -ne $ChecksumsPath }
+    Where-Object {
+        if ($_.FullName -eq $ChecksumsPath) {
+            return $false
+        }
+        $relativePath = Get-PortableRelativePath -BasePath $ReleaseDirectory -TargetPath $_.FullName
+        return -not (Test-IsRootRuntimeInput -Entry $_ -RelativePath $relativePath)
+    }
 foreach ($file in $ReleaseFiles) {
     $relativePath = Get-PortableRelativePath -BasePath $ReleaseDirectory -TargetPath $file.FullName
     if (-not $ChecksumRecords.ContainsKey($relativePath)) {
@@ -236,12 +293,11 @@ if ($LASTEXITCODE -ne 0) {
 $ForbiddenArchiveModules = @(
     "project.app",
     "project.pit_model",
-    "project.prediction_support",
-    "project.release_prediction",
     "sklearn",
     "scipy",
     "joblib",
-    "threadpoolctl"
+    "threadpoolctl",
+    "pkg_resources"
 )
 $ArchiveModules = @(
     $ArchiveListing -split "`r?`n" |
@@ -255,6 +311,18 @@ foreach ($moduleName in $ForbiddenArchiveModules) {
     } | Select-Object -First 1
     if ($matchedModule) {
         throw "PyInstaller 内部归档包含禁止模块: $matchedModule"
+    }
+}
+$RequiredArchiveModules = @(
+    "project.prediction_support",
+    "project.release_prediction"
+)
+foreach ($moduleName in $RequiredArchiveModules) {
+    $matchedModule = $ArchiveModules | Where-Object {
+        $_.Equals($moduleName, [System.StringComparison]::OrdinalIgnoreCase)
+    } | Select-Object -First 1
+    if (-not $matchedModule) {
+        throw "PyInstaller 内部归档缺少发布预测模块: $moduleName"
     }
 }
 

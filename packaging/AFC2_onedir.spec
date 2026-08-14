@@ -20,18 +20,21 @@ if not ENTRY_POINT.is_file():
 EXCLUDED_MODULES = [
     "project.app",
     "project.pit_model",
-    "project.prediction_support",
-    "project.release_prediction",
     "sklearn",
     "scipy",
     "joblib",
     "threadpoolctl",
+    "pkg_resources",
+    # Tk 发布应用不使用交互式 Python 补全；排除其测试和源码数据载荷。
+    "IPython",
+    "jedi",
 ]
 
 # Conda 的 NumPy/Pandas 通过 mkl_rt 在运行时动态加载这些 DLL；
 # PyInstaller 的静态依赖分析无法发现，缺失时 windowed EXE 会在显示界面前直接退出。
 CONDA_LIBRARY_BIN = Path(sys.prefix) / "Library" / "bin"
 MKL_RUNTIME_NAMES = [
+    "mkl_rt.2.dll",
     "mkl_core.2.dll",
     "mkl_intel_thread.2.dll",
     # 通用调度回退保证不同 x64 CPU 都能启动，不依赖本机构建时的 AVX 等级。

@@ -6,10 +6,12 @@ import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -19,10 +21,20 @@ if str(SRC_ROOT) not in sys.path:
 
 from project.input_idle import InputIdleMixin
 from project.analysis_export import AnalysisExportMixin
+from project.plot_support import PlotSupportMixin
 from project.prediction_support import (
     append_inverse_prediction_channels,
     apply_steady_representative_prediction,
+    fit_nonnegative_kc_ke,
     summarize_interval_kc_mode_statistics,
+)
+from project.release_prediction import (
+    IIPINC_FEED_SCALE,
+    IIPINC_SINGLE_FEED_SCALE,
+    IipincFormatError,
+    ReleasePredictionMixin,
+    map_iipinc_feed_to_samples,
+    parse_iipinc_rows,
 )
 from project.sample_manager import SampleManagerMixin
 
@@ -30,13 +42,28 @@ from project.sample_manager import SampleManagerMixin
 class _ReleaseStartupHarness(InputIdleMixin):
     release_mode = True
 
-    def __init__(self):
+    def __init__(self, sample_success=False, experiment_path=None, experiment_success=True):
         self.sample_data_loaded = False
         self.calls = []
+        self.sample_success = bool(sample_success)
+        self.experiment_path = experiment_path
+        self.experiment_success = bool(experiment_success)
+        self.experiment_resolve_calls = []
+        self.experiment_load_calls = []
 
     def load_sample_bundle_from_dir(self, base_dir, **kwargs):
         self.calls.append((str(base_dir), dict(kwargs)))
-        return False
+        return self.sample_success
+
+    def resolve_experiment_measurement_file(self, base_dir):
+        self.experiment_resolve_calls.append(str(base_dir))
+        if self.experiment_path is None:
+            self._experiment_measurement_resolution_error = "未找到可识别的实验实测 CSV"
+        return self.experiment_path
+
+    def load_experiment_measurement_file(self, file_path, silent=False):
+        self.experiment_load_calls.append((str(file_path), bool(silent)))
+        return self.experiment_success
 
     def get_input_files(self):
         return []
@@ -99,6 +126,132 @@ class _LoadFailureHarness(SampleManagerMixin):
         self.sample_data_loaded = False
 
 
+class _ReleasePredictionHarness(ReleasePredictionMixin):
+    release_mode = True
+
+    def __init__(self, iip_path):
+        self._release_iipinc_path = Path(iip_path)
+        self.sample_data_mode = "sampledata"
+        self.sample_data_loaded = True
+        self.sample_csv_path = None
+        self.sample_txt_path = None
+        self.sample_data_source = _ValueVar(1)
+        self.inverse_prediction_status_var = _ValueVar("")
+        self.p_idle_var = _ValueVar(0.0)
+        self.kc_coeff = _ValueVar("")
+        self.ke_coeff = _ValueVar("")
+        self.ap = np.asarray([1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0])
+        self.ae = np.asarray([1.0, 2.0, 1.0, 3.0, 1.0, 4.0, 2.0, 5.0])
+        self.process_feed = np.full(8, 60.0)
+        self.sample_data_line_numbers = np.arange(8, dtype=int)
+        process_mrr = self.ap * self.ae * self.process_feed / 60.0
+        actual = 250.0 + 2.0 * process_mrr + 3.0 * self.ap
+        self.sample_data_values = np.column_stack(
+            [np.zeros(8), actual, np.zeros(8)]
+        )
+        self.data = [
+            {
+                "line_no_raw": int(index),
+                "line_no_aligned": int(index),
+                "process_point_index": 0,
+                "ap": float(self.ap[index]),
+                "ae": float(self.ae[index]),
+                "feed_effective": 60.0,
+            }
+            for index in range(8)
+        ]
+
+    def _build_aligned_process_geometry_frame(self, raw_line_numbers):
+        point_count = len(raw_line_numbers)
+        return pd.DataFrame(
+            {
+                "line_no_aligned": np.asarray(raw_line_numbers, dtype=int),
+                "ap": self.ap[:point_count],
+                "ae": self.ae[:point_count],
+                "feed_plan": self.process_feed[:point_count],
+                "process_anchor_mask": np.ones(point_count, dtype=bool),
+            }
+        )
+
+
+class _ReleaseProcessExportHarness(ReleasePredictionMixin, AnalysisExportMixin):
+    release_mode = True
+
+    def __init__(self, iip_path):
+        self._release_iipinc_path = Path(iip_path)
+        self.data = [
+            {
+                "line_no_raw": 0,
+                "S": 5000.0,
+                "ap": 1.0,
+                "ae": 2.0,
+                "feed_effective": 60.0,
+                "s": 1.0,
+                "gcode_content": "G1 X1 F60",
+            },
+            {
+                "line_no_raw": 0,
+                "S": 5000.0,
+                "ap": 1.0,
+                "ae": 2.0,
+                "feed_effective": 60.0,
+                "s": 1.0,
+                "gcode_content": "G1 X2 F60",
+            },
+            {
+                "line_no_raw": 1,
+                "S": 5000.0,
+                "ap": 1.0,
+                "ae": 2.0,
+                "feed_effective": 60.0,
+                "s": 1.0,
+                "gcode_content": "G1 X3 F60",
+            },
+        ]
+        self._latest_segmentation_result = SimpleNamespace(
+            point_labels=pd.DataFrame(
+                {"source_index": [0, 1, 2], "state_code": [2, 2, 3]}
+            )
+        )
+
+
+class _ReleasePlotHarness(AnalysisExportMixin, PlotSupportMixin):
+    release_mode = True
+
+    def __init__(self):
+        self._latest_segmentation_result = object()
+        self.sample_data_values = np.column_stack(
+            [np.zeros(5), np.asarray([250.0, 260.0, np.nan, 270.0, 250.0])]
+        )
+        self.sample_data_source = _ValueVar(1)
+        self.sample_data_mode = "sampledata"
+        self.show_prediction_load_var = _ValueVar(False)
+        self.preview_plot_max_points = 60000
+        self.figures = []
+        self.figure_names = []
+        self.predicted = np.asarray([250.0, 255.0, np.nan, 275.0, 250.0])
+        self.prediction_build_count = 0
+
+    def has_prediction_model_ready(self):
+        return True
+
+    def _build_sampledata_prediction_payload(self):
+        self.prediction_build_count += 1
+        return {"predicted_load": self.predicted.copy()}
+
+    @staticmethod
+    def get_sample_time_indices_array():
+        return np.arange(5, dtype=float)
+
+    @staticmethod
+    def show_current_figure(index=0):
+        return None
+
+    @staticmethod
+    def apply_line_axis_on_time(ax, sample_mask, max_ticks=60):
+        return None
+
+
 class ReleaseRequirementTests(unittest.TestCase):
     def test_frozen_release_output_root_is_executable_directory(self):
         with TemporaryDirectory() as temp_dir:
@@ -157,7 +310,7 @@ if (expected / 'output').exists():
             self.assertTrue(log_path.is_file())
             self.assertFalse((release_root / "output").exists())
 
-    def test_release_import_does_not_load_research_application(self):
+    def test_release_import_loads_only_lightweight_prediction(self):
         code = """
 import sys
 from pathlib import Path
@@ -168,14 +321,16 @@ forbidden = [
     if name in {
         'project.app',
         'project.pit_model',
-        'project.prediction_support',
-        'project.release_prediction',
         'sklearn',
     }
     or name.startswith('sklearn.')
 ]
 if forbidden:
     raise SystemExit('forbidden imports: ' + ','.join(sorted(forbidden)))
+required = {'project.prediction_support', 'project.release_prediction'}
+missing = required.difference(sys.modules)
+if missing:
+    raise SystemExit('missing imports: ' + ','.join(sorted(missing)))
 """ % str(SRC_ROOT)
         completed = subprocess.run(
             [sys.executable, "-c", code],
@@ -192,7 +347,7 @@ if forbidden:
 
         mro_names = {base.__name__ for base in AFCReleaseApplication.__mro__}
         self.assertNotIn("PitModelMixin", mro_names)
-        self.assertNotIn("ReleasePredictionMixin", mro_names)
+        self.assertIn("ReleasePredictionMixin", mro_names)
         self.assertTrue(AFCReleaseApplication.release_mode)
         self.assertFalse(AFCReleaseApplication.enable_research_features)
         self.assertFalse(AFCReleaseApplication.enable_profile_config)
@@ -259,6 +414,7 @@ if forbidden:
             encoding="utf-8"
         )
         for runtime_name in (
+            "mkl_rt.2.dll",
             "mkl_core.2.dll",
             "mkl_intel_thread.2.dll",
             "mkl_def.2.dll",
@@ -267,6 +423,21 @@ if forbidden:
         ):
             self.assertIn(runtime_name, spec_text)
 
+        self.assertNotIn('"project.prediction_support",', spec_text)
+        self.assertNotIn('"project.release_prediction",', spec_text)
+        self.assertIn('"IPython",', spec_text)
+        self.assertIn('"jedi",', spec_text)
+        self.assertIn('"pkg_resources",', spec_text)
+        verifier_text = (
+            PROJECT_ROOT / "scripts" / "verification" / "verify_release_build.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertIn('$RequiredArchiveModules = @(', verifier_text)
+        self.assertIn('"project.prediction_support"', verifier_text)
+        self.assertIn('"project.release_prediction"', verifier_text)
+        self.assertIn('"SampleData.rg"', verifier_text)
+        self.assertIn('"ProcessDataPath.txt"', verifier_text)
+        self.assertIn('$RuntimeInputPatterns = @("*.csv", "SampleData*.txt")', verifier_text)
+
     def test_build_script_uses_dedicated_release_versions_directory(self):
         build_script = (PROJECT_ROOT / "scripts" / "build_release.ps1").read_text(
             encoding="utf-8"
@@ -274,13 +445,24 @@ if forbidden:
         self.assertIn('Join-Path $ProjectRoot "release_versions"', build_script)
         self.assertIn('$FinalReleaseDirectory = Join-Path $OutputRoot $ProductName', build_script)
         self.assertNotIn('Join-Path $ProjectOutputRoot "release"', build_script)
+        for runtime_name in (
+            "SampleData.csv",
+            "SampleData.txt",
+            "iipinc.txt",
+            "SampleData.rg",
+            "ProcessDataPath.txt",
+        ):
+            self.assertIn(runtime_name, build_script)
+        self.assertIn('$RuntimeInputPatterns = @("*.csv", "SampleData*.txt")', build_script)
+        self.assertIn("Get-FileSha256WithRetry -Path $restoredPath", build_script)
 
-    def test_public_plot_toolbar_keeps_only_optional_overlays(self):
+    def test_public_plot_toolbar_has_default_hidden_prediction_option(self):
         ui_source = (SRC_ROOT / "project" / "ui_bootstrap.py").read_text(
             encoding="utf-8"
         )
         self.assertNotIn('"显示实测"', ui_source)
-        self.assertNotIn('"显示预测负载"', ui_source)
+        self.assertIn('self.show_prediction_load_var = tk.BooleanVar(value=False)', ui_source)
+        self.assertIn('self.data_plot_toolbar, "预测负载", self.show_prediction_load_var', ui_source)
         self.assertNotIn("show_measured_curve_btn", ui_source)
         self.assertNotIn("show_reconstructed_curve_btn", ui_source)
         self.assertNotIn("baseline_ratio = 0.30", ui_source)
@@ -402,7 +584,48 @@ if forbidden:
         _root, kwargs = harness.calls[0]
         self.assertTrue(kwargs["strict_root"])
         self.assertTrue(kwargs["clear_on_failure"])
+        self.assertEqual(1, len(harness.experiment_resolve_calls))
+        self.assertEqual([], harness.experiment_load_calls)
         self.assertTrue(harness._sampledata_startup_attempted)
+
+    def test_release_startup_prefers_sampledata_over_experiment_csv(self):
+        harness = _ReleaseStartupHarness(
+            sample_success=True,
+            experiment_path="ignored.csv",
+        )
+        harness.auto_load_sample_bundle()
+        self.assertEqual([], harness.experiment_resolve_calls)
+        self.assertEqual([], harness.experiment_load_calls)
+
+    def test_release_startup_falls_back_to_experiment_csv(self):
+        harness = _ReleaseStartupHarness(experiment_path="measurement.csv")
+        harness.auto_load_sample_bundle()
+        self.assertEqual(1, len(harness.experiment_resolve_calls))
+        self.assertEqual([("measurement.csv", True)], harness.experiment_load_calls)
+
+    def test_experiment_csv_resolution_requires_one_channel_export(self):
+        manager = InputIdleMixin()
+        manager.detect_file_encoding = lambda _path: "utf-8"
+        channel_payload = (
+            "<Scope>\n"
+            "<ChannelInfo>,<True>,<5>,<实际速度>,<5>,<SP轴>\n"
+            "<ChannelData>,<1>,<2>\n"
+        )
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            measurement = root / "measurement.csv"
+            measurement.write_text(channel_payload, encoding="utf-8")
+            (root / "ProcessInfo.csv").write_text("N,S,F\n1,2,3\n", encoding="utf-8")
+            (root / "SampleData.csv").write_text(channel_payload, encoding="utf-8")
+
+            self.assertEqual(
+                measurement,
+                Path(manager.resolve_experiment_measurement_file(root)),
+            )
+
+            (root / "second.csv").write_text(channel_payload, encoding="utf-8")
+            self.assertIsNone(manager.resolve_experiment_measurement_file(root))
+            self.assertIn("找到多个实验实测 CSV", manager._experiment_measurement_resolution_error)
 
     def test_release_parse_failure_clears_stale_sample_state(self):
         harness = _LoadFailureHarness()
@@ -456,6 +679,272 @@ if forbidden:
             rtol=0.0,
             atol=1e-12,
         )
+
+    def test_iipinc_pair_deduplication_scaling_and_midpoint_mapping(self):
+        rows = [
+            "1 10 20 30 40 50 60 1000000 extra",
+            "1 10 20 30 40 50 60 1000000 extra",
+            "1 11 21 31 41 51 61 2000000",
+            "1 11 21 31 41 51 61 2000000",
+            "3 12 22 32 42 52 62 3000000",
+            "3 12 22 32 42 52 62 3000000",
+        ]
+        parsed = parse_iipinc_rows(rows)
+        self.assertEqual(6, parsed["physical_row_count"])
+        self.assertEqual(3, parsed["deduplicated_point_count"])
+        self.assertEqual("paired", parsed["row_format"])
+        self.assertEqual({0, 2}, set(parsed["feeds_by_line"]))
+        np.testing.assert_allclose(
+            parsed["feeds_by_line"][0],
+            np.asarray([1000000.0, 2000000.0]) * IIPINC_FEED_SCALE,
+        )
+
+        mapped, covered = map_iipinc_feed_to_samples(
+            np.asarray([0, 0, 0, 0, 1, 2, 2]),
+            parsed["feeds_by_line"],
+        )
+        np.testing.assert_allclose(mapped[:4], [60.0, 60.0, 120.0, 120.0])
+        self.assertTrue(np.isnan(mapped[4]))
+        np.testing.assert_allclose(mapped[5:], [180.0, 180.0])
+        np.testing.assert_array_equal(covered, [True, True, True, True, False, True, True])
+
+    def test_iipinc_single_rows_are_used_directly(self):
+        parsed = parse_iipinc_rows(
+            [
+                "1 0 0 0 0 0 0 1000000",
+                "1 0 0 0 0 0 0 2000000",
+                "3 0 0 0 0 0 0 3000000",
+                "Total periods 3",
+            ]
+        )
+
+        self.assertEqual(3, parsed["physical_row_count"])
+        self.assertEqual(3, parsed["deduplicated_point_count"])
+        self.assertEqual(3, parsed["declared_period_count"])
+        self.assertEqual("single", parsed["row_format"])
+        np.testing.assert_allclose(
+            parsed["feeds_by_line"][0],
+            np.asarray([1000000.0, 2000000.0]) * IIPINC_SINGLE_FEED_SCALE,
+        )
+        np.testing.assert_allclose(
+            parsed["feeds_by_line"][2],
+            np.asarray([3000000.0]) * IIPINC_SINGLE_FEED_SCALE,
+        )
+
+    def test_iipinc_rejects_illegal_rows(self):
+        with self.assertRaisesRegex(IipincFormatError, "非法数值"):
+            parse_iipinc_rows(
+                [
+                    "1 0 0 0 0 bad 0 1",
+                    "1 0 0 0 0 bad 0 1",
+                ]
+            )
+        with self.assertRaisesRegex(IipincFormatError, "数量与数据行数不一致"):
+            parse_iipinc_rows(
+                [
+                    "1 0 0 0 0 0 0 1",
+                    "Total periods 2",
+                ]
+            )
+
+    def test_nonnegative_fit_recovers_known_kc_ke(self):
+        ap_values = np.asarray([1.0, 1.0, 2.0, 2.0, 3.0, 4.0])
+        mrr_values = np.asarray([1.0, 2.0, 2.0, 6.0, 3.0, 8.0])
+        target = 2.5 * mrr_values + 4.0 * ap_values
+        result = fit_nonnegative_kc_ke(mrr_values, ap_values, target)
+        self.assertAlmostEqual(2.5, result["kc_value"], places=10)
+        self.assertAlmostEqual(4.0, result["ke_value"], places=10)
+        self.assertEqual(2, result["matrix_rank"])
+        self.assertEqual(6, result["sample_count"])
+
+    @staticmethod
+    def _write_iipinc(path, line_numbers, command_feeds, *, duplicate_rows=True):
+        rows = []
+        feed_scale = IIPINC_FEED_SCALE if duplicate_rows else IIPINC_SINGLE_FEED_SCALE
+        for line_number, command_feed in zip(line_numbers, command_feeds):
+            raw_feed = float(command_feed) / feed_scale
+            row = f"{int(line_number) + 1} 0 0 0 0 0 0 {raw_feed:.12g}"
+            rows.extend([row, row] if duplicate_rows else [row])
+        Path(path).write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    def test_release_fit_uses_process_feed_but_prediction_uses_iip_feed(self):
+        with TemporaryDirectory() as temp_dir:
+            iip_path = Path(temp_dir) / "iipinc.txt"
+            self._write_iipinc(iip_path, range(8), [0.0] + [120.0] * 7)
+            harness = _ReleasePredictionHarness(iip_path)
+            payload = harness._build_sampledata_prediction_payload_for_mode()
+
+        self.assertAlmostEqual(2.0, payload["fit_result"]["kc_value"], places=9)
+        self.assertAlmostEqual(3.0, payload["fit_result"]["ke_value"], places=9)
+        np.testing.assert_allclose(payload["mapped_process_feed"], 60.0)
+        np.testing.assert_allclose(payload["mapped_feed"], [0.0] + [120.0] * 7)
+        expected = 250.0 + 2.0 * (harness.ap * harness.ae * 120.0 / 60.0) + 3.0 * harness.ap
+        expected[0] = 250.0
+        np.testing.assert_allclose(payload["predicted_load"], expected, atol=1e-9)
+        self.assertEqual(250.0, harness.p_idle_var.get())
+        self.assertEqual(0, payload["fallback_line_count"])
+        self.assertIn("空载按 250 W", payload["status_text"])
+
+    def test_release_prediction_uses_experiment_actual_load_column(self):
+        with TemporaryDirectory() as temp_dir:
+            iip_path = Path(temp_dir) / "iipinc.txt"
+            self._write_iipinc(iip_path, range(8), [120.0] * 8)
+            harness = _ReleasePredictionHarness(iip_path)
+            actual_load = harness.sample_data_values[:, 1].copy()
+            harness.sample_data_mode = "experiment_measurement"
+            harness.manual_measurement_path = Path(temp_dir) / "measurement.csv"
+            harness.sample_data_values = np.column_stack(
+                [actual_load, np.zeros(8), np.zeros(8)]
+            )
+            payload = harness._build_sampledata_prediction_payload_for_mode()
+
+        self.assertEqual("实际负载", payload["actual_label"])
+        np.testing.assert_allclose(payload["actual_load"], actual_load)
+        self.assertAlmostEqual(2.0, payload["fit_result"]["kc_value"], places=9)
+        self.assertAlmostEqual(3.0, payload["fit_result"]["ke_value"], places=9)
+
+    def test_process_info_export_replaces_f_and_mrr_with_command_feed(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            iip_path = root / "iipinc.txt"
+            self._write_iipinc(
+                iip_path,
+                [0, 0],
+                [120.0, 180.0],
+                duplicate_rows=False,
+            )
+            harness = _ReleaseProcessExportHarness(iip_path)
+            output_path = harness._save_process_info_csv(root)
+            exported = pd.read_csv(output_path, encoding="utf-8-sig")
+
+        np.testing.assert_allclose(exported["F(mm/min)"], [120.0, 180.0, 60.0])
+        np.testing.assert_allclose(exported["MRR(mm3/s)"], [4.0, 6.0, 2.0])
+        self.assertEqual(2, harness._last_processinfo_feed_export["replaced_point_count"])
+        self.assertEqual(1, harness._last_processinfo_feed_export["fallback_line_count"])
+        self.assertIn("替换 2/3", harness._last_processinfo_feed_export_status)
+
+    def test_process_info_export_without_iip_keeps_process_feed(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            harness = _ReleaseProcessExportHarness(root / "iipinc.txt")
+            output_path = harness._save_process_info_csv(root)
+            exported = pd.read_csv(output_path, encoding="utf-8-sig")
+
+        np.testing.assert_allclose(exported["F(mm/min)"], [60.0, 60.0, 60.0])
+        np.testing.assert_allclose(exported["MRR(mm3/s)"], [2.0, 2.0, 2.0])
+        self.assertEqual(0, harness._last_processinfo_feed_export["replaced_point_count"])
+        self.assertIn("F 保留编程进给", harness._last_processinfo_feed_export_status)
+
+    def test_iipinc_missing_and_partial_lines_fall_back_to_process_feed(self):
+        with TemporaryDirectory() as temp_dir:
+            missing_path = Path(temp_dir) / "iipinc.txt"
+            missing_harness = _ReleasePredictionHarness(missing_path)
+            missing = missing_harness._build_sampledata_prediction_payload_for_mode()
+            np.testing.assert_allclose(missing["mapped_feed"], 60.0)
+            self.assertFalse(missing["iipinc_valid"])
+            self.assertEqual(8, missing["fallback_line_count"])
+
+            missing_path.write_text(
+                "1 0 0 0 0 bad 0 1\n",
+                encoding="utf-8",
+            )
+            invalid_harness = _ReleasePredictionHarness(missing_path)
+            invalid = invalid_harness._build_sampledata_prediction_payload_for_mode()
+            np.testing.assert_allclose(invalid["mapped_feed"], 60.0)
+            self.assertFalse(invalid["iipinc_valid"])
+            self.assertIn("非法数值", invalid["iipinc_error"])
+
+            self._write_iipinc(missing_path, [0, 2, 4, 6], [120.0] * 4)
+            partial_harness = _ReleasePredictionHarness(missing_path)
+            partial = partial_harness._build_sampledata_prediction_payload_for_mode()
+            np.testing.assert_allclose(
+                partial["mapped_feed"],
+                [120.0, 60.0, 120.0, 60.0, 120.0, 60.0, 120.0, 60.0],
+            )
+            self.assertTrue(partial["iipinc_valid"])
+            self.assertEqual(4, partial["fallback_line_count"])
+
+    def test_prediction_cache_uses_iip_file_signature_and_preserves_nan_gap(self):
+        with TemporaryDirectory() as temp_dir:
+            iip_path = Path(temp_dir) / "iipinc.txt"
+            self._write_iipinc(iip_path, range(8), [90.0] * 8)
+            harness = _ReleasePredictionHarness(iip_path)
+            harness.sample_data_values[3, 1] = np.nan
+            first = harness._build_sampledata_prediction_payload_for_mode()
+            second = harness._build_sampledata_prediction_payload_for_mode()
+            self.assertIs(first, second)
+            self.assertTrue(np.isnan(first["predicted_load"][3]))
+
+            self._write_iipinc(iip_path, range(8), [150.0] * 8)
+            third = harness._build_sampledata_prediction_payload_for_mode()
+            self.assertIsNot(first, third)
+            self.assertFalse(np.allclose(first["mapped_feed"], third["mapped_feed"]))
+
+    def test_release_plot_calculates_prediction_but_hides_it_until_selected(self):
+        harness = _ReleasePlotHarness()
+        mapping_records = [
+            {
+                "interval_id": "SEG0001",
+                "segment_type": "steady",
+                "state_code": 2,
+                "sample_start_idx": 0,
+                "sample_end_idx": 4,
+            }
+        ]
+        before = harness.build_segmentation_sample_background_masks(
+            np.asarray([250.0, 260.0, np.nan, 270.0, 250.0]),
+            None,
+            mapping_records,
+            valid_mask=np.asarray([True, True, False, True, True]),
+        )["state_masks"]
+        self.assertTrue(harness._render_segmentation_sample_overlay_view(mapping_records))
+        figure = harness.figures[0]
+        try:
+            axis = figure.axes[0]
+            labels = [line.get_label() for line in axis.lines]
+            self.assertIn("实际负载", labels)
+            self.assertNotIn("预测负载", labels)
+            self.assertEqual("实际负载与区间划分", axis.get_title())
+            self.assertEqual(1, harness.prediction_build_count)
+        finally:
+            plt.close(figure)
+
+        harness.show_prediction_load_var.set(True)
+        self.assertTrue(harness._render_segmentation_sample_overlay_view(mapping_records))
+        figure = harness.figures[0]
+        try:
+            axis = figure.axes[0]
+            labels = [line.get_label() for line in axis.lines]
+            self.assertIn("预测负载", labels)
+            self.assertEqual("实际负载、预测负载与区间划分", axis.get_title())
+            predicted_line = next(line for line in axis.lines if line.get_label() == "预测负载")
+            self.assertTrue(np.isnan(np.asarray(predicted_line.get_ydata(), dtype=float)).any())
+            after = harness.build_segmentation_sample_background_masks(
+                np.asarray([250.0, 260.0, np.nan, 275.0, 250.0]),
+                None,
+                mapping_records,
+                valid_mask=np.asarray([True, True, False, True, True]),
+            )["state_masks"]
+            for state_name in before:
+                np.testing.assert_array_equal(before[state_name], after[state_name])
+        finally:
+            plt.close(figure)
+
+    def test_release_experiment_display_resolver_runs_lightweight_inverse(self):
+        harness = _ReleasePlotHarness()
+        harness.sample_data_mode = "experiment_measurement"
+        harness.sample_data_source = _ValueVar(0)
+        harness.sample_data_values = np.column_stack(
+            [np.asarray([250.0, 260.0, np.nan, 270.0, 250.0]), np.zeros(5), np.zeros(5)]
+        )
+        harness.manual_measurement_data = {
+            "actual_load": harness.sample_data_values[:, 0].copy()
+        }
+
+        predicted = harness._resolve_segmentation_display_prediction(5)
+
+        np.testing.assert_allclose(predicted, harness.predicted, equal_nan=True)
+        self.assertEqual(1, harness.prediction_build_count)
 
     def test_steady_mode_is_deterministic_and_nonsteady_remains_pointwise(self):
         kc_hat, _sigma, _valid = summarize_interval_kc_mode_statistics([1.0, 3.0])

@@ -1751,14 +1751,7 @@ class ProcessingCoreMixin:
         self._process_point_metadata_cache_key = None
         self._sample_line_point_context_cache = None
         self._authoritative_segmentation_sample_lookup_cache = None
-        self._smif_source_cache = None
-        self._smif_dashboard_payload = None
-        self._smif_focus_bounds = None
-        self._smif_profile_process_rows_cache = None
         self._last_process_application_context = ""
-        smif_cache_resetter = getattr(self, "_reset_smif_runtime_cache", None)
-        if callable(smif_cache_resetter):
-            smif_cache_resetter()
         if self.sample_display_mode.get() == "program":
             self.sample_avg_var.set("-")
             self.sample_ideal_var.set("-")
@@ -1769,14 +1762,8 @@ class ProcessingCoreMixin:
             self.update_nav_buttons()
         except Exception:
             pass
-        pit_button_refresher = getattr(self, "refresh_pit_button_state", None)
-        if callable(pit_button_refresher):
-            pit_button_refresher()
-        smif_refresher = getattr(self, "refresh_smif_view", None)
-        if callable(smif_refresher):
-            smif_refresher()
-        if hasattr(self, "refresh_main_pit_preview"):
-            self.refresh_main_pit_preview()
+        if hasattr(self, "invalidate_pit_view"):
+            self.invalidate_pit_view(refresh_if_visible=True)
         if hasattr(self, "refresh_prediction_metrics_summary"):
             self.refresh_prediction_metrics_summary()
         if hasattr(self, "_refresh_import_order_controls"):

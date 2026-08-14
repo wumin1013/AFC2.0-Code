@@ -6,6 +6,141 @@ import numpy as np
 import pandas as pd
 
 
+def _solve_nonnegative_scalar(feature_values, target_values) -> float:
+    feature = np.asarray(feature_values, dtype=float).reshape(-1)
+    target = np.asarray(target_values, dtype=float).reshape(-1)
+    denominator = float(np.dot(feature, feature))
+    if denominator <= 1e-12:
+        return 0.0
+    return max(float(np.dot(feature, target) / denominator), 0.0)
+
+
+def _solve_nonnegative_kc_ke(mrr_values, ap_values, target_values):
+    """用二维边界枚举实现无 SciPy 依赖的非负最小二乘。"""
+    mrr_arr = np.asarray(mrr_values, dtype=float).reshape(-1)
+    ap_arr = np.asarray(ap_values, dtype=float).reshape(-1)
+    target_arr = np.asarray(target_values, dtype=float).reshape(-1)
+    design_matrix = np.column_stack([mrr_arr, ap_arr])
+
+    candidates = []
+    try:
+        coefficients, _, _, _ = np.linalg.lstsq(design_matrix, target_arr, rcond=None)
+        coefficients = np.asarray(coefficients, dtype=float).reshape(-1)
+        if (
+            coefficients.size == 2
+            and np.all(np.isfinite(coefficients))
+            and np.all(coefficients >= 0.0)
+        ):
+            candidates.append(coefficients)
+    except Exception:
+        pass
+
+    candidates.extend(
+        [
+            np.array([_solve_nonnegative_scalar(mrr_arr, target_arr), 0.0], dtype=float),
+            np.array([0.0, _solve_nonnegative_scalar(ap_arr, target_arr)], dtype=float),
+            np.array([0.0, 0.0], dtype=float),
+        ]
+    )
+    best_coefficients = candidates[-1]
+    best_rss = float("inf")
+    for coefficients in candidates:
+        residuals = target_arr - design_matrix @ coefficients
+        rss = float(np.dot(residuals, residuals))
+        if rss < best_rss:
+            best_rss = rss
+            best_coefficients = coefficients
+    return float(best_coefficients[0]), float(best_coefficients[1])
+
+
+def fit_nonnegative_kc_ke(
+    mrr_values,
+    ap_values,
+    target_values,
+    *,
+    source_label: str = "切削锚点",
+    minimum_samples: int = 2,
+    maximum_condition_number: float = 3e3,
+):
+    """按主代码口径联合辨识非负 ``Kc/Ke``，并返回诊断信息。"""
+    mrr_arr = pd.to_numeric(pd.Series(mrr_values), errors="coerce").to_numpy(dtype=float)
+    ap_arr = pd.to_numeric(pd.Series(ap_values), errors="coerce").to_numpy(dtype=float)
+    target_arr = pd.to_numeric(pd.Series(target_values), errors="coerce").to_numpy(dtype=float)
+    finite_mask = (
+        np.isfinite(mrr_arr)
+        & np.isfinite(ap_arr)
+        & np.isfinite(target_arr)
+        & (mrr_arr > 1e-12)
+        & (ap_arr > 1e-12)
+    )
+    mrr_arr = mrr_arr[finite_mask]
+    ap_arr = ap_arr[finite_mask]
+    target_arr = target_arr[finite_mask]
+
+    required_samples = max(int(minimum_samples), 2)
+    sample_count = int(target_arr.size)
+    if sample_count < required_samples:
+        raise ValueError(
+            f"{source_label}有效样本不足 {required_samples} 个，无法辨识 K_c / K_e"
+        )
+
+    design_matrix = np.column_stack([mrr_arr, ap_arr])
+    scale_mrr = max(float(np.median(np.abs(mrr_arr))), 1.0)
+    scale_ap = max(float(np.median(np.abs(ap_arr))), 1.0)
+    scaled_design = np.column_stack([mrr_arr / scale_mrr, ap_arr / scale_ap])
+    matrix_rank = int(np.linalg.matrix_rank(scaled_design))
+    if matrix_rank < 2:
+        specific_mrr = np.divide(
+            mrr_arr,
+            ap_arr,
+            out=np.full_like(mrr_arr, np.nan, dtype=float),
+            where=np.abs(ap_arr) > 1e-12,
+        )
+        excitation_span = (
+            float(np.nanmax(specific_mrr) - np.nanmin(specific_mrr))
+            if specific_mrr.size
+            else 0.0
+        )
+        excitation_scale = max(
+            float(np.nanmedian(np.abs(specific_mrr))) if specific_mrr.size else 0.0,
+            1.0,
+        )
+        if excitation_span <= 1e-6 or excitation_span / excitation_scale < 0.02:
+            raise ValueError(
+                f"{source_label}的 a_e·F/60 变化不足，无法分离 K_c / K_e"
+            )
+        raise ValueError(f"{source_label}的 MRR 与 a_p 高度共线，无法稳定分离 K_c / K_e")
+
+    condition_number = float(np.linalg.cond(scaled_design))
+    if (
+        not np.isfinite(condition_number)
+        or condition_number > float(maximum_condition_number)
+    ):
+        raise ValueError(
+            f"{source_label}病态过强（条件数={condition_number:.1f}），无法稳定辨识 K_c / K_e"
+        )
+
+    kc_value, ke_value = _solve_nonnegative_kc_ke(mrr_arr, ap_arr, target_arr)
+    residuals = target_arr - design_matrix @ np.asarray([kc_value, ke_value], dtype=float)
+    if sample_count > 2:
+        residual_variance = float(
+            np.sum(residuals ** 2) / max(sample_count - 2, 1)
+        )
+        covariance = residual_variance * np.linalg.pinv(design_matrix.T @ design_matrix)
+        kc_sigma = float(np.sqrt(max(float(covariance[0, 0]), 0.0)))
+    else:
+        kc_sigma = 0.0
+    return {
+        "kc_value": float(kc_value),
+        "ke_value": float(ke_value),
+        "kc_sigma": max(float(kc_sigma), 0.0),
+        "sample_count": sample_count,
+        "matrix_rank": matrix_rank,
+        "condition_number": condition_number,
+        "residual_std": float(np.std(residuals)) if residuals.size else 0.0,
+    }
+
+
 def clip_nonnegative_numeric_array(values) -> np.ndarray:
     """将有限负数截断为 0，保留 NaN/Inf 供上层判定有效性。"""
     array = np.asarray(values, dtype=float).copy()
@@ -415,6 +550,7 @@ __all__ = [
     "apply_steady_representative_prediction",
     "clip_nonnegative_numeric_array",
     "estimate_idle_noise_and_mrr_gate",
+    "fit_nonnegative_kc_ke",
     "robust_sigma",
     "summarize_interval_kc_mode_statistics",
 ]

@@ -21,22 +21,18 @@ class BootstrapUiMixin:
             except Exception:
                 pass
 
-    def _schedule_smif_resize_and_refresh(self, refresh=False, refresh_pit=False):
+    def _schedule_pit_resize_and_refresh(self):
         def _run():
-            try:
-                self.adjust_figure_sizes()
-            except Exception as exc:
-                self._report_view_refresh_error("调整图形尺寸", exc)
-            if refresh_pit and hasattr(self, "refresh_main_pit_preview"):
+            if hasattr(self, "resize_pit_figure_to_canvas"):
+                try:
+                    self.resize_pit_figure_to_canvas()
+                except Exception as exc:
+                    self._report_view_refresh_error("调整PIT图形尺寸", exc)
+            if hasattr(self, "refresh_main_pit_preview"):
                 try:
                     self.refresh_main_pit_preview()
                 except Exception as exc:
-                    self._report_view_refresh_error("刷新PIT预览", exc)
-            if refresh:
-                try:
-                    self.refresh_smif_view()
-                except Exception as exc:
-                    self._report_view_refresh_error("刷新SMIF视图", exc)
+                    self._report_view_refresh_error("刷新PIT", exc)
 
         if hasattr(self, "root"):
             try:
@@ -51,18 +47,8 @@ class BootstrapUiMixin:
             selected = self.notebook.select()
         except Exception:
             return
-        if str(selected) == str(self.smif_pit_tab):
-            self._schedule_smif_resize_and_refresh(refresh=True, refresh_pit=True)
-
-    def _on_smif_notebook_tab_changed(self, _event=None):
-        try:
-            selected = self.pit_smif_notebook.select()
-        except Exception:
-            return
-        if str(selected) == str(self.smif_workspace_tab):
-            self._schedule_smif_resize_and_refresh(refresh=True)
-        else:
-            self._schedule_smif_resize_and_refresh(refresh=False, refresh_pit=True)
+        if str(selected) == str(getattr(self, "pit_tab", "")):
+            self._schedule_pit_resize_and_refresh()
 
     def __init__(self, root):
         self.root = root
@@ -73,6 +59,7 @@ class BootstrapUiMixin:
         self.enable_profile_config = bool(
             getattr(self, "enable_profile_config", not self.release_mode)
         )
+        self._startup_layout_pending = bool(self.release_mode)
         self.root.title("🔬 铣削工艺信息分析工具 - 智能分析系统")
         
         # 配置科技感主题样式
@@ -161,6 +148,9 @@ class BootstrapUiMixin:
             value="六类数量：空载 0 | 进刀 0 | 稳态 0 | 过渡 0 | 退刀 0 | 非稳态 0"
         )
         self.interval_overview_mapping_var = tk.StringVar(value="采样映射：未导入实际采样文件")
+        self.inverse_prediction_status_var = tk.StringVar(
+            value="预测负载：等待自动生成"
+        )
         self.model_detail_collapsed = tk.BooleanVar(value=True)
         self.model_detail_toggle_text = tk.StringVar(value="展开详情")
         self._model_detail_widgets = []
@@ -200,10 +190,6 @@ class BootstrapUiMixin:
         self.pit_records = []
         self._process_model_state_version = 0
         self._last_process_application_context = ""
-        self.smif_metric_var = tk.StringVar(value="K_c_hat")
-        self.smif_view_mode_var = tk.StringVar(value="full")
-        self.smif_scope_var = tk.StringVar(value="all")
-        self.smif_status_var = tk.StringVar(value="未导入G代码NC（工艺信息分析可直接使用输入中的 s/S）")
         self.data = []  # 存储处理后的数据
         self.figures = []  # 存储图表对象
         self.current_figure_index = 0  # 当前显示的图表索引
@@ -277,6 +263,7 @@ class BootstrapUiMixin:
         self.show_ap_overlay_var = tk.BooleanVar(value=False)
         self.show_ae_overlay_var = tk.BooleanVar(value=False)
         self.show_interval_state_var = tk.BooleanVar(value=True)
+        self.show_prediction_load_var = tk.BooleanVar(value=False)
         self.sample_program_name = tk.StringVar()
         self.sample_tool_name = tk.StringVar()
         self.sample_avg_var = tk.StringVar(value="-")
@@ -365,14 +352,10 @@ class BootstrapUiMixin:
         # 图表拖动功能变量
         self.is_panning = False  # 是否正在拖动
         self.pan_start = None  # 拖动起始位置
-        self._smif_pan_active = False
-        self._smif_pan_state = None
-        self._smif_pan_button = 1
-        self._smif_pan_key = "alt"
-        self._smif_alt_pressed = False
-
         if hasattr(self, "init_academic_workbench_state"):
             self.init_academic_workbench_state()
+        if hasattr(self, "init_pit_viewer_state"):
+            self.init_pit_viewer_state()
 
         # 创建标签页
         self.notebook = ttk.Notebook(root)
@@ -380,15 +363,15 @@ class BootstrapUiMixin:
         
         # 创建工艺信息分析标签页
         self.data_processing_tab = ttk.Frame(self.notebook)
-        self.notebook.add(self.data_processing_tab, text="工艺信息分析")
+        self.notebook.add(self.data_processing_tab, text="主页面")
         if self.enable_research_features:
-            self.smif_pit_tab = ttk.Frame(self.notebook)
-            self.notebook.add(self.smif_pit_tab, text="PIT / SMIF")
+            self.pit_tab = ttk.Frame(self.notebook)
+            self.notebook.add(self.pit_tab, text="PIT")
 
         # 创建界面
         self.create_data_processing_tab()
         if self.enable_research_features:
-            self.create_smif_pit_tab()
+            self.create_pit_tab()
         # self.create_steady_state_tab()  # 已合并到工艺信息分析页
         
         # 初始化图表
@@ -400,8 +383,16 @@ class BootstrapUiMixin:
         if self.enable_research_features:
             self.notebook.bind("<<NotebookTabChanged>>", self._on_main_notebook_tab_changed)
         
-        # 延迟调用图表大小自适应，确保所有组件都已创建完成
-        self.root.after(100, self.adjust_figure_sizes)
+        # 发布版由分割条初始化统一完成首次尺寸同步，避免启动阶段重复重绘。
+        if self.enable_research_features:
+            self.root.after(100, self.adjust_figure_sizes)
+        else:
+            # 启动窗口在 withdraw/deiconify/zoomed 之间会连续产生多次 Configure。
+            # 分割条初始化已负责首次布局，短暂忽略这些重复尺寸事件。
+            self.root.after(
+                600,
+                lambda: setattr(self, "_startup_layout_pending", False),
+            )
         # 仅保留工艺信息分析页，无需实际负载页的自适应逻辑
         self.root.after(200, self.auto_load_sample_bundle)
 
@@ -532,7 +523,6 @@ class BootstrapUiMixin:
             maximum_controls_h = max(total_h - minimum_preview_h, 150)
             target_h = min(target_h, maximum_controls_h)
             paned.sashpos(0, target_h)
-            self.root.after_idle(self.adjust_figure_sizes)
         except Exception:
             pass
 
@@ -548,7 +538,16 @@ class BootstrapUiMixin:
                 total_w = int(controls.winfo_reqwidth())
             if total_w <= 10:
                 return
-            if total_w >= 1850:
+            if not self.enable_research_features:
+                if total_w >= 1850:
+                    detail_width = 430
+                elif total_w >= 1600:
+                    detail_width = 400
+                elif total_w >= 1360:
+                    detail_width = 370
+                else:
+                    detail_width = 350
+            elif total_w >= 1850:
                 detail_width = 510
             elif total_w >= 1600:
                 detail_width = 470
@@ -576,7 +575,7 @@ class BootstrapUiMixin:
     def _create_research_model_controls(self, parent, row):
         """创建仅研究版可用的机理辨识区。
 
-        发布版不调用本方法，从而不实例化辨识、profile 或 PIT 相关控件。
+        发布版不调用本方法，从而不实例化辨识或 profile 相关控件。
         """
         model_frame = ttk.LabelFrame(parent, text="🧠 机理辨识", padding=8, style='Tech.TLabelframe')
         model_frame.grid(row=row, column=0, sticky="ew", pady=(0, 6))
@@ -585,7 +584,7 @@ class BootstrapUiMixin:
 
         model_action_frame = ttk.Frame(model_frame)
         model_action_frame.grid(row=0, column=0, columnspan=10, sticky="ew", pady=(0, 6))
-        model_action_frame.grid_columnconfigure(4, weight=1)
+        model_action_frame.grid_columnconfigure(3, weight=1)
 
         self.import_nc_btn = ttk.Button(
             model_action_frame, text="📄 导入G代码NC(可选)", command=self.browse_nc_file,
@@ -607,16 +606,11 @@ class BootstrapUiMixin:
             lambda _event: self._arm_model_param_commit_refresh_suppression(duration_seconds=1.2),
             add="+",
         )
-        self.pit_display_btn = ttk.Button(
-            model_action_frame, text="📋 PIT显示", command=self.show_pit_dialog,
-            width=11, style='Secondary.TButton', state="disabled"
-        )
-        self.pit_display_btn.grid(row=0, column=3, padx=(0, 6), pady=(0, 6), sticky="w")
         self.model_detail_toggle_btn = ttk.Button(
             model_action_frame, textvariable=self.model_detail_toggle_text,
             command=self._toggle_model_detail_section, width=10, style='Secondary.TButton'
         )
-        self.model_detail_toggle_btn.grid(row=0, column=5, padx=(6, 0), pady=(0, 6), sticky="e")
+        self.model_detail_toggle_btn.grid(row=0, column=4, padx=(6, 0), pady=(0, 6), sticky="e")
 
         model_option_frame = ttk.Frame(model_frame)
         model_option_frame.grid(row=1, column=0, columnspan=10, sticky="ew", pady=(0, 4))
@@ -882,31 +876,42 @@ class BootstrapUiMixin:
             action_frame, text="行程域+指令域", variable=self.process_axis_mode, value="行程域+指令域",
             command=self.on_sample_selection_change, style='Tech.TRadiobutton'
         ).grid(row=0, column=5, sticky="e")
-        # ===== 右侧：只读区间划分概况 =====
+        # ===== 右侧：只读运行结果 =====
+        detail_title = "✅ 运行结果" if self.release_mode else "📌 区间划分详情"
         ideal_frame = ttk.LabelFrame(
-            controls, text="📌 区间划分详情", padding=10, style='Tech.TLabelframe'
+            controls, text=detail_title, padding=10, style='Tech.TLabelframe'
         )
         ideal_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
         ideal_frame.configure(width=470)
         ideal_frame.grid_columnconfigure(0, weight=1)
         self.ideal_detail_frame = ideal_frame
 
-        ttk.Label(
-            ideal_frame, text="区间划分概况", font=UI_FONT_BOLD, foreground=UI_COLOR_PRIMARY
-        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
-        overview_rows = (
-            self.interval_overview_success_var,
-            self.interval_overview_total_var,
-            self.interval_overview_counts_var,
-            self.interval_overview_mapping_var,
-        )
+        if self.release_mode:
+            overview_rows = [
+                self.interval_overview_success_var,
+                self.interval_overview_mapping_var,
+                self.inverse_prediction_status_var,
+            ]
+            first_overview_row = 0
+        else:
+            ttk.Label(
+                ideal_frame, text="区间划分概况", font=UI_FONT_BOLD,
+                foreground=UI_COLOR_PRIMARY
+            ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+            overview_rows = [
+                self.interval_overview_success_var,
+                self.interval_overview_total_var,
+                self.interval_overview_counts_var,
+                self.interval_overview_mapping_var,
+            ]
+            first_overview_row = 1
         self.interval_overview_labels = []
-        for row_index, variable in enumerate(overview_rows, start=1):
+        for row_index, variable in enumerate(overview_rows, start=first_overview_row):
             label = ttk.Label(
                 ideal_frame, textvariable=variable, font=UI_FONT_NORMAL,
                 foreground=UI_COLOR_TEXT, justify=tk.LEFT, wraplength=370,
             )
-            label.grid(row=row_index, column=0, sticky="w", pady=(0, 6))
+            label.grid(row=row_index, column=0, sticky="w", pady=(0, 5))
             self.interval_overview_labels.append(label)
         self._refresh_ideal_tree()
         # 收集控件引用
@@ -917,7 +922,8 @@ class BootstrapUiMixin:
 
         if self.enable_research_features:
             self._set_model_detail_collapsed(True)
-        self.root.after_idle(self._adapt_data_processing_layout)
+        if self.enable_research_features:
+            self.root.after_idle(self._adapt_data_processing_layout)
 
         # ===== 预览区 =====
         preview.grid_columnconfigure(0, weight=1)
@@ -948,25 +954,37 @@ class BootstrapUiMixin:
         ttk.Label(self.data_plot_toolbar, text="显示:", font=UI_FONT_SMALL).grid(
             row=0, column=1, sticky="e", padx=(0, 2)
         )
+        toolbar_column = 2
+        self.show_prediction_load_btn = None
+        if self.release_mode:
+            self.show_prediction_load_btn = self._create_plot_option_checkbutton(
+                self.data_plot_toolbar, "预测负载", self.show_prediction_load_var,
+                self.on_sample_selection_change, 0, toolbar_column
+            )
+            toolbar_column += 1
         self.show_feed_overlay_btn = self._create_plot_option_checkbutton(
             self.data_plot_toolbar, "F", self.show_feed_overlay_var,
-            self.on_optional_overlay_toggle, 0, 2
+            self.on_optional_overlay_toggle, 0, toolbar_column
         )
+        toolbar_column += 1
         self.show_speed_overlay_btn = self._create_plot_option_checkbutton(
             self.data_plot_toolbar, "S", self.show_speed_overlay_var,
-            self.on_optional_overlay_toggle, 0, 3
+            self.on_optional_overlay_toggle, 0, toolbar_column
         )
+        toolbar_column += 1
         self.show_ap_overlay_btn = self._create_plot_option_checkbutton(
             self.data_plot_toolbar, "ap", self.show_ap_overlay_var,
-            self.on_optional_overlay_toggle, 0, 4
+            self.on_optional_overlay_toggle, 0, toolbar_column
         )
+        toolbar_column += 1
         self.show_ae_overlay_btn = self._create_plot_option_checkbutton(
             self.data_plot_toolbar, "ae", self.show_ae_overlay_var,
-            self.on_optional_overlay_toggle, 0, 5
+            self.on_optional_overlay_toggle, 0, toolbar_column
         )
+        toolbar_column += 1
         self.show_interval_state_btn = self._create_plot_option_checkbutton(
             self.data_plot_toolbar, "区间状态", self.show_interval_state_var,
-            self.on_sample_selection_change, 0, 6
+            self.on_sample_selection_change, 0, toolbar_column
         )
 
         self.data_plot_canvas_frame = ttk.Frame(self.data_figure_frame)
@@ -984,6 +1002,8 @@ class BootstrapUiMixin:
             self.show_ae_overlay_btn,
             self.show_interval_state_btn,
         ))
+        if self.show_prediction_load_btn is not None:
+            self.sample_control_widgets.append(self.show_prediction_load_btn)
         # 过程域按钮不属于实测控件组，不得因未导入实测而禁用。
         if hasattr(self, "_refresh_import_order_controls"):
             self._refresh_import_order_controls()
@@ -1021,7 +1041,12 @@ class BootstrapUiMixin:
                     ctrl_h = max(requested_h + 12, int(total_h * 0.36), 220)
                 ctrl_h = min(ctrl_h, max(total_h - 300, 150))
                 paned.sashpos(0, ctrl_h)
-                self.root.after_idle(self._sync_data_controls_preview_ratio)
+
+                def _finish_initial_layout():
+                    self._sync_data_controls_preview_ratio()
+                    self.adjust_figure_sizes()
+
+                self.root.after_idle(_finish_initial_layout)
             except Exception:
                 pass
 
@@ -1031,7 +1056,7 @@ class BootstrapUiMixin:
             self.refresh_prediction_mode_controls()
         if self.enable_research_features and hasattr(self, "refresh_prediction_metrics_summary"):
             self.refresh_prediction_metrics_summary()
-        if hasattr(self, "_refresh_idle_power_chart"):
+        if self.enable_research_features and hasattr(self, "_refresh_idle_power_chart"):
             self.root.after_idle(self._refresh_idle_power_chart)
 
     def _build_pit_preview_panel(self, parent):
@@ -1040,167 +1065,37 @@ class BootstrapUiMixin:
 
         pit_toolbar = ttk.Frame(parent, padding=(6, 6, 6, 2))
         pit_toolbar.grid(row=0, column=0, sticky="ew")
-        pit_toolbar.grid_columnconfigure(9, weight=1)
-
-        ttk.Label(pit_toolbar, text="显示:", font=UI_FONT_SMALL).grid(row=0, column=0, sticky="w")
-        ttk.Radiobutton(
-            pit_toolbar, text="图", variable=self.pit_view_mode_var, value="plot",
-            command=self._on_main_pit_config_changed, style='Tech.TRadiobutton'
-        ).grid(row=0, column=1, sticky="w", padx=(4, 8))
-        ttk.Radiobutton(
-            pit_toolbar, text="表", variable=self.pit_view_mode_var, value="table",
-            command=self._on_main_pit_config_changed, style='Tech.TRadiobutton'
-        ).grid(row=0, column=2, sticky="w", padx=(0, 12))
-        ttk.Label(pit_toolbar, text="范围:", font=UI_FONT_SMALL).grid(row=0, column=3, sticky="w")
-        ttk.Radiobutton(
-            pit_toolbar, text="全部工艺点", variable=self.pit_scope_var, value="all",
-            command=self._on_main_pit_config_changed, style='Tech.TRadiobutton'
-        ).grid(row=0, column=4, sticky="w", padx=(4, 8))
-        ttk.Radiobutton(
-            pit_toolbar, text="仅稳态区间", variable=self.pit_scope_var, value="steady",
-            command=self._on_main_pit_config_changed, style='Tech.TRadiobutton'
-        ).grid(row=0, column=5, sticky="w", padx=(0, 12))
-        ttk.Label(pit_toolbar, text="横轴:", font=UI_FONT_SMALL).grid(row=0, column=6, sticky="w")
-        ttk.Radiobutton(
-            pit_toolbar, text="时域+指令域", variable=self.pit_axis_mode_var, value="时域+指令域",
-            command=self._on_main_pit_config_changed, style='Tech.TRadiobutton'
-        ).grid(row=0, column=7, sticky="w", padx=(4, 8))
-        ttk.Radiobutton(
-            pit_toolbar, text="行程域+指令域", variable=self.pit_axis_mode_var, value="行程域+指令域",
-            command=self._on_main_pit_config_changed, style='Tech.TRadiobutton'
-        ).grid(row=0, column=8, sticky="w", padx=(0, 12))
-        ttk.Label(pit_toolbar, text="字段:", font=UI_FONT_SMALL).grid(row=0, column=9, sticky="w")
-        self.pit_field_combo = ttk.Combobox(
-            pit_toolbar, textvariable=self.pit_field_var, state="readonly", width=18, font=UI_FONT_SMALL
-        )
-        self.pit_field_combo.grid(row=0, column=10, sticky="w", padx=(4, 8))
-        self.pit_field_combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh_main_pit_preview())
+        pit_toolbar.grid_columnconfigure(0, weight=1)
         ttk.Label(
             pit_toolbar,
-            text="单字段单图显示，切换字段即切换图",
+            text="只读工艺信息查看器｜固定显示 ap、ae、F、MRR",
             font=UI_FONT_SMALL,
-            foreground=UI_COLOR_TEXT_MUTED
-        ).grid(row=0, column=11, sticky="w")
+            foreground=UI_COLOR_TEXT,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Button(
+            pit_toolbar,
+            text="刷新",
+            command=lambda: self.refresh_main_pit_preview(force=True),
+            width=9,
+            style='Secondary.TButton',
+        ).grid(row=0, column=1, sticky="e", padx=(8, 0))
         ttk.Label(
             pit_toolbar,
             textvariable=self.pit_status_var,
             font=UI_FONT_SMALL,
-            foreground=UI_COLOR_TEXT_MUTED
-        ).grid(row=1, column=0, columnspan=10, sticky="w", pady=(4, 0))
+            foreground=UI_COLOR_TEXT_MUTED,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
-        self.pit_content_stack = ttk.Frame(parent)
-        self.pit_content_stack.grid(row=1, column=0, sticky="nsew")
-        self.pit_content_stack.grid_columnconfigure(0, weight=1)
-        self.pit_content_stack.grid_rowconfigure(0, weight=1)
-        self.pit_plot_container = ttk.Frame(self.pit_content_stack)
-        self.pit_table_container = ttk.Frame(self.pit_content_stack)
+        self.pit_plot_container = ttk.Frame(parent)
+        self.pit_plot_container.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
+        self.pit_plot_container.grid_columnconfigure(0, weight=1)
+        self.pit_plot_container.grid_rowconfigure(0, weight=1)
 
-    def create_smif_pit_tab(self):
-        """创建 SMIF / PIT 子页面。"""
-        self.smif_pit_tab.grid_columnconfigure(0, weight=1)
-        self.smif_pit_tab.grid_rowconfigure(0, weight=1)
-
-        self.pit_smif_notebook = ttk.Notebook(self.smif_pit_tab)
-        self.pit_smif_notebook.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
-        self.pit_smif_notebook.bind("<<NotebookTabChanged>>", self._on_smif_notebook_tab_changed)
-        self.pit_workspace_tab = ttk.Frame(self.pit_smif_notebook)
-        self.smif_workspace_tab = ttk.Frame(self.pit_smif_notebook)
-        self.pit_smif_notebook.add(self.pit_workspace_tab, text="PIT")
-        self.pit_smif_notebook.add(self.smif_workspace_tab, text="SMIF")
-
-        self._build_pit_preview_panel(self.pit_workspace_tab)
-
-        self.smif_workspace_tab.grid_columnconfigure(0, weight=1)
-        self.smif_workspace_tab.grid_rowconfigure(1, weight=1)
-
-        top_bar = ttk.Frame(self.smif_workspace_tab, padding=(0, 0, 0, 4))
-        top_bar.grid(row=0, column=0, sticky="ew")
-        top_bar.grid_columnconfigure(11, weight=1)
-
-        ttk.Label(top_bar, text="SMIF 指标:", font=UI_FONT_NORMAL).grid(row=0, column=0, sticky="w")
-        ttk.Radiobutton(
-            top_bar, text="K_c_hat", variable=self.smif_metric_var, value="K_c_hat",
-            command=self.refresh_smif_view, style='Tech.TRadiobutton'
-        ).grid(row=0, column=1, sticky="w", padx=(6, 8))
-        ttk.Radiobutton(
-            top_bar, text="K_c_UCB", variable=self.smif_metric_var, value="K_c_UCB",
-            command=self.refresh_smif_view, style='Tech.TRadiobutton'
-        ).grid(row=0, column=2, sticky="w", padx=(0, 12))
-        ttk.Label(top_bar, text="显示范围:", font=UI_FONT_NORMAL).grid(row=0, column=3, sticky="w")
-        ttk.Radiobutton(
-            top_bar, text="区间聚焦", variable=self.smif_view_mode_var, value="focus",
-            command=self.refresh_smif_view, style='Tech.TRadiobutton'
-        ).grid(row=0, column=4, sticky="w", padx=(6, 8))
-        ttk.Radiobutton(
-            top_bar, text="完整轨迹", variable=self.smif_view_mode_var, value="full",
-            command=self.refresh_smif_view, style='Tech.TRadiobutton'
-        ).grid(row=0, column=5, sticky="w", padx=(0, 12))
-        ttk.Label(top_bar, text="显示内容:", font=UI_FONT_NORMAL).grid(row=0, column=6, sticky="w")
-        ttk.Radiobutton(
-            top_bar, text="全部显示", variable=self.smif_scope_var, value="all",
-            command=self.refresh_smif_view, style='Tech.TRadiobutton'
-        ).grid(row=0, column=7, sticky="w", padx=(6, 8))
-        ttk.Radiobutton(
-            top_bar, text="仅稳态", variable=self.smif_scope_var, value="steady",
-            command=self.refresh_smif_view, style='Tech.TRadiobutton'
-        ).grid(row=0, column=8, sticky="w", padx=(0, 12))
-        ttk.Button(
-            top_bar, text="刷新SMIF", command=self.refresh_smif_view,
-            width=12, style='Secondary.TButton'
-        ).grid(row=0, column=9, sticky="w")
-        ttk.Label(
-            top_bar, textvariable=self.smif_status_var, font=UI_FONT_SMALL,
-            foreground=UI_COLOR_TEXT_MUTED
-        ).grid(row=0, column=11, sticky="e")
-
-        self.smif_plot_frame = ttk.LabelFrame(self.smif_workspace_tab, text="SMIF 轨迹视图（滚轮缩放）", padding=2, style='Tech.TLabelframe')
-        self.smif_plot_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 0), pady=(0, 0))
-        self.smif_plot_frame.grid_rowconfigure(0, weight=1)
-        self.smif_plot_frame.grid_columnconfigure(0, weight=1)
-
-        self.fig_smif = plt.figure(figsize=(8, 6), dpi=80)
-        self.fig_smif.patch.set_facecolor(SMIF_FIG_BG)
-        self.ax_smif = None
-        self.ax_smif_xy = None
-        self.ax_smif_xz = None
-        self.ax_smif_metric = None
-        self._smif_colorbar_ax = None
-        self.canvas_smif = FigureCanvasTkAgg(self.fig_smif, master=self.smif_plot_frame)
-        smif_canvas_widget = self.canvas_smif.get_tk_widget()
-        try:
-            smif_canvas_widget.configure(background=SMIF_FIG_BG, highlightthickness=0, borderwidth=0)
-        except Exception:
-            pass
-        smif_canvas_widget.grid(row=0, column=0, sticky="nsew")
-        smif_canvas_widget.bind("<Enter>", lambda _e: smif_canvas_widget.focus_set())
-        smif_canvas_widget.bind("<FocusOut>", lambda _e: setattr(self, "_smif_alt_pressed", False))
-        smif_canvas_widget.bind("<MouseWheel>", self.on_smif_widget_mousewheel)
-        smif_canvas_widget.bind("<Button-4>", self.on_smif_widget_mousewheel)
-        smif_canvas_widget.bind("<Button-5>", self.on_smif_widget_mousewheel)
-        self.smif_plot_frame.bind(
-            "<Configure>",
-            lambda _e: self._schedule_smif_resize_and_refresh(refresh=False),
-            add="+",
-        )
-        self.canvas_smif.mpl_connect('scroll_event', self.on_smif_scroll_zoom)
-        self.canvas_smif.mpl_connect('button_press_event', self.on_smif_pan_press)
-        self.canvas_smif.mpl_connect('motion_notify_event', self.on_smif_pan_motion)
-        self.canvas_smif.mpl_connect('button_release_event', self.on_smif_pan_release)
-        self.canvas_smif.mpl_connect('key_press_event', self.on_smif_key_press)
-        self.canvas_smif.mpl_connect('key_release_event', self.on_smif_key_release)
-        self.smif_pit_tree = None
-        has_smif_source = bool(hasattr(self, "_has_smif_trajectory_source") and self._has_smif_trajectory_source())
-        if not has_smif_source:
-            try:
-                self._draw_smif_empty_placeholder()
-                self.canvas_smif.draw_idle()
-            except Exception:
-                pass
-
-        initial_refresh_delay = 0 if has_smif_source else 200
-        self.root.after(initial_refresh_delay, self._deferred_smif_first_refresh)
-        if hasattr(self, "refresh_main_pit_preview"):
-            self.refresh_main_pit_preview()
+    def create_pit_tab(self):
+        """创建惰性加载的只读 PIT 页面。"""
+        self.pit_tab.grid_columnconfigure(0, weight=1)
+        self.pit_tab.grid_rowconfigure(0, weight=1)
+        self._build_pit_preview_panel(self.pit_tab)
 
     def setup_tech_theme(self):
         """配置科技蓝+白色主题样式 - 专业级UI设计"""
@@ -1709,7 +1604,9 @@ class BootstrapUiMixin:
     def on_window_resize(self, event):
         """处理窗口大小变化事件 - 添加防抖动机制"""
         # 只处理主窗口的resize事件，避免子组件的resize事件
-        if event.widget == self.root:
+        if event.widget == self.root and not bool(
+            getattr(self, "_startup_layout_pending", False)
+        ):
             # 取消之前的定时器
             if self._resize_timer is not None:
                 self.root.after_cancel(self._resize_timer)
@@ -1722,51 +1619,6 @@ class BootstrapUiMixin:
         self._adapt_data_processing_layout()
         self._sync_data_controls_preview_ratio()
         self.adjust_figure_sizes()
-
-    def _deferred_smif_first_refresh(self):
-        """延迟首次 SMIF 刷新，确保画布已完成布局。"""
-        try:
-            self._sync_smif_figure_to_canvas()
-        except Exception:
-            pass
-        try:
-            self.refresh_smif_view()
-        except Exception:
-            pass
-
-    def _sync_smif_figure_to_canvas(self):
-        """将 SMIF figure 尺寸同步到画布实际像素大小，并重新定位 axes。"""
-        fig = getattr(self, 'fig_smif', None)
-        canvas = getattr(self, 'canvas_smif', None)
-        if fig is None or canvas is None:
-            return
-        try:
-            if hasattr(self, "root") and self.root is not None:
-                self.root.update_idletasks()
-            widget = canvas.get_tk_widget()
-            width_px = int(widget.winfo_width() or 0)
-            height_px = int(widget.winfo_height() or 0)
-        except Exception:
-            return
-        if width_px < 50 or height_px < 50:
-            return
-        try:
-            dpi = float(fig.get_dpi()) if fig.get_dpi() else 100.0
-        except Exception:
-            dpi = 100.0
-        current_width_px = float(fig.get_figwidth()) * dpi
-        current_height_px = float(fig.get_figheight()) * dpi
-        if abs(current_width_px - width_px) < 2.0 and abs(current_height_px - height_px) < 2.0:
-            return
-        fig.set_size_inches(width_px / dpi, height_px / dpi, forward=True)
-        try:
-            fig.subplots_adjust(left=0.015, right=0.955, top=0.985, bottom=0.035)
-        except Exception:
-            pass
-        try:
-            canvas.draw_idle()
-        except Exception:
-            pass
 
     def adjust_figure_sizes(self):
         """根据当前窗口大小调整图表大小 - 让图表随容器实时放缩、尽量铺满"""
@@ -1894,10 +1746,8 @@ class BootstrapUiMixin:
 
             _resize_figure_by_canvas('fig_idle_curve', 'canvas_idle_curve', pad_px=4, apply_tight_layout=False)
 
-            # 4) SMIF 3D 图：同步 figure 尺寸到画布并重新定位 axes
-            self._sync_smif_figure_to_canvas()
-            if hasattr(self, 'canvas_smif') and self.canvas_smif is not None:
-                self.canvas_smif.draw_idle()
+            if hasattr(self, "resize_pit_figure_to_canvas"):
+                self.resize_pit_figure_to_canvas()
 
         except Exception:
             # 静默处理异常，避免影响程序运行

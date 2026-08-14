@@ -418,6 +418,21 @@ class AnalysisExportMixin:
                     "manual_measurement_data",
                     prediction_payload,
                 )
+            if (
+                _read_prediction(prediction_payload) is None
+                and bool(getattr(self, "release_mode", False))
+            ):
+                # 发布版不包含 PIT 的实验实测预测刷新器，改用与 SampleData
+                # 相同的轻量反解。曲线是否显示由独立开关控制，计算仍会执行。
+                builder = getattr(self, "_build_sampledata_prediction_payload", None)
+                if callable(builder):
+                    try:
+                        candidate = builder()
+                    except Exception as exc:
+                        self._segmentation_display_prediction_error = str(exc)
+                        candidate = None
+                    if isinstance(candidate, dict):
+                        prediction_payload = candidate
         elif sample_mode == "sampledata":
             model_ready = bool(
                 self.has_prediction_model_ready()
@@ -472,6 +487,21 @@ class AnalysisExportMixin:
         actual_values = np.asarray(actual_values, dtype=float).reshape(-1)
         actual_finite = np.isfinite(actual_values)
 
+        predicted_values = None
+        show_prediction = False
+        if bool(getattr(self, "release_mode", False)):
+            predicted_values = self._resolve_segmentation_display_prediction(
+                actual_values.size
+            )
+            show_prediction = self._plot_option_enabled(
+                "show_prediction_load_var",
+                False,
+            )
+            if predicted_values is not None:
+                predicted_values = np.asarray(predicted_values, dtype=float).reshape(-1)
+                if predicted_values.size != actual_values.size:
+                    predicted_values = None
+
         sample_x = None
         x_label = "实际采样点索引（0 基）"
         time_getter = getattr(self, "get_sample_time_indices_array", None)
@@ -505,8 +535,14 @@ class AnalysisExportMixin:
         if sample_x is None:
             sample_x = np.arange(actual_values.size, dtype=float)
 
-        # 六态分类只来自过程域 MRR，背景高度跟随实际负载。
+        # 六态分类只来自过程域 MRR；显示预测时背景高度覆盖两条曲线。
         fill_values = np.maximum(actual_values, 0.0)
+        if show_prediction and predicted_values is not None:
+            predicted_finite = np.isfinite(predicted_values)
+            fill_values[predicted_finite] = np.maximum(
+                fill_values[predicted_finite],
+                np.maximum(predicted_values[predicted_finite], 0.0),
+            )
         background_payload = self.build_segmentation_sample_background_masks(
             fill_values,
             None,
@@ -556,6 +592,25 @@ class AnalysisExportMixin:
             label="实际负载",
             zorder=4,
         )
+        if (
+            show_prediction
+            and predicted_values is not None
+            and np.any(np.isfinite(predicted_values))
+        ):
+            predicted_x, predicted_plot_values = self._compress_plot_series_preserve_gaps(
+                sample_x,
+                predicted_values,
+                preview_limit,
+            )
+            sample_ax.plot(
+                predicted_x,
+                predicted_plot_values,
+                color=STYLE_PREDICTED["color"],
+                linewidth=STYLE_PREDICTED["linewidth"],
+                linestyle=STYLE_PREDICTED["linestyle"],
+                label="预测负载",
+                zorder=5,
+            )
         aux_axes = []
         overlay_plotter = getattr(
             self,
@@ -585,7 +640,11 @@ class AnalysisExportMixin:
             )
 
         sample_ax.set_title(
-            "实际负载与区间划分",
+            (
+                "实际负载、预测负载与区间划分"
+                if show_prediction and predicted_values is not None
+                else "实际负载与区间划分"
+            ),
             fontsize=PLOT_FONT_BASE + 1,
             fontweight="bold",
             pad=6,
@@ -671,7 +730,11 @@ class AnalysisExportMixin:
                 subplot_adjust=subplot_adjust,
             )
         self.figures = [fig]
-        self.figure_names = ["实际负载与区间划分"]
+        self.figure_names = [
+            "实际负载、预测负载与区间划分"
+            if show_prediction and predicted_values is not None
+            else "实际负载与区间划分"
+        ]
         self.current_figure_index = 0
         if hasattr(self, "interval_count_var"):
             self.interval_count_var.set(str(len(mapping_records)))
@@ -1803,13 +1866,19 @@ class AnalysisExportMixin:
                 if mapping_status == "failed"
                 else "未导入可映射的实测数据，因此未生成或覆盖 SampleData.rg。"
             )
+            feed_export_note = str(
+                getattr(self, "_last_processinfo_feed_export_status", "") or ""
+            )
             self.status_var_data.set(
-                f"工艺信息已保存: {os.path.basename(process_info_path)}"
+                f"工艺信息已保存: {os.path.basename(process_info_path)}；{feed_export_note}"
+                if feed_export_note
+                else f"工艺信息已保存: {os.path.basename(process_info_path)}"
             )
             messagebox.showinfo(
                 "保存成功",
                 f"已导出: {os.path.basename(process_info_path)}\n"
-                + mapping_note,
+                + mapping_note
+                + (f"\n{feed_export_note}" if feed_export_note else ""),
             )
             return
         if not self.sample_programs:
@@ -1995,7 +2064,15 @@ class AnalysisExportMixin:
                 messagebox.showwarning("无可导出数据", "未找到有效的刀具区间信息")
             else:
                 process_info_path = self._save_process_info_csv(output_dir)
-                self.status_var_data.set(f"区间信息已保存: {os.path.basename(output_path)} (共{saved_lines}行)")
+                feed_export_note = str(
+                    getattr(self, "_last_processinfo_feed_export_status", "") or ""
+                )
+                status_text = (
+                    f"区间信息已保存: {os.path.basename(output_path)} (共{saved_lines}行)"
+                )
+                if feed_export_note:
+                    status_text += f"；{feed_export_note}"
+                self.status_var_data.set(status_text)
 
                 saved_programs = {program_name for program_name, _, _ in tools_to_save}
                 self._save_process_data_paths(output_dir, saved_programs)
@@ -2003,6 +2080,8 @@ class AnalysisExportMixin:
                 detail = "结果已保存，请关闭该窗口"
                 if process_info_path:
                     detail += f"\n同时导出: {os.path.basename(process_info_path)}"
+                if feed_export_note:
+                    detail += f"\n{feed_export_note}"
                 messagebox.showinfo("保存成功", detail)
         except Exception as e:
             messagebox.showerror("导出失败", f"保存区间信息时发生错误:\n{str(e)}")
@@ -2102,6 +2181,23 @@ class AnalysisExportMixin:
                 details.append(f"存在未知工艺行 {extra_sources[:10]}")
             raise ValueError("六态逐点结果与工艺信息行不一致：" + "；".join(details))
 
+        export_feeds = np.asarray(
+            [
+                pd.to_numeric(row.get("feed_effective"), errors="coerce")
+                for _source_index, row in process_rows
+            ],
+            dtype=float,
+        )
+        if bool(getattr(self, "release_mode", False)):
+            resolver = getattr(self, "_resolve_processinfo_export_feeds", None)
+            if callable(resolver):
+                export_feeds = np.asarray(
+                    resolver([row for _source_index, row in process_rows]),
+                    dtype=float,
+                )
+                if export_feeds.size != len(process_rows):
+                    raise ValueError("ProcessInfo 指令进给映射长度与工艺信息行数不一致")
+
         output_path = Path(save_dir) / "ProcessInfo.csv"
         temporary_path = output_path.with_name(f".{output_path.stem}.tmp{output_path.suffix}")
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2135,11 +2231,11 @@ class AnalysisExportMixin:
                 return f"N{int(round(raw_line)) + 1}"
             return _as_csv_value(row.get("N_str"))
 
-        def _calculated_mrr(row):
+        def _calculated_mrr(row, feed_value):
             try:
                 ap_value = max(float(row.get("ap", 0.0) or 0.0), 0.0)
                 ae_value = max(float(row.get("ae", 0.0) or 0.0), 0.0)
-                feed_value = max(float(row.get("feed_effective", 0.0) or 0.0), 0.0)
+                feed_value = max(float(feed_value), 0.0)
             except (TypeError, ValueError):
                 return ""
             if not all(np.isfinite(value) for value in (ap_value, ae_value, feed_value)):
@@ -2154,15 +2250,15 @@ class AnalysisExportMixin:
             ) as stream:
                 writer = csv.writer(stream, lineterminator="\n")
                 writer.writerow(header)
-                for source_index, row in process_rows:
+                for (source_index, row), feed_value in zip(process_rows, export_feeds):
                     writer.writerow([
                         _export_line_number(row),
                         _as_csv_value(row.get("S")),
                         _as_csv_value(row.get("ap")),
                         _as_csv_value(row.get("ae")),
-                        _as_csv_value(row.get("feed_effective")),
+                        _as_csv_value(float(feed_value)),
                         _as_csv_value(row.get("s")),
-                        _as_csv_value(_calculated_mrr(row)),
+                        _as_csv_value(_calculated_mrr(row, feed_value)),
                         _as_csv_value(row.get("gcode_content")),
                         state_by_source[source_index],
                     ])
@@ -2223,10 +2319,18 @@ class AnalysisExportMixin:
                 messagebox.showwarning("无可导出数据", "未找到已保存优化倍率的刀具区间")
                 return
             process_info_path = self._save_process_info_csv(output_dir)
-            self.status_var_data.set(f"结果已保存: {os.path.basename(output_path)} (共{saved_lines}行)")
+            feed_export_note = str(
+                getattr(self, "_last_processinfo_feed_export_status", "") or ""
+            )
+            status_text = f"结果已保存: {os.path.basename(output_path)} (共{saved_lines}行)"
+            if feed_export_note:
+                status_text += f"；{feed_export_note}"
+            self.status_var_data.set(status_text)
             detail = f"结果已保存:\n{output_path}\n共 {saved_lines} 行"
             if process_info_path:
                 detail += f"\n同时导出:\n{process_info_path}"
+            if feed_export_note:
+                detail += f"\n{feed_export_note}"
             messagebox.showinfo("保存完成", detail)
         except Exception as e:
             messagebox.showerror("导出失败", f"保存结果时发生错误:\n{str(e)}")
@@ -4534,25 +4638,8 @@ class AnalysisExportMixin:
                     self.root.after_idle(self.refresh_prediction_metrics_summary)
                 except Exception:
                     self.refresh_prediction_metrics_summary()
-            if hasattr(self, "refresh_main_pit_preview"):
-                try:
-                    self.root.after_idle(self.refresh_main_pit_preview)
-                except Exception:
-                    self.refresh_main_pit_preview()
-            if hasattr(self, "_schedule_smif_refresh"):
-                self._schedule_smif_refresh()
-            elif hasattr(self, "refresh_smif_view"):
-                self.refresh_smif_view()
-            if (
-                getattr(self, "analysis_runs", None)
-                and hasattr(self, "run_data_analysis")
-                and not getattr(self, "analysis_import_in_progress", False)
-                and not getattr(self, "analysis_run_in_progress", False)
-            ):
-                try:
-                    self.root.after_idle(self.run_data_analysis)
-                except Exception:
-                    pass
+            if hasattr(self, "invalidate_pit_view"):
+                self.invalidate_pit_view(refresh_if_visible=True)
             
             total_charts = len(self.figures)
             self.status_var_data.set(f"图表已生成! 共{total_charts}张图表")
@@ -4616,12 +4703,15 @@ class AnalysisExportMixin:
 
         self.update_nav_buttons()
 
-        self.canvas_data.draw_idle()
-        self.root.after_idle(self.adjust_figure_sizes)
+        # 新画布建立后只安排一次防抖尺寸同步；Configure 事件若紧随其后会
+        # 覆盖同一个定时任务，不再出现“先画一次、再调整后重画一次”。
+        self._on_preview_canvas_configure(None)
         self.root.after(10, lambda: self._focus_preview_canvas(canvas_widget))
 
     def _on_preview_canvas_configure(self, event):
         """预览区大小变化时触发图表重排（防抖避免拖拽卡顿）"""
+        if bool(getattr(self, "_startup_layout_pending", False)):
+            return
         try:
             if getattr(self, '_preview_resize_timer', None) is not None:
                 self.root.after_cancel(self._preview_resize_timer)

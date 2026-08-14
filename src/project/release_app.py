@@ -7,12 +7,14 @@ from .input_idle import InputIdleMixin
 from .interval_runtime import IntervalRuntimeMixin
 from .plot_support import PlotSupportMixin
 from .processing_core import ProcessingCoreMixin
+from .release_prediction import ReleasePredictionMixin
 from .sample_manager import SampleManagerMixin
 from .ui_bootstrap import BootstrapUiMixin
 
 
 class AFCReleaseApplication(
     BootstrapUiMixin,
+    ReleasePredictionMixin,
     AcademicWorkbenchMixin,
     InputIdleMixin,
     IntervalRuntimeMixin,
@@ -22,7 +24,7 @@ class AFCReleaseApplication(
     AnalysisExportMixin,
     ConfigStateMixin,
 ):
-    """AFC2.0.2alpha 多文件发布版主类（不含 PIT/SMIF 混入层）。"""
+    """AFC2.0.2alpha 多文件发布版主类（轻量反解，不含 PIT/SMIF）。"""
 
     release_mode = True
     enable_research_features = False

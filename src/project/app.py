@@ -5,8 +5,10 @@ from .analysis_export import AnalysisExportMixin
 from .config_state import ConfigStateMixin
 from .input_idle import InputIdleMixin
 from .interval_runtime import IntervalRuntimeMixin
-from .pit_model import PitModelMixin
+from .pit_viewer import PitViewerMixin
+from .pit_model import MechanismModelMixin
 from .plot_support import PlotSupportMixin
+from .prediction_runtime import PredictionRuntimeMixin
 from .processing_core import ProcessingCoreMixin
 from .sample_manager import SampleManagerMixin
 from .ui_bootstrap import BootstrapUiMixin
@@ -14,9 +16,11 @@ from .ui_bootstrap import BootstrapUiMixin
 
 class MillingAnalysisTool(
     BootstrapUiMixin,
+    PitViewerMixin,
+    PredictionRuntimeMixin,
     AcademicWorkbenchMixin,
     InputIdleMixin,
-    PitModelMixin,
+    MechanismModelMixin,
     IntervalRuntimeMixin,
     ProcessingCoreMixin,
     SampleManagerMixin,

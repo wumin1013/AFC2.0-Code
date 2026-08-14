@@ -357,6 +357,44 @@ class ConfigStateMixin:
         )
 
         total = len(interval_records)
+        if bool(getattr(self, "release_mode", False)):
+            if ready:
+                result_text = f"处理状态：已完成，共 {total} 个区间；可以查看图表并保存结果"
+            elif division_status == "失败":
+                result_text = "处理状态：未完成，请检查工艺信息文件后重试"
+            elif division_status == "进行中":
+                result_text = "处理状态：正在计算，请稍候"
+            else:
+                result_text = "处理状态：等待导入工艺信息文件"
+            self._set_overview_text(
+                getattr(self, "interval_overview_success_var", None), result_text
+            )
+
+            mapping_state = str(getattr(self, "_sample_mapping_status", "") or "")
+            if mapping_state == "valid":
+                mapping_source = ""
+                for record in interval_records:
+                    mapping_source = str(record.get("mapping_source", "") or "")
+                    if mapping_source:
+                        break
+                if mapping_source == "journey_order_ratio_missing_n":
+                    mapping_text = "实际负载：已匹配（工艺文件没有行号，已按加工顺序匹配）"
+                elif mapping_source == "program_line_and_point_order_quantized":
+                    mapping_text = "实际负载：已匹配（短区间已自动对齐到相邻采样点）"
+                else:
+                    mapping_text = "实际负载：已匹配，可以查看叠加图"
+            elif mapping_state == "failed":
+                mapping_text = "实际负载：匹配失败，请检查工艺行号和 SampleData"
+            elif mapping_state == "pending":
+                mapping_text = "实际负载：等待与工艺信息匹配"
+            else:
+                mapping_text = "实际负载：尚未读取 SampleData"
+            self._set_overview_text(
+                getattr(self, "interval_overview_mapping_var", None), mapping_text
+            )
+            self._set_overview_text(getattr(self, "interval_count_var", None), str(total))
+            return
+
         self._set_overview_text(
             getattr(self, "interval_overview_success_var", None),
             f"当前划分：{division_status}",

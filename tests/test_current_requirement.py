@@ -20,7 +20,11 @@ from matplotlib.collections import PolyCollection
 
 from project.academic_workbench import AcademicWorkbenchMixin
 from project.analysis_export import AnalysisExportMixin
+from project.app import MillingAnalysisTool
+from project.pit_model import PitModelMixin
+from project.pit_viewer import PitViewerMixin
 from project.plot_support import PlotSupportMixin
+from project.prediction_runtime import PredictionRuntimeMixin
 from project.processing_core import ProcessingCoreMixin
 from project.sample_manager import SampleManagerMixin
 from project.segmentation import SegmentationConfig, SegmentationPipeline
@@ -458,6 +462,62 @@ def _fill_heights_at_x(collections, x_values) -> np.ndarray:
 
 
 class CurrentRequirementRegressionTests(unittest.TestCase):
+    def test_main_page_prediction_and_pit_viewer_are_separate_components(self):
+        mro = list(MillingAnalysisTool.__mro__)
+
+        self.assertLess(mro.index(PredictionRuntimeMixin), mro.index(PitModelMixin))
+        self.assertLess(mro.index(PitViewerMixin), mro.index(PitModelMixin))
+        self.assertIs(
+            PredictionRuntimeMixin._refresh_manual_measurement_prediction,
+            MillingAnalysisTool._refresh_manual_measurement_prediction,
+        )
+        self.assertNotIn("_refresh_manual_measurement_prediction", PitViewerMixin.__dict__)
+        self.assertNotIn("has_prediction_model_ready", PitModelMixin.__dict__)
+
+    def test_main_ui_removes_smif_and_data_analysis_pages(self):
+        ui_source = (SRC_ROOT / "project" / "ui_bootstrap.py").read_text(encoding="utf-8")
+        workbench_source = (SRC_ROOT / "project" / "academic_workbench.py").read_text(encoding="utf-8")
+
+        self.assertIn('self.notebook.add(self.data_processing_tab, text="主页面")', ui_source)
+        self.assertIn('self.notebook.add(self.pit_tab, text="PIT")', ui_source)
+        self.assertNotIn("create_smif_pit_tab", ui_source)
+        self.assertNotIn("PIT / SMIF", ui_source)
+        self.assertNotIn("create_data_analysis_tab", workbench_source)
+        self.assertNotIn("run_data_analysis", workbench_source)
+
+    def test_pit_viewer_is_process_only_fixed_four_field_dashboard(self):
+        harness = PitViewerMixin.__new__(PitViewerMixin)
+        harness.data = [
+            {
+                "line_no_raw": 9,
+                "path_start": 0.0,
+                "path_end": 1.0,
+                "ap": 1.5,
+                "ae": 2.5,
+                "feed_effective": 600.0,
+                "MRR": 37.5,
+            }
+        ]
+        harness._process_model_state_version = 1
+        harness._pit_dataframe_cache = None
+        harness._pit_dataframe_cache_signature = None
+        harness._pit_render_signature = None
+        harness._pit_refresh_pending = True
+
+        first = harness.build_current_pit_dataframe()
+        cached_frame_id = id(harness._pit_dataframe_cache)
+        second = harness.build_current_pit_dataframe()
+
+        self.assertEqual(
+            ("ap", "ae", "feed_effective", "MRR"),
+            tuple(item[0] for item in PitViewerMixin.PIT_VIEW_FIELDS),
+        )
+        self.assertEqual(cached_frame_id, id(harness._pit_dataframe_cache))
+        pd.testing.assert_frame_equal(first, second)
+        self.assertEqual(10.0, first.loc[0, "command_position"])
+        self.assertNotIn("actual_load", first.columns)
+        self.assertNotIn("predicted_load", first.columns)
+
     def assert_valid_result(self, result) -> None:
         diagnostics = result.diagnostics
         self.assertEqual(1.0, float(diagnostics["coverage_rate"]))
