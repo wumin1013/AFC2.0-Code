@@ -472,8 +472,21 @@ if missing:
         manager = SampleManagerMixin()
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            csv_path = root / "sampledata.CSV"
-            txt_path = root / "SAMPLEDATA.txt"
+            wrong_csv_path = root / "sampledata.CSV"
+            wrong_txt_path = root / "SAMPLEDATA.txt"
+            wrong_csv_path.write_text("1,2,3,4,P1\n", encoding="utf-8")
+            wrong_txt_path.write_text("P1:1:T0:0-4;\n", encoding="utf-8")
+
+            self.assertEqual(
+                (None, None, None),
+                manager.resolve_sampledata_files(root, strict_root=True),
+            )
+            self.assertIn("未找到完整", manager._sampledata_resolution_error)
+
+            wrong_csv_path.unlink()
+            wrong_txt_path.unlink()
+            csv_path = root / "SampleData.csv"
+            txt_path = root / "SampleData.txt"
             csv_path.write_text("1,2,3,4,P1\n", encoding="utf-8")
             txt_path.write_text("P1:1:T0:0-4;\n", encoding="utf-8")
 
@@ -512,22 +525,22 @@ if missing:
             nested_result = manager.resolve_sampledata_files(root, strict_root=False)
             self.assertEqual(nested, Path(nested_result[0]))
 
-    def test_strict_sampledata_case_conflict_is_not_silently_selected(self):
+    def test_strict_sampledata_exact_name_is_selected_without_casefold_lookup(self):
         manager = SampleManagerMixin()
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            fake_csv = [str(root / "SampleData.csv"), str(root / "sampledata.CSV")]
-            fake_txt = [str(root / "SampleData.txt")]
+            expected_csv = str(root / "SampleData.csv")
+            expected_txt = str(root / "SampleData.txt")
 
-            def _matches(_directory, filename):
-                return fake_csv if filename.casefold().endswith(".csv") else fake_txt
+            def _exact(_directory, filename):
+                return expected_csv if filename == "SampleData.csv" else expected_txt
 
-            with patch.object(manager, "_find_files_case_insensitive", side_effect=_matches):
-                self.assertEqual(
-                    (None, None, None),
-                    manager.resolve_sampledata_files(root, strict_root=True),
-                )
-            self.assertIn("文件名冲突", manager._sampledata_resolution_error)
+            with patch.object(manager, "_find_file_exact", side_effect=_exact), patch.object(
+                manager,
+                "_validate_sampledata_input_file",
+            ):
+                resolved = manager.resolve_sampledata_files(root, strict_root=True)
+            self.assertEqual((root, expected_csv, expected_txt), resolved)
 
     @unittest.skipUnless(os.name == "nt", "文件共享占用检查仅适用于 Windows")
     def test_strict_sampledata_exclusive_writer_is_reported(self):

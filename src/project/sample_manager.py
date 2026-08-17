@@ -1271,6 +1271,19 @@ class SampleManagerMixin:
         matches = self._find_files_case_insensitive(directory, filename)
         return matches[0] if len(matches) == 1 else None
 
+    def _find_file_exact(self, directory, filename):
+        """仅返回文件名逐字符完全匹配的普通文件。"""
+        if not directory or not filename:
+            return None
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if entry.name == filename and entry.is_file():
+                        return os.path.join(directory, entry.name)
+        except OSError:
+            return None
+        return None
+
     def _validate_sampledata_input_file(self, file_path, display_name):
         """在解析前确认文件存在、非空且当前可读取。"""
         if not file_path or not os.path.isfile(file_path):
@@ -1288,7 +1301,7 @@ class SampleManagerMixin:
 
     def resolve_sampledata_files(self, base_dir, strict_root=False):
         """
-        在目录中定位 SampleData.csv / SampleData.txt。
+        在目录中按逐字符精确文件名定位 SampleData.csv / SampleData.txt。
         兼容两种放置方式：
         1) 与工艺信息表同目录
         2) 放在同目录下的 SampleData 子目录
@@ -1303,20 +1316,9 @@ class SampleManagerMixin:
         for directory in candidates:
             if not os.path.isdir(directory):
                 continue
-            csv_matches = self._find_files_case_insensitive(directory, "SampleData.csv")
-            txt_matches = self._find_files_case_insensitive(directory, "SampleData.txt")
-            conflicts = []
-            if len(csv_matches) > 1:
-                conflicts.append("SampleData.csv")
-            if len(txt_matches) > 1:
-                conflicts.append("SampleData.txt")
-            if conflicts:
-                self._sampledata_resolution_error = (
-                    "文件名冲突：同一目录存在多个仅大小写不同的 " + "、".join(conflicts)
-                )
-                return None, None, None
-            if len(csv_matches) == 1 and len(txt_matches) == 1:
-                csv_path, txt_path = csv_matches[0], txt_matches[0]
+            csv_path = self._find_file_exact(directory, "SampleData.csv")
+            txt_path = self._find_file_exact(directory, "SampleData.txt")
+            if csv_path and txt_path:
                 try:
                     self._validate_sampledata_input_file(csv_path, "SampleData.csv")
                     self._validate_sampledata_input_file(txt_path, "SampleData.txt")
@@ -1324,8 +1326,8 @@ class SampleManagerMixin:
                     self._sampledata_resolution_error = str(exc)
                     return None, None, None
                 return directory, csv_path, txt_path
-            if csv_matches or txt_matches:
-                missing = "SampleData.txt" if csv_matches else "SampleData.csv"
+            if csv_path or txt_path:
+                missing = "SampleData.txt" if csv_path else "SampleData.csv"
                 self._sampledata_resolution_error = f"文件对不完整：缺少 {missing}"
                 if strict_root:
                     return None, None, None

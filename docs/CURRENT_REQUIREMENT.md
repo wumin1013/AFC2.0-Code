@@ -12,7 +12,7 @@
 
 发布版保持以下顺序：
 
-1. 启动时从 EXE 同目录自动读取 `SampleData.csv` 和 `SampleData.txt`；
+1. 启动时优先从 EXE 同目录自动读取文件名逐字符完全匹配的 `SampleData.csv` 和 `SampleData.txt`；错误大小写、增加后缀或改名后的文件不作为 SampleData，完整文件对不可用时才回退实验实测 CSV；
 2. 用户导入 AfoMilling 或 ProcessInfo 工艺信息文件；
 3. 程序按现有算法完成过程域六态划分及 SampleData 映射；
 4. 使用 VGpro 功率和工艺信息中的 `ap/ae/F` 反解全局 `Kc/Ke`；
