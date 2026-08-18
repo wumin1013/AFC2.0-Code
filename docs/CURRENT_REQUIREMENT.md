@@ -12,7 +12,7 @@
 
 发布版保持以下顺序：
 
-1. 启动时优先从 EXE 同目录自动读取文件名逐字符完全匹配的 `SampleData.csv` 和 `SampleData.txt`；错误大小写、增加后缀或改名后的文件不作为 SampleData，完整文件对不可用时才回退实验实测 CSV；
+1. 启动时优先从 EXE 同目录自动读取文件名逐字符完全匹配的 `SampleData.csv` 和 `SampleData.txt`；CSV/TXT 支持 UTF-8/BOM、UTF-16/32、GB18030/GBK、Big5、Shift-JIS、EUC-JP/KR 和常见 Windows ANSI 编码；错误大小写、增加后缀或改名后的文件不作为 SampleData，完整文件对不可用时才回退实验实测 CSV；
 2. 用户导入 AfoMilling 或 ProcessInfo 工艺信息文件；
 3. 程序按现有算法完成过程域六态划分及 SampleData 映射；
 4. 使用 VGpro 功率和工艺信息中的 `ap/ae/F` 反解全局 `Kc/Ke`；
@@ -172,7 +172,7 @@ project.release_prediction
 
 ## 13. 本次实际验证结果
 
-- `compileall`、44 项 `unittest`、`pip check`、PowerShell 语法检查和 `git diff --check` 通过。
+- `compileall`、49 项 `unittest`、`pip check`、PowerShell 语法检查和 `git diff --check` 通过。
 - 真实 `iipinc.txt`：自动识别为单行格式，641,094 个数据行和指令点、634 个物理行号组，使用单行系数 `0.6`。
 - 真实实测负载/工艺信息无窗口复现：661,693 个采样点、42,407 个工艺点；固定空载联合拟合得到 `Kc=1.0104848670`、`Ke=11.6788400510`。
 - 当前 422 个切削物理行全部由 iip 覆盖；对比图使用 444,613 个有效切削样本。
@@ -193,3 +193,5 @@ project.release_prediction
 - PIT DataFrame 和 FigureCanvas 复用缓存，主页面处理时只使缓存失效，切换到 PIT 后才重绘。
 - 隐藏窗口复验仅包含“主页面 / PIT”两个页签，PIT 生成 8 个子图且重复刷新复用同一 FigureCanvas。
 - 不改变六态算法、输入文件格式、`SampleData.rg` 与 `ProcessInfo.csv` 保存契约。
+- “导入 SampleData”改为多文件选择：一次必须选中同目录、同主文件名的一份 CSV 和一份 TXT，加载时直接使用所选路径，不再忽略选择后重新查找固定文件名。
+- 主代码与发布版共用的 SampleData CSV/TXT 解析支持 UTF-8/BOM、UTF-16/32、GB18030/GBK、Big5、Shift-JIS、EUC-JP/KR 和常见 Windows ANSI；2026-08-18 当前 TXT=GB18030、CSV=UTF-8 的文件对已真实读取为 666,990 个采样点、程序 `1D10-外形.NC`。

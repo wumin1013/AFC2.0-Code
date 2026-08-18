@@ -13,7 +13,7 @@ Git 提交：{{GIT_COMMIT}}
 使用方法
 --------
 1. 必须完整复制或解压本目录，不能只发送或移动 AFC2.0.2alpha.exe。
-2. 外部软件须在本程序启动前，将文件名逐字符完全匹配的 SampleData.csv 和 SampleData.txt 同时写入 EXE 所在目录，或仅放置一个实验实测通道导出 CSV；完整 SampleData 文件对优先，错误大小写、增加后缀或改名后的文件不作为 SampleData。可同时提供 iipinc.txt 指令进给文件。
+2. 外部软件须在本程序启动前，将文件名逐字符完全匹配的 SampleData.csv 和 SampleData.txt 同时写入 EXE 所在目录，或仅放置一个实验实测通道导出 CSV；SampleData CSV/TXT 支持 UTF-8/BOM、UTF-16/32、GB18030/GBK、Big5、Shift-JIS、EUC-JP/KR 和常见 Windows ANSI。完整 SampleData 文件对优先，错误大小写、增加后缀或改名后的文件不作为 SampleData。可同时提供 iipinc.txt 指令进给文件。
 3. 启动 AFC2.0.2alpha.exe。程序不会轮询或热监控运行输入，切换图形选项时复用内存缓存。
 4. 本目录必须可写；请勿放在 Program Files 等通常需要管理员权限的位置。
 5. 程序生成的结果文件和启动错误日志直接写入 EXE 所在目录，不创建 output 子目录；本机配置和运行状态仍分别写入 config、data/runtime。

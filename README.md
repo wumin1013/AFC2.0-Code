@@ -15,9 +15,11 @@ python src/project/main.py
 
 运行依赖记录在 `requirements.txt`。本机 `AFC` 环境可能与该文件的历史版本锁定存在差异，发布构建会在产物中记录实际参与构建的版本，不会自动安装或升级依赖。
 
+主代码点击“导入 SampleData”时，应在同一个多选窗口内同时选择一对同目录、同主文件名的 CSV 和 TXT，例如 `SampleData_1.csv` 与 `SampleData_1.txt`；只选一个文件或文件名不配对时不会开始加载。
+
 ### AFC2.0.2alpha 发布模式
 
-发布模式使用独立入口，启动时优先自动读取文件名逐字符完全匹配的 `SampleData.csv` 与 `SampleData.txt`；文件对缺失或无效时，回退识别 EXE 同目录唯一的实验实测通道导出 CSV。错误大小写、增加后缀或改名后的文件不作为 SampleData。导入工艺信息并完成六态划分后，以固定 `P_idle=250 W` 和编程 F 反解全局 `Kc/Ke`，再优先使用 EXE 同目录 `iipinc.txt` 的指令进给计算预测负载；缺失、无效或未覆盖的指令进给逐行回退工艺信息中的编程进给。反解始终执行，预测曲线默认隐藏，可通过图形工具栏的“预测负载”勾选框显示。右侧“运行结果”只显示处理、实际负载和预测负载三项通俗状态，启动与导入过程中合并重复绘图刷新。发布包仍不包含 PIT / SMIF、profile、scikit-learn 或 SciPy。
+发布模式使用独立入口，启动时优先自动读取文件名逐字符完全匹配的 `SampleData.csv` 与 `SampleData.txt`；CSV/TXT 支持 UTF-8/BOM、UTF-16/32、GB18030/GBK、Big5、Shift-JIS、EUC-JP/KR 和常见 Windows ANSI 编码。文件对缺失或无效时，回退识别 EXE 同目录唯一的实验实测通道导出 CSV。错误大小写、增加后缀或改名后的文件不作为 SampleData。导入工艺信息并完成六态划分后，以固定 `P_idle=250 W` 和编程 F 反解全局 `Kc/Ke`，再优先使用 EXE 同目录 `iipinc.txt` 的指令进给计算预测负载；缺失、无效或未覆盖的指令进给逐行回退工艺信息中的编程进给。反解始终执行，预测曲线默认隐藏，可通过图形工具栏的“预测负载”勾选框显示。右侧“运行结果”只显示处理、实际负载和预测负载三项通俗状态，启动与导入过程中合并重复绘图刷新。发布包仍不包含 PIT / SMIF、profile、scikit-learn 或 SciPy。
 
 发布目录采用 PyInstaller 6.12.0 的 `onedir`、`windowed` 模式：
 

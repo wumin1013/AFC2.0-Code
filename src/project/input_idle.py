@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 import csv
 import bisect
+from pathlib import Path
 
 from .shared import *
 
@@ -295,6 +296,9 @@ class InputIdleMixin:
             return False
 
         if not self.load_sample_data_from_paths(csv_path, txt_path, silent=silent, sample_dir=resolved_dir):
+            load_error = str(getattr(self, "_sampledata_load_error", "") or "")
+            if load_error:
+                self._sampledata_resolution_error = load_error
             return False
 
         sample_lines = getattr(self, "sample_data_line_numbers", None)
@@ -613,18 +617,42 @@ class InputIdleMixin:
         """导入 SampleData.csv/txt"""
         if not self._ensure_nc_loaded_before_measurement():
             return
-        file_path = filedialog.askopenfilename(
-            title="选择 SampleData.csv 或 SampleData.txt",
+        file_paths = list(filedialog.askopenfilenames(
+            title="同时选择一对 SampleData CSV 和 TXT（可按 Ctrl 多选）",
             filetypes=(
-                ("SampleData文件", ("SampleData.csv", "SampleData.txt", "*.csv", "*.txt")),
+                ("SampleData文件", ("*.csv", "*.txt")),
                 ("所有文件", "*.*"),
             )
-        )
-        if not file_path:
+        ))
+        if not file_paths:
             return
 
-        base_dir = os.path.dirname(file_path)
-        self.load_sample_bundle_from_dir(base_dir, silent=False)
+        csv_paths = [path for path in file_paths if Path(path).suffix.casefold() == ".csv"]
+        txt_paths = [path for path in file_paths if Path(path).suffix.casefold() == ".txt"]
+        if len(file_paths) != 2 or len(csv_paths) != 1 or len(txt_paths) != 1:
+            messagebox.showwarning(
+                "请选择完整文件对",
+                "请一次同时选择 1 个 SampleData CSV 文件和 1 个同名 TXT 文件。",
+            )
+            return
+
+        csv_path = os.path.abspath(csv_paths[0])
+        txt_path = os.path.abspath(txt_paths[0])
+        csv_parent = os.path.normcase(os.path.dirname(csv_path))
+        txt_parent = os.path.normcase(os.path.dirname(txt_path))
+        if csv_parent != txt_parent or Path(csv_path).stem.casefold() != Path(txt_path).stem.casefold():
+            messagebox.showwarning(
+                "文件不配对",
+                "CSV 和 TXT 必须位于同一文件夹，并且主文件名相同（例如 SampleData_1.csv 与 SampleData_1.txt）。",
+            )
+            return
+
+        self.load_sample_data_from_paths(
+            csv_path,
+            txt_path,
+            silent=False,
+            sample_dir=os.path.dirname(csv_path),
+        )
         self._refresh_import_order_controls()
 
     def browse_experiment_measurement_file(self):

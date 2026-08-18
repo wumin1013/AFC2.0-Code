@@ -525,6 +525,117 @@ if missing:
             nested_result = manager.resolve_sampledata_files(root, strict_root=False)
             self.assertEqual(nested, Path(nested_result[0]))
 
+    def test_sample_program_txt_accepts_gb18030_chinese_program_name(self):
+        manager = SampleManagerMixin()
+        with TemporaryDirectory() as temp_dir:
+            txt_path = Path(temp_dir) / "SampleData.txt"
+            txt_path.write_bytes(
+                "1D10-外形.NC:613448256:T0:23-643;\r\n".encode("gb18030")
+            )
+            programs = manager.parse_sample_program_file(txt_path)
+
+        self.assertEqual("gb18030", manager._sample_program_file_encoding)
+        self.assertEqual("613448256", programs["1D10-外形.NC"]["program_number"])
+        self.assertEqual([(23, 643)], programs["1D10-外形.NC"]["tools"]["T0"])
+
+    def test_sample_program_txt_accepts_common_unicode_and_legacy_encodings(self):
+        cases = (
+            ("utf-8-sig", "外形"),
+            ("utf-16", "外形"),
+            ("utf-16-le", "外形"),
+            ("utf-16-be", "外形"),
+            ("utf-32", "外形"),
+            ("utf-32-le", "外形"),
+            ("utf-32-be", "外形"),
+            ("big5", "外形"),
+            ("shift_jis", "外形テスト"),
+            ("euc_jp", "外形テスト"),
+            ("euc_kr", "외형"),
+            ("cp1252", "Contouré"),
+        )
+        manager = SampleManagerMixin()
+        with TemporaryDirectory() as temp_dir:
+            txt_path = Path(temp_dir) / "SampleData.txt"
+            for source_encoding, program_name in cases:
+                with self.subTest(source_encoding=source_encoding):
+                    txt_path.write_bytes(
+                        f"{program_name}:123:T0:1-9;\r\n".encode(source_encoding)
+                    )
+                    programs = manager.parse_sample_program_file(txt_path)
+                    self.assertIn(program_name, programs)
+                    self.assertEqual([(1, 9)], programs[program_name]["tools"]["T0"])
+
+    def test_sampledata_csv_encoding_detection_accepts_utf16_and_gb18030(self):
+        manager = SampleManagerMixin()
+        cases = (
+            ("utf-16", "程序一"),
+            ("utf-16-le", "程序一"),
+            ("utf-16-be", "程序一"),
+            ("utf-32", "程序一"),
+            ("gb18030", "程序一"),
+        )
+        with TemporaryDirectory() as temp_dir:
+            csv_path = Path(temp_dir) / "SampleData.csv"
+            for source_encoding, program_number in cases:
+                with self.subTest(source_encoding=source_encoding):
+                    csv_path.write_bytes(
+                        f"1,2,3,4,{program_number}\r\n".encode(source_encoding)
+                    )
+                    detected = manager._detect_sampledata_csv_encoding(csv_path)
+                    decoded = pd.read_csv(
+                        csv_path,
+                        header=None,
+                        encoding=detected,
+                        dtype={4: str},
+                    )
+                    self.assertEqual(program_number, decoded.iloc[0, 4])
+
+    def test_manual_sampledata_import_uses_selected_csv_and_txt_pair(self):
+        manager = InputIdleMixin()
+        manager._ensure_nc_loaded_before_measurement = lambda: True
+        manager._refresh_import_order_controls = lambda: None
+        loaded = []
+        manager.load_sample_data_from_paths = lambda *args, **kwargs: loaded.append(
+            (args, kwargs)
+        )
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            csv_path = root / "SampleData_1.csv"
+            txt_path = root / "SampleData_1.txt"
+            csv_path.write_text("1,2,3,4,P1\n", encoding="utf-8")
+            txt_path.write_text("P1:1:T0:0-4;\n", encoding="utf-8")
+            with patch(
+                "project.input_idle.filedialog.askopenfilenames",
+                return_value=(str(csv_path), str(txt_path)),
+            ):
+                manager.browse_sample_bundle()
+
+        self.assertEqual(1, len(loaded))
+        args, kwargs = loaded[0]
+        self.assertEqual(csv_path, Path(args[0]))
+        self.assertEqual(txt_path, Path(args[1]))
+        self.assertFalse(kwargs["silent"])
+        self.assertEqual(root, Path(kwargs["sample_dir"]))
+
+    def test_manual_sampledata_import_rejects_single_file_selection(self):
+        manager = InputIdleMixin()
+        manager._ensure_nc_loaded_before_measurement = lambda: True
+        manager._refresh_import_order_controls = lambda: None
+        manager.load_sample_data_from_paths = lambda *_args, **_kwargs: self.fail(
+            "不完整文件对不应进入加载"
+        )
+        with TemporaryDirectory() as temp_dir:
+            csv_path = Path(temp_dir) / "SampleData.csv"
+            csv_path.write_text("1,2,3,4,P1\n", encoding="utf-8")
+            with patch(
+                "project.input_idle.filedialog.askopenfilenames",
+                return_value=(str(csv_path),),
+            ), patch("project.input_idle.messagebox.showwarning") as warning:
+                manager.browse_sample_bundle()
+
+        warning.assert_called_once()
+        self.assertIn("同时选择", warning.call_args.args[1])
+
     def test_strict_sampledata_exact_name_is_selected_without_casefold_lookup(self):
         manager = SampleManagerMixin()
         with TemporaryDirectory() as temp_dir:

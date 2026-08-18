@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import codecs
+import locale
+
 from .shared import *
 
 
@@ -944,63 +947,195 @@ class SampleManagerMixin:
             ranges.extend(tool_ranges)
         return ranges if ranges else None
 
+    @staticmethod
+    def _sampledata_encoding_candidates(raw_payload):
+        """按 BOM、字节布局和系统代码页生成常见文本编码候选。"""
+        payload = bytes(raw_payload or b"")
+        if payload.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+            return ("utf-32",)
+        if payload.startswith((b"\xff\xfe", b"\xfe\xff")):
+            return ("utf-16",)
+        if payload.startswith(b"\xef\xbb\xbf"):
+            return ("utf-8-sig",)
+
+        candidates = []
+        probe = payload[:4096]
+        if len(probe) >= 8:
+            quarter = max(len(probe) // 4, 1)
+            zero_by_modulo = [
+                sum(1 for value in probe[offset::4] if value == 0) / quarter
+                for offset in range(4)
+            ]
+            if min(zero_by_modulo[1:]) > 0.55:
+                candidates.append("utf-32-le")
+            if min(zero_by_modulo[:3]) > 0.55:
+                candidates.append("utf-32-be")
+            odd_bytes = probe[1::2]
+            even_bytes = probe[0::2]
+            odd_zero_ratio = sum(value == 0 for value in odd_bytes) / max(len(odd_bytes), 1)
+            even_zero_ratio = sum(value == 0 for value in even_bytes) / max(len(even_bytes), 1)
+            if odd_zero_ratio > 0.45 and even_zero_ratio < 0.20:
+                candidates.append("utf-16-le")
+            if even_zero_ratio > 0.45 and odd_zero_ratio < 0.20:
+                candidates.append("utf-16-be")
+
+        candidates.append("utf-8-sig")
+        # 无 BOM 的日文/韩文旧编码与中文双字节编码有重叠。若候选解码中
+        # 出现该语言特有字符，优先于本机代码页，避免“能解码但名称乱码”。
+        language_hints = (
+            ("shift_jis", lambda char: 0x3040 <= ord(char) <= 0x30FF),
+            ("euc_jp", lambda char: 0x3040 <= ord(char) <= 0x30FF),
+            ("euc_kr", lambda char: 0xAC00 <= ord(char) <= 0xD7AF),
+        )
+        for encoding, character_test in language_hints:
+            try:
+                hinted_text = payload.decode(encoding, errors="strict")
+            except UnicodeError:
+                continue
+            specific_count = sum(character_test(char) for char in hinted_text)
+            east_asian_count = sum(
+                0x3040 <= ord(char) <= 0x30FF
+                or 0x3400 <= ord(char) <= 0x9FFF
+                or 0xAC00 <= ord(char) <= 0xD7AF
+                for char in hinted_text
+            )
+            if specific_count >= 2 and specific_count / max(east_asian_count, 1) >= 0.5:
+                candidates.append(encoding)
+        preferred = str(locale.getpreferredencoding(False) or "").strip().casefold()
+        preferred_alias = {
+            "cp936": "gb18030",
+            "gbk": "gb18030",
+            "gb2312": "gb18030",
+            "cp950": "big5",
+            "cp932": "shift_jis",
+            "ms932": "shift_jis",
+        }.get(preferred, preferred)
+        if preferred_alias:
+            candidates.append(preferred_alias)
+        candidates.extend(
+            ("gb18030", "big5", "shift_jis", "euc_jp", "euc_kr", "cp1252", "latin-1")
+        )
+
+        unique = []
+        for encoding in candidates:
+            if encoding and encoding not in unique:
+                unique.append(encoding)
+        return tuple(unique)
+
+    @staticmethod
+    def _sampledata_decoded_text_is_plausible(text):
+        if not isinstance(text, str) or not text:
+            return False
+        if "\x00" in text:
+            return False
+        invalid_control_count = sum(
+            ord(char) < 32 and char not in "\t\r\n\f"
+            for char in text
+        )
+        if invalid_control_count > max(1, len(text) // 1000):
+            return False
+        private_use_count = sum(
+            0xE000 <= ord(char) <= 0xF8FF
+            or 0xF0000 <= ord(char) <= 0xFFFFD
+            or 0x100000 <= ord(char) <= 0x10FFFD
+            for char in text
+        )
+        return private_use_count == 0
+
+    def _decode_sampledata_text(self, raw_payload, display_name, *, final=True):
+        decode_errors = []
+        for encoding in self._sampledata_encoding_candidates(raw_payload):
+            try:
+                decoder = codecs.getincrementaldecoder(encoding)(errors="strict")
+                decoded_text = decoder.decode(bytes(raw_payload), final=bool(final))
+            except (LookupError, UnicodeError) as exc:
+                decode_errors.append(f"{encoding}: {exc}")
+                continue
+            if self._sampledata_decoded_text_is_plausible(decoded_text):
+                return decoded_text, encoding
+            decode_errors.append(f"{encoding}: 解码结果包含异常控制字符")
+        raise UnicodeError(
+            f"{display_name} 编码无法识别（支持 UTF-8、UTF-16/32、GB18030/GBK、"
+            "Big5、Shift-JIS、EUC-JP/KR 和常见 Windows ANSI 编码）："
+            + "；".join(decode_errors)
+        )
+
+    def _detect_sampledata_csv_encoding(self, csv_path):
+        with open(csv_path, "rb") as stream:
+            raw_probe = stream.read(65536)
+        decoded_probe, encoding = self._decode_sampledata_text(
+            raw_probe,
+            "SampleData.csv",
+            final=False,
+        )
+        if "," not in decoded_probe:
+            raise ValueError("SampleData.csv 未识别到逗号分隔结构")
+        return encoding
+
     def parse_sample_program_file(self, txt_path):
-        """解析程序区间交互文件 SampleData.txt"""
+        """解析程序区间交互文件 SampleData.txt。"""
         programs = {}
-        with open(txt_path, 'r', encoding='utf-8') as f:
-            for raw_line in f:
-                line = raw_line.strip()
-                if not line:
+        with open(txt_path, "rb") as stream:
+            raw_payload = stream.read()
+        decoded_text, encoding = self._decode_sampledata_text(
+            raw_payload,
+            "SampleData.txt",
+        )
+        self._sample_program_file_encoding = encoding
+
+        for raw_line in decoded_text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.endswith(';'):
+                line = line[:-1]
+            parts = line.split(':')
+            if len(parts) < 3:
+                continue
+            program_name = parts[0].strip()
+            program_number = parts[1].strip()
+            tools_part = ":".join(parts[2:]).strip()
+            tool_segments = [seg for seg in tools_part.split(';') if seg.strip()]
+            if program_name not in programs:
+                programs[program_name] = {
+                    'program_number': program_number,
+                    'tools': {},
+                    'tool_raw_ranges': {},
+                    'tool_display_ranges': {},
+                    'tool_display_map': {}
+                }
+            program_entry = programs[program_name]
+            if not program_entry.get('program_number') and program_number:
+                program_entry['program_number'] = program_number
+            tools = program_entry.setdefault('tools', {})
+            tool_raw_ranges = program_entry.setdefault('tool_raw_ranges', {})
+            tool_display_ranges = program_entry.setdefault('tool_display_ranges', {})
+            for seg in tool_segments:
+                seg = seg.strip().replace('，', ',')
+                if not seg:
                     continue
-                if line.endswith(';'):
-                    line = line[:-1]
-                parts = line.split(':')
-                if len(parts) < 3:
+                if ',' in seg:
+                    tool_part, range_part = seg.split(',', 1)
+                elif ':' in seg:
+                    tool_part, range_part = seg.split(':', 1)
+                else:
+                    seg_parts = seg.split()
+                    tool_part = seg_parts[0] if seg_parts else ""
+                    range_part = seg_parts[1] if len(seg_parts) > 1 else ""
+                tool_id = tool_part.strip()
+                range_part = range_part.strip()
+                if '-' not in range_part:
                     continue
-                program_name = parts[0].strip()
-                program_number = parts[1].strip()
-                tools_part = ":".join(parts[2:]).strip()
-                tool_segments = [seg for seg in tools_part.split(';') if seg.strip()]
-                if program_name not in programs:
-                    programs[program_name] = {
-                        'program_number': program_number,
-                        'tools': {},
-                        'tool_raw_ranges': {},
-                        'tool_display_ranges': {},
-                        'tool_display_map': {}
-                    }
-                program_entry = programs[program_name]
-                if not program_entry.get('program_number') and program_number:
-                    program_entry['program_number'] = program_number
-                tools = program_entry.setdefault('tools', {})
-                tool_raw_ranges = program_entry.setdefault('tool_raw_ranges', {})
-                tool_display_ranges = program_entry.setdefault('tool_display_ranges', {})
-                for seg in tool_segments:
-                    seg = seg.strip().replace('，', ',')
-                    if not seg:
-                        continue
-                    if ',' in seg:
-                        tool_part, range_part = seg.split(',', 1)
-                    elif ':' in seg:
-                        tool_part, range_part = seg.split(':', 1)
-                    else:
-                        seg_parts = seg.split()
-                        tool_part = seg_parts[0] if seg_parts else ""
-                        range_part = seg_parts[1] if len(seg_parts) > 1 else ""
-                    tool_id = tool_part.strip()
-                    range_part = range_part.strip()
-                    if '-' not in range_part:
-                        continue
-                    start_str, end_str = range_part.split('-', 1)
-                    try:
-                        start_val = int(float(start_str))
-                        end_val = int(float(end_str))
-                    except Exception:
-                        continue
-                    # 区间行号保持原样，不做-1处理
-                    tools.setdefault(tool_id, []).append((start_val, end_val))
-                    tool_raw_ranges.setdefault(tool_id, []).append((start_val, end_val))
-                    tool_display_ranges.setdefault(tool_id, []).append((start_val, end_val))
+                start_str, end_str = range_part.split('-', 1)
+                try:
+                    start_val = int(float(start_str))
+                    end_val = int(float(end_str))
+                except Exception:
+                    continue
+                # 区间行号保持原样，不做-1处理
+                tools.setdefault(tool_id, []).append((start_val, end_val))
+                tool_raw_ranges.setdefault(tool_id, []).append((start_val, end_val))
+                tool_display_ranges.setdefault(tool_id, []).append((start_val, end_val))
         return programs
 
     def build_tool_display_label(self, tool_id, display_ranges):
@@ -1336,6 +1471,7 @@ class SampleManagerMixin:
 
     def load_sample_data_from_paths(self, csv_path, txt_path, silent=False, sample_dir=None):
         """从明确路径加载实测数据 SampleData.csv 与 SampleData.txt（不依赖工艺信息表路径）"""
+        self._sampledata_load_error = ""
         if not csv_path or not txt_path:
             if bool(getattr(self, "release_mode", False)) and hasattr(self, "reset_sample_data_state"):
                 self.reset_sample_data_state()
@@ -1358,6 +1494,7 @@ class SampleManagerMixin:
             except Exception:
                 pass
             reason = str(exc)
+            self._sampledata_load_error = reason
             if not silent:
                 messagebox.showerror("SampleData读取失败", reason)
             if hasattr(self, "sample_auto_status_var"):
@@ -1408,7 +1545,15 @@ class SampleManagerMixin:
                 for program_info in self.sample_programs.values()
             ):
                 raise ValueError("SampleData.txt 未解析到有效程序或刀具范围")
-            df = pd.read_csv(csv_path, header=None, usecols=[0, 1, 2, 3, 4], dtype={4: str})
+            csv_encoding = self._detect_sampledata_csv_encoding(csv_path)
+            self._sample_csv_file_encoding = csv_encoding
+            df = pd.read_csv(
+                csv_path,
+                header=None,
+                usecols=[0, 1, 2, 3, 4],
+                dtype={4: str},
+                encoding=csv_encoding,
+            )
             if df.shape[1] < 5:
                 if not silent:
                     messagebox.showerror("格式错误", "SampleData.csv 列数不足")
@@ -1484,6 +1629,7 @@ class SampleManagerMixin:
                 self.reset_sample_data_state()
             except Exception:
                 pass
+            self._sampledata_load_error = str(e)
             if not silent:
                 messagebox.showerror("加载失败", f"读取实测数据时发生错误:\n{str(e)}")
             if hasattr(self, "sample_auto_status_var"):
