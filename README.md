@@ -21,6 +21,8 @@ python src/project/main.py
 
 发布模式使用独立入口，启动时优先自动读取文件名逐字符完全匹配的 `SampleData.csv` 与 `SampleData.txt`；CSV/TXT 支持 UTF-8/BOM、UTF-16/32、GB18030/GBK、Big5、Shift-JIS、EUC-JP/KR 和常见 Windows ANSI 编码。文件对缺失或无效时，回退识别 EXE 同目录唯一的实验实测通道导出 CSV。错误大小写、增加后缀或改名后的文件不作为 SampleData。导入工艺信息并完成六态划分后，以固定 `P_idle=250 W` 和编程 F 反解全局 `Kc/Ke`，再优先使用 EXE 同目录 `iipinc.txt` 的指令进给计算预测负载；缺失、无效或未覆盖的指令进给逐行回退工艺信息中的编程进给。反解始终执行，预测曲线默认隐藏，可通过图形工具栏的“预测负载”勾选框显示。右侧“运行结果”只显示处理、实际负载和预测负载三项通俗状态，启动与导入过程中合并重复绘图刷新。发布包仍不包含 PIT / SMIF、profile、scikit-learn 或 SciPy。
 
+实测数据与工艺信息完成六态划分及采样映射后，按当前程序/刀具的切削稳态区间显示有限实测点平均功率；理想功率始终等于该稳态平均功率乘以当前优化倍率。没有可用切削稳态区间时，两项功率显示为 `-`。`SampleData.rg` 保持原有字段、顺序和 UTF-8 编码，区间集合同时包含六态划分中的空载和切削稳态区间。
+
 发布目录采用 PyInstaller 6.12.0 的 `onedir`、`windowed` 模式：
 
 ```text

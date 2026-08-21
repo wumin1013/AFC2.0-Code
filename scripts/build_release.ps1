@@ -460,6 +460,55 @@ foreach ($runtimeInputName in $RuntimeInputHashes.Keys) {
     }
     Write-Host "已原样恢复运行输入: $runtimeInputName ($restoredHash)"
 }
+
+# 临时目录自检通过后，再从最终发布目录原地启动一次。同步盘可能在目录
+# 换入后短暂锁定新 EXE，这一步确保交付路径本身也能完成初始化。
+$FinalExecutable = Join-Path $ReleaseDirectory "$ProductName.exe"
+$FinalStartupLog = Join-Path $ReleaseDirectory "startup-error.log"
+$PreviousFinalSmokeFlag = $env:AFC_RELEASE_SMOKE_TEST
+$PreviousFinalSuppressMessageboxes = $env:SUPPRESS_MESSAGEBOXES
+try {
+    $env:AFC_RELEASE_SMOKE_TEST = "1"
+    $env:SUPPRESS_MESSAGEBOXES = "1"
+    $FinalSmokeProcess = Start-Process `
+        -FilePath $FinalExecutable `
+        -WorkingDirectory $ReleaseDirectory `
+        -WindowStyle Hidden `
+        -PassThru
+    if (-not $FinalSmokeProcess.WaitForExit(30000)) {
+        Stop-Process -Id $FinalSmokeProcess.Id -Force -ErrorAction SilentlyContinue
+        throw "最终发布目录原地启动自检超时。"
+    }
+    if ($FinalSmokeProcess.ExitCode -ne 0) {
+        $FinalSmokeLogText = ""
+        if (Test-Path -LiteralPath $FinalStartupLog -PathType Leaf) {
+            $FinalSmokeLogText = [System.IO.File]::ReadAllText(
+                $FinalStartupLog,
+                [System.Text.Encoding]::UTF8
+            )
+        }
+        throw "最终发布目录原地启动自检失败，退出码 $($FinalSmokeProcess.ExitCode)。`n$FinalSmokeLogText"
+    }
+    if (Test-Path -LiteralPath $FinalStartupLog -PathType Leaf) {
+        Remove-Item -LiteralPath $FinalStartupLog -Force
+    }
+}
+finally {
+    if ($null -eq $PreviousFinalSmokeFlag) {
+        Remove-Item Env:AFC_RELEASE_SMOKE_TEST -ErrorAction SilentlyContinue
+    }
+    else {
+        $env:AFC_RELEASE_SMOKE_TEST = $PreviousFinalSmokeFlag
+    }
+    if ($null -eq $PreviousFinalSuppressMessageboxes) {
+        Remove-Item Env:SUPPRESS_MESSAGEBOXES -ErrorAction SilentlyContinue
+    }
+    else {
+        $env:SUPPRESS_MESSAGEBOXES = $PreviousFinalSuppressMessageboxes
+    }
+}
+Write-Host "最终发布目录原地启动自检通过: $FinalExecutable"
+
 if (Test-Path -LiteralPath $ReleaseBuildRoot) {
     Remove-SafeDirectory -Path $ReleaseBuildRoot -AllowedParent $OutputRoot
 }

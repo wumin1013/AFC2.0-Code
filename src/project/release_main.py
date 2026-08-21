@@ -3,8 +3,13 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import time
 import traceback
 from pathlib import Path
+
+
+_RUNTIME_LOAD_RETRY_ATTEMPTS = 12
+_RUNTIME_LOAD_RETRY_DELAY_SECONDS = 0.5
 
 
 def _load_runtime_components():
@@ -35,6 +40,19 @@ def _load_runtime_components():
         "tk": tk,
         "ttk": ttk,
     }
+
+
+def _load_runtime_components_with_retry():
+    """冻结发布版遇到同步软件的瞬时文件锁时短暂重试。"""
+    attempts = _RUNTIME_LOAD_RETRY_ATTEMPTS if getattr(sys, "frozen", False) else 1
+    for attempt in range(1, attempts + 1):
+        try:
+            return _load_runtime_components()
+        except PermissionError:
+            if attempt >= attempts:
+                raise
+            time.sleep(_RUNTIME_LOAD_RETRY_DELAY_SECONDS)
+    raise RuntimeError("发布运行组件加载重试意外结束")
 
 
 def _startup_log_root() -> Path:
@@ -92,7 +110,7 @@ def main() -> int:
     components = {}
     root = None
     try:
-        components = _load_runtime_components()
+        components = _load_runtime_components_with_retry()
         components["fast_startup"]()
         components["optimize_memory"]()
         root = components["tk"].Tk()

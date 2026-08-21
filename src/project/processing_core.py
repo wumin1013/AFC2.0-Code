@@ -1656,6 +1656,7 @@ class ProcessingCoreMixin:
 
     def reset_sample_data_state(self):
         """清空已加载的实测数据状态"""
+        self._current_display_power_mean = None
         if hasattr(self, "_invalidate_measurement_runtime_state"):
             self._invalidate_measurement_runtime_state(keep_profile_lock=False)
         self.sample_data_loaded = False

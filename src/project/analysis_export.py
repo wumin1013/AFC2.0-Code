@@ -1888,11 +1888,11 @@ class AnalysisExportMixin:
                 "缺少程序/刀具信息，未生成 SampleData.rg",
             )
             return
-        if not self._get_current_interval_records(allow_profile_fallback=False):
+        if not self._get_optimizable_interval_records():
             messagebox.showwarning(
-                "无稳态区间",
+                "无可优化区间",
                 f"{os.path.basename(process_info_path)} 已保存；"
-                "当前没有可映射的稳态区间，未生成 SampleData.rg",
+                "当前没有可映射的空载或稳态区间，未生成 SampleData.rg",
             )
             return
         
@@ -2275,8 +2275,11 @@ class AnalysisExportMixin:
         if not self.sample_programs:
             messagebox.showwarning("无程序信息", "请先加载 SampleData.txt")
             return
-        if not self._get_current_interval_records(allow_profile_fallback=False):
-            messagebox.showwarning("无稳态区间", "请先生成稳态区间")
+        if not self._get_optimizable_interval_records():
+            messagebox.showwarning(
+                "无可优化区间",
+                "请先生成空载或稳态区间",
+            )
             return
 
         # 源码研究版写项目 output/；冻结发布版直接写 EXE 同目录。
@@ -3910,14 +3913,11 @@ class AnalysisExportMixin:
 
             tool_mean_val = None
             tool_count = 0
-            tool_ideal_val_saved = None
             tool_ideal_val_preview = None
-            tool_saved = False
             if display_mode == "tool" and program_name and tool_id:
-                tool_mean_val, tool_count, tool_ideal_val_saved = _get_tool_stats(tool_id)
+                tool_mean_val, tool_count, _ = _get_tool_stats(tool_id)
                 if tool_mean_val is not None and tool_count > 0:
                     tool_ideal_val_preview = tool_mean_val * adjustment_ratio
-                tool_saved = tool_ideal_val_saved is not None
 
             # 注意：不再根据SampleData行号范围过滤预测负载
             # 两者使用独立的行号体系，只是叠加显示在同一张图上
@@ -4564,22 +4564,15 @@ class AnalysisExportMixin:
                     self.sample_ideal_var.set("-")
             else:
                 tool_label = self.sample_tool_name.get().strip() or (self.format_tool_label(tool_id) if tool_id else "当前刀具")
-                if not has_process_file:
-                    if tool_mean_val is not None and tool_count > 0:
-                        self.sample_avg_var.set(f"{tool_mean_val:.3f}")
+                if tool_mean_val is not None and tool_count > 0:
+                    self.sample_avg_var.set(f"{tool_mean_val:.3f}")
+                    if tool_ideal_val_preview is not None:
+                        self.sample_ideal_var.set(f"{tool_ideal_val_preview:.3f}")
                     else:
-                        self.sample_avg_var.set("-")
-                    self.sample_ideal_var.set("待导入")
-                else:
-                    if tool_mean_val is not None and tool_count > 0:
-                        self.sample_avg_var.set(f"{tool_mean_val:.3f}")
-                        if tool_saved and tool_ideal_val_saved is not None:
-                            self.sample_ideal_var.set(f"{tool_ideal_val_saved:.3f}")
-                        else:
-                            self.sample_ideal_var.set("未设定")
-                    else:
-                        self.sample_avg_var.set("-")
                         self.sample_ideal_var.set("-")
+                else:
+                    self.sample_avg_var.set("-")
+                    self.sample_ideal_var.set("-")
             
             fig2.subplots_adjust(
                 left=0.06,

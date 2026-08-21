@@ -1375,7 +1375,7 @@ class PlotSupportMixin:
         return self.merge_intervals(clipped)
 
     def get_predicted_intervals_for_display(self, ranges=None):
-        """获取完整稳态区间（按行号），供目标值和 .rg 消费。"""
+        """获取完整切削稳态区间（按行号），供稳态显示消费。"""
         base_intervals = []
         interval_records = self._get_current_interval_records(allow_profile_fallback=False)
         if hasattr(self, "_get_steady_interval_records"):
@@ -1457,23 +1457,22 @@ class PlotSupportMixin:
         return sum(counts), blocks
 
     def compute_tool_measured_mean(self, program_name, tool_id):
-        """计算指定程序+刀具在稳态区间内的实测均值"""
+        """计算指定程序+刀具在切削稳态区间内的有限实测均值。"""
         if not self.sample_data_loaded or self.sample_data_values is None:
             return None, 0, []
         program_no = self.get_program_number_by_name(program_name)
         tool_ranges = self.get_tool_ranges_by_id(program_name, tool_id)
-        intervals = self.get_predicted_intervals_for_display(tool_ranges)
-        if not intervals:
-            return None, 0, intervals
+        steady_ranges = self.get_predicted_intervals_for_display(tool_ranges)
+        if not steady_ranges:
+            return None, 0, steady_ranges
         base_mask = self.build_sample_mask(program_no, tool_ranges)
         if base_mask is None or not base_mask.any():
-            return None, 0, intervals
+            return None, 0, steady_ranges
 
-        interval_records = self._get_current_interval_records(allow_profile_fallback=False)
-        if hasattr(self, "_get_steady_interval_records"):
-            interval_records = self._get_steady_interval_records(interval_records)
-        else:
-            interval_records = []
+        interval_records = self._get_current_interval_records(
+            allow_profile_fallback=False
+        )
+        interval_records = self._get_steady_interval_records(interval_records)
         interval_mask = np.zeros(len(base_mask), dtype=bool)
         for interval in interval_records:
             interval_mask |= self._build_interval_sample_mask(
@@ -1481,16 +1480,20 @@ class PlotSupportMixin:
                 len(base_mask),
                 line_numbers=self.sample_data_line_numbers,
             )
-        mask = base_mask & interval_mask
-        if not mask.any():
-            return None, 0, intervals
+        measured_mask = base_mask & interval_mask
+        if not measured_mask.any():
+            return None, 0, steady_ranges
 
         source_idx = int(self.sample_data_source.get())
         values = np.asarray(self.sample_data_values[:, source_idx], dtype=float)
-        finite_mask = mask & np.isfinite(values)
+        finite_mask = measured_mask & np.isfinite(values)
         if not finite_mask.any():
-            return None, 0, intervals
-        return float(np.mean(values[finite_mask])), int(np.sum(finite_mask)), intervals
+            return None, 0, steady_ranges
+        return (
+            float(np.mean(values[finite_mask])),
+            int(np.sum(finite_mask)),
+            steady_ranges,
+        )
 
     def format_line_point(self, line_number, point_index):
         """格式化现有界面的一基行点标签。"""
@@ -1509,14 +1512,14 @@ class PlotSupportMixin:
             return f"{line_number}.{point_index}"
 
     def collect_line_point_intervals_for_tool(self, program_name, tool_id):
-        """获取指定程序+刀具的稳态区间行点范围（包含每个区间的平均值）
+        """获取指定程序+刀具的空载/稳态区间行点范围（含区间均值）
         
         使用工艺信息索引的精确x坐标边界来匹配SampleData点，
         确保与图表绘制的区间边界完全一致。
         """
         if not self.sample_data_loaded or self.sample_data_line_numbers is None:
             return []
-        interval_records = self._get_steady_interval_records()
+        interval_records = self._get_optimizable_interval_records()
         if not interval_records:
             return []
         if not self.data:

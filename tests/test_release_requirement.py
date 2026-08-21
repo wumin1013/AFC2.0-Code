@@ -21,6 +21,8 @@ if str(SRC_ROOT) not in sys.path:
 
 from project.input_idle import InputIdleMixin
 from project.analysis_export import AnalysisExportMixin
+from project.config_state import ConfigStateMixin
+from project.interval_runtime import IntervalRuntimeMixin
 from project.plot_support import PlotSupportMixin
 from project.prediction_support import (
     append_inverse_prediction_channels,
@@ -78,6 +80,25 @@ class _ValueVar:
 
     def set(self, value):
         self.value = value
+
+
+class _PowerDisplayHarness(ConfigStateMixin):
+    def __init__(self):
+        self.sample_avg_var = _ValueVar("-")
+        self.sample_ideal_var = _ValueVar("-")
+        self.adjustment_ratio = _ValueVar(2.5)
+
+    @staticmethod
+    def get_current_program_key():
+        return "P1"
+
+    @staticmethod
+    def get_selected_tool_id():
+        return "T0"
+
+    @staticmethod
+    def compute_tool_measured_mean(_program_name, _tool_id):
+        return 200.0, 3, [(10, 12)]
 
 
 class _RgExportHarness(AnalysisExportMixin):
@@ -408,6 +429,46 @@ if missing:
         self.assertIn("application", events)
         self.assertIn("update_idletasks", events)
         self.assertIn("destroy", events)
+
+    def test_release_main_retries_transient_frozen_executable_lock(self):
+        import project.release_main as release_main
+
+        components = {
+            "application": lambda _root: None,
+            "cleanup": lambda: None,
+            "configure_style": lambda _style: None,
+            "fast_startup": lambda: None,
+            "messagebox": None,
+            "optimize_memory": lambda: None,
+            "tk": SimpleNamespace(
+                Tk=lambda: SimpleNamespace(
+                    withdraw=lambda: None,
+                    title=lambda _value: None,
+                    update_idletasks=lambda: None,
+                    destroy=lambda: None,
+                )
+            ),
+            "ttk": SimpleNamespace(Style=lambda: object()),
+        }
+        transient_error = PermissionError(13, "Permission denied", "AFC2.0.2alpha.exe")
+        with patch.dict(
+            os.environ,
+            {"AFC_RELEASE_SMOKE_TEST": "1", "SUPPRESS_MESSAGEBOXES": "1"},
+            clear=False,
+        ), patch.object(
+            sys,
+            "frozen",
+            True,
+            create=True,
+        ), patch.object(
+            release_main,
+            "_load_runtime_components",
+            side_effect=[transient_error, transient_error, components],
+        ) as loader, patch.object(release_main.time, "sleep") as sleeper:
+            self.assertEqual(0, release_main.main())
+
+        self.assertEqual(3, loader.call_count)
+        self.assertEqual(2, sleeper.call_count)
 
     def test_packaging_spec_collects_dynamic_mkl_runtime(self):
         spec_text = (PROJECT_ROOT / "packaging" / "AFC2_onedir.spec").read_text(
@@ -1104,6 +1165,133 @@ if missing:
             np.array([16.0, 16.0, 16.0, 22.0]),
         )
         self.assertEqual("measurement_point_kc", result.loc[3, "predicted_kc_source"])
+
+    def test_steady_average_and_live_ratio_refresh(self):
+        harness = _PowerDisplayHarness()
+
+        harness._refresh_current_ideal_display()
+
+        self.assertEqual("200.000", harness.sample_avg_var.get())
+        self.assertEqual("500.000", harness.sample_ideal_var.get())
+        self.assertEqual(200.0, harness._current_display_power_mean)
+
+    def test_tool_average_uses_only_finite_cutting_steady_points(self):
+        harness = PlotSupportMixin()
+        harness.sample_data_loaded = True
+        harness.sample_data_source = _ValueVar(1)
+        harness.sample_data_values = np.asarray(
+            [
+                [0.0, 100.0],
+                [0.0, np.nan],
+                [0.0, 300.0],
+                [0.0, 900.0],
+            ]
+        )
+        harness.sample_data_line_numbers = np.asarray([10, 10, 11, 12])
+        harness.sample_data_program_numbers = np.asarray(["1", "1", "1", "1"])
+        harness.sample_programs = {
+            "P1": {
+                "program_number": "1",
+                "tools": {"T0": [(10, 11)]},
+            }
+        }
+        steady_record = {
+            "segment_type": "steady",
+            "start_line": 10,
+            "end_line": 11,
+        }
+        harness._get_current_interval_records = lambda **_kwargs: [steady_record]
+        harness._get_steady_interval_records = lambda records=None: list(records or [])
+        harness._build_interval_sample_mask = (
+            lambda _interval, _size, line_numbers=None: np.asarray(
+                [True, False, True, False]
+            )
+        )
+
+        mean_value, count, ranges = harness.compute_tool_measured_mean("P1", "T0")
+
+        self.assertEqual(200.0, mean_value)
+        self.assertEqual(2, count)
+        self.assertEqual([(10, 11)], ranges)
+
+    def test_tool_average_is_empty_without_cutting_steady_intervals(self):
+        harness = PlotSupportMixin()
+        harness.sample_data_loaded = True
+        harness.sample_data_source = _ValueVar(1)
+        harness.sample_data_values = np.asarray([[0.0, 100.0]])
+        harness.sample_data_line_numbers = np.asarray([10])
+        harness.sample_data_program_numbers = np.asarray(["1"])
+        harness.sample_programs = {
+            "P1": {
+                "program_number": "1",
+                "tools": {"T0": [(10, 10)]},
+            }
+        }
+        harness._get_current_interval_records = lambda **_kwargs: []
+        harness._get_steady_interval_records = lambda records=None: []
+
+        mean_value, count, ranges = harness.compute_tool_measured_mean("P1", "T0")
+
+        self.assertIsNone(mean_value)
+        self.assertEqual(0, count)
+        self.assertEqual([], ranges)
+
+    def test_ratio_preview_updates_ideal_power_without_rescanning_samples(self):
+        harness = SampleManagerMixin()
+        harness._current_display_power_mean = 200.0
+        harness.sample_ideal_var = _ValueVar("-")
+
+        harness._update_ideal_power_preview(1.85)
+
+        self.assertEqual("370.000", harness.sample_ideal_var.get())
+
+    def test_selection_change_refreshes_power_display_with_processed_data(self):
+        harness = SampleManagerMixin()
+        harness._loading_sample_data = False
+        harness._selection_change_job = None
+        harness._pending_selection_signature = None
+        harness._last_selection_signature = None
+        harness._current_display_power_mean = 200.0
+        harness.sample_display_mode = _ValueVar("tool")
+        harness.sample_data_loaded = True
+        harness.data = [{}]
+        harness.build_sample_selection_signature = lambda: ("tool", "P1", "T0")
+        harness.sync_adjustment_ratio_for_current_view = lambda: None
+        refresh_calls = []
+        plot_calls = []
+        harness._refresh_current_ideal_display = lambda: refresh_calls.append(True)
+        harness.generate_plots = lambda **kwargs: plot_calls.append(kwargs)
+        harness.root = SimpleNamespace(
+            after=lambda _delay, callback: callback(),
+            after_cancel=lambda _job: None,
+        )
+
+        harness.on_sample_selection_change()
+
+        self.assertIsNone(harness._current_display_power_mean)
+        self.assertEqual([True], refresh_calls)
+        self.assertEqual(1, len(plot_calls))
+
+    def test_rg_optimizable_intervals_include_idle_and_cutting_steady(self):
+        harness = IntervalRuntimeMixin()
+        records = [
+            {"segment_type": "idle", "start_idx": 0, "end_idx": 1},
+            {"segment_type": "entry", "start_idx": 2, "end_idx": 2},
+            {"segment_type": "steady", "start_idx": 3, "end_idx": 5},
+            {"segment_type": "exit", "start_idx": 6, "end_idx": 6},
+        ]
+
+        optimizable = harness._get_optimizable_interval_records(records)
+        steady_only = harness._get_steady_interval_records(records)
+
+        self.assertEqual(
+            ["idle", "steady"],
+            [record["segment_type"] for record in optimizable],
+        )
+        self.assertEqual(
+            ["steady"],
+            [record["segment_type"] for record in steady_only],
+        )
 
     def test_rg_output_contract_does_not_gain_average_or_ratio_columns(self):
         import project.analysis_export as export_module

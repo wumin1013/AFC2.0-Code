@@ -268,6 +268,7 @@ class BootstrapUiMixin:
         self.sample_tool_name = tk.StringVar()
         self.sample_avg_var = tk.StringVar(value="-")
         self.sample_ideal_var = tk.StringVar(value="-")
+        self._current_display_power_mean = None
         self.sample_auto_status_var = tk.StringVar(value="请先导入 SampleData 或实验实测文件")
         self._selection_change_job = None  # debounce timer handle for selection changes
         self._pending_selection_signature = None

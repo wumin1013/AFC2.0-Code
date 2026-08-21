@@ -417,34 +417,30 @@ class ConfigStateMixin:
         self._set_overview_text(getattr(self, "interval_count_var", None), str(total))
 
     def _refresh_current_ideal_display(self):
-        """刷新当前选中刀具的理想值显示"""
+        """刷新当前选中刀具的切削稳态平均功率和理想功率。"""
         prog = self.get_current_program_key()
         tool = self.get_selected_tool_id()
-        
+
         if not prog or not tool:
+            self._current_display_power_mean = None
+            self.sample_avg_var.set("-")
+            self.sample_ideal_var.set("-")
             return
-        
-        tool_label = self.format_tool_label(tool)
-        
-        # 检查该程序是否已导入工艺信息文件
-        process_path = self.program_process_file_map.get(prog)
-        has_process_file = bool(process_path and os.path.exists(process_path))
-        has_processed = self._has_processed_result_for(process_path)
-        if not has_process_file or not has_processed:
-            self.sample_ideal_var.set("待导入")
+
+        mean_val, count, _ = self.compute_tool_measured_mean(prog, tool)
+        if mean_val is None or count <= 0:
+            self._current_display_power_mean = None
+            self.sample_avg_var.set("-")
+            self.sample_ideal_var.set("-")
             return
-        
-        store = self.ideal_store.get((prog, tool))
-        if store:
-            rg = store.get("rg", 1.0)
-            mean_val, _, _ = self.compute_tool_measured_mean(prog, tool)
-            if mean_val is not None:
-                ideal_val = mean_val * rg
-                self.sample_ideal_var.set(f"{ideal_val:.3f}")
-            else:
-                self.sample_ideal_var.set("未计算")
-        else:
-            self.sample_ideal_var.set("未设定")
+
+        try:
+            ratio = float(self.adjustment_ratio.get())
+        except Exception:
+            ratio = 2.0
+        self._current_display_power_mean = float(mean_val)
+        self.sample_avg_var.set(f"{mean_val:.3f}")
+        self.sample_ideal_var.set(f"{mean_val * ratio:.3f}")
 
     def _on_rg_entry_commit(self, event=None):
         """rg文本框回车/失焦时同步滑条并触发完整更新"""

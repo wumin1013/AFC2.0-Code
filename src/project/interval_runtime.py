@@ -294,6 +294,23 @@ class IntervalRuntimeMixin:
             return segment_type in {"steady", "steady_cutting"}
         return int(self._resolve_profile_segment_state_code(record)) == 2
 
+    def _record_represents_optimizable_interval(self, record):
+        """空载和切削稳态区间均可写入 SampleData.rg。"""
+        if not isinstance(record, dict):
+            return False
+        segment_type = str(record.get("segment_type") or "").strip().lower()
+        steady_subtype = str(record.get("steady_subtype") or "").strip().lower()
+        is_idle = (
+            bool(record.get("is_idle_interval"))
+            or str(record.get("kc_source", "")).strip().lower() == "idle"
+            or steady_subtype == "idle"
+        )
+        if is_idle:
+            return True
+        if segment_type:
+            return segment_type in {"idle", "steady", "steady_cutting"}
+        return int(self._resolve_profile_segment_state_code(record)) == 2
+
     def _refresh_interval_process_descriptors(self, record):
         current = dict(record) if isinstance(record, dict) else {}
         rows = getattr(self, "data", None) or []
@@ -348,6 +365,29 @@ class IntervalRuntimeMixin:
             if refreshed:
                 steady_records.append(refreshed)
         return steady_records
+
+    def _get_optimizable_interval_records(self, records=None):
+        """返回可供优化器消费的空载和切削稳态区间。"""
+        if isinstance(records, list):
+            source_records = records
+        else:
+            segment_records = self._get_current_segment_records(
+                allow_profile_fallback=False
+            )
+            source_records = segment_records or self._get_current_interval_records(
+                allow_profile_fallback=False
+            )
+        optimizable_records = []
+        for record in source_records or []:
+            if (
+                not isinstance(record, dict)
+                or not self._record_represents_optimizable_interval(record)
+            ):
+                continue
+            refreshed = self._refresh_interval_process_descriptors(record)
+            if refreshed:
+                optimizable_records.append(refreshed)
+        return optimizable_records
 
     def _refresh_authoritative_segmentation_interval_descriptors(self):
         if not self._has_authoritative_segmentation_state() or not getattr(self, "data", None):

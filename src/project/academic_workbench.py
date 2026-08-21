@@ -1311,6 +1311,13 @@ class AcademicWorkbenchMixin:
                     refresh_view=False,
                     silent=True,
                 )
+            power_refresher = getattr(
+                self,
+                "_refresh_current_ideal_display",
+                None,
+            )
+            if callable(power_refresher):
+                power_refresher()
             self.target_load_curve = []
             diagnostics_path = diagnostics.get("path", {})
             path_source = str(diagnostics_path.get("source") or "unknown")

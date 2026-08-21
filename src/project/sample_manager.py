@@ -710,6 +710,7 @@ class SampleManagerMixin:
             self.adjustment_ratio_display.set(f"{ratio:.2f}")
         except Exception:
             return
+        self._update_ideal_power_preview(ratio)
         
         # 取消待执行的防抖定时器
         if self._ratio_debounce_timer is not None:
@@ -722,6 +723,18 @@ class SampleManagerMixin:
         
         # 标记正在通过滑块交互（用于 release 判断是否需要完整重绘）
         self._ratio_scale_interacting = True
+
+    def _update_ideal_power_preview(self, ratio):
+        """仅刷新理想功率文本，避免滑动倍率时重扫全量实测数据。"""
+        mean_value = getattr(self, "_current_display_power_mean", None)
+        try:
+            mean_value = float(mean_value)
+            ratio_value = float(ratio)
+        except (TypeError, ValueError):
+            return
+        if not np.isfinite(mean_value) or not np.isfinite(ratio_value):
+            return
+        self.sample_ideal_var.set(f"{mean_value * ratio_value:.3f}")
 
     def on_adjustment_ratio_change(self, *args):
         """优化倍率变更：添加防抖机制，避免频繁更新"""
@@ -738,6 +751,7 @@ class SampleManagerMixin:
             self.adjustment_ratio_display.set(f"{ratio:.2f}")
         except Exception:
             return
+        self._update_ideal_power_preview(ratio)
         
         # 正在拖动滑块时（包括刚按下的瞬间），仅更新虚线/背景预览，不触发整图重绘
         if self._ratio_dragging:
@@ -1239,6 +1253,7 @@ class SampleManagerMixin:
 
     def on_sample_display_mode_change(self):
         """显示模式切换"""
+        self._current_display_power_mean = None
         mode = self.sample_display_mode.get()
         if not self.sample_programs:
             self.sample_program_combo.configure(state="disabled")
@@ -1335,6 +1350,7 @@ class SampleManagerMixin:
         """实测数据显示条件变化时刷新图表（加入去抖，防止频繁切换卡顿）"""
         if bool(getattr(self, "_loading_sample_data", False)):
             return
+        self._current_display_power_mean = None
         try:
             # 记录当前选择签名，快速跳过重复请求
             sig = self.build_sample_selection_signature()
@@ -1354,10 +1370,16 @@ class SampleManagerMixin:
 
                 if self.sample_display_mode.get() in ("program", "tool"):
                     self.sync_adjustment_ratio_for_current_view()
+                power_refresher = getattr(
+                    self,
+                    "_refresh_current_ideal_display",
+                    None,
+                )
+                if callable(power_refresher):
+                    power_refresher()
                 if not self.data:
                     if self.sample_data_loaded:
                         self.show_sample_preview()
-                    self._refresh_current_ideal_display()
                     return
                 interval_policy = self._get_default_interval_policy() if hasattr(self, "_get_default_interval_policy") else "fresh_or_empty"
                 self.generate_plots(save=False, silent=True, interval_policy=interval_policy)
@@ -1368,10 +1390,16 @@ class SampleManagerMixin:
             # 退回旧逻辑避免阻塞
             if self.sample_display_mode.get() in ("program", "tool"):
                 self.sync_adjustment_ratio_for_current_view()
+            power_refresher = getattr(
+                self,
+                "_refresh_current_ideal_display",
+                None,
+            )
+            if callable(power_refresher):
+                power_refresher()
             if not self.data:
                 if self.sample_data_loaded:
                     self.show_sample_preview()
-                self._refresh_current_ideal_display()
                 return
             interval_policy = self._get_default_interval_policy() if hasattr(self, "_get_default_interval_policy") else "fresh_or_empty"
             self.generate_plots(save=False, silent=True, interval_policy=interval_policy)
@@ -2086,7 +2114,7 @@ class SampleManagerMixin:
                            alpha=0.5, zorder=1, linewidth=0)
 
     def collect_intervals_for_tool(self, program_name, tool_id):
-        """获取指定程序+刀具的稳态区间行点范围。"""
+        """获取指定程序+刀具的空载/稳态区间行点范围。"""
         intervals = self.collect_line_point_intervals_for_tool(program_name, tool_id)
         range_strings = []
         for interval_text in intervals:
@@ -2097,8 +2125,8 @@ class SampleManagerMixin:
 
     def export_sample_intervals(self):
         """导出负载区间交互文件 SampleData.rg"""
-        if not self._get_current_interval_records(allow_profile_fallback=False):
-            messagebox.showwarning("无区间", "请先生成稳态区间")
+        if not self._get_optimizable_interval_records():
+            messagebox.showwarning("无区间", "请先生成空载或稳态区间")
             return
         if not self.sample_programs:
             messagebox.showwarning("无程序信息", "请先加载 SampleData.txt")
