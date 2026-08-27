@@ -30,10 +30,11 @@ EXCLUDED_MODULES = [
     "jedi",
 ]
 
-# Conda 的 NumPy/Pandas 通过 mkl_rt 在运行时动态加载这些 DLL；
-# PyInstaller 的静态依赖分析无法发现，缺失时 windowed EXE 会在显示界面前直接退出。
+# Conda 的 NumPy/Pandas、ctypes 与 Pillow 会在运行时动态加载这些 DLL；
+# 仅显式指定 Python 路径而未激活 Conda 时，PyInstaller 无法从 PATH
+# 解析它们，缺失会使 windowed EXE 在显示界面前直接退出。
 CONDA_LIBRARY_BIN = Path(sys.prefix) / "Library" / "bin"
-MKL_RUNTIME_NAMES = [
+CONDA_RUNTIME_NAMES = [
     "mkl_rt.2.dll",
     "mkl_core.2.dll",
     "mkl_intel_thread.2.dll",
@@ -41,18 +42,25 @@ MKL_RUNTIME_NAMES = [
     "mkl_def.2.dll",
     "mkl_vml_def.2.dll",
     "libiomp5md.dll",
+    "ffi.dll",
+    "libsharpyuv.dll",
+    "libwebp.dll",
+    "libwebpdemux.dll",
+    "libwebpmux.dll",
+    "tcl86t.dll",
+    "tk86t.dll",
 ]
-MKL_RUNTIME_BINARIES = []
-for runtime_name in MKL_RUNTIME_NAMES:
+CONDA_RUNTIME_BINARIES = []
+for runtime_name in CONDA_RUNTIME_NAMES:
     runtime_path = CONDA_LIBRARY_BIN / runtime_name
     if not runtime_path.is_file():
-        raise FileNotFoundError(f"缺少 NumPy/Pandas 所需 MKL 运行库: {runtime_path}")
-    MKL_RUNTIME_BINARIES.append((str(runtime_path), "."))
+        raise FileNotFoundError(f"缺少发布版所需 Conda 运行库: {runtime_path}")
+    CONDA_RUNTIME_BINARIES.append((str(runtime_path), "."))
 
 analysis = Analysis(
     [str(ENTRY_POINT)],
     pathex=[str(SOURCE_ROOT)],
-    binaries=MKL_RUNTIME_BINARIES,
+    binaries=CONDA_RUNTIME_BINARIES,
     datas=[],
     hiddenimports=[],
     hookspath=[],

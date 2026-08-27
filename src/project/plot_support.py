@@ -567,6 +567,18 @@ class PlotSupportMixin:
         if mask_arr.size == 0:
             return []
 
+        if mask_arr.ndim == 1:
+            padded = np.empty(mask_arr.size + 2, dtype=bool)
+            padded[0] = False
+            padded[-1] = False
+            padded[1:-1] = mask_arr
+            edges = np.flatnonzero(padded[1:] != padded[:-1])
+            return [
+                (int(start), int(end - 1))
+                for start, end in edges.reshape(-1, 2)
+            ]
+
+        # 非一维历史输入保留原有迭代行为（包括不明确布尔值的异常）。
         blocks = []
         start = None
         for idx, flag in enumerate(mask_arr):
@@ -610,6 +622,53 @@ class PlotSupportMixin:
                 start = idx
         blocks.append((start, len(line_arr) - 1))
         return blocks
+
+    def compute_sample_sequence_layout(self, line_numbers, group_keys=None):
+        """一次生成整数采样行的序列块、行内坐标和点内序号。
+
+        该快路径只服务已经清洗为一维整数的 SampleData/实验实测数组；
+        其它输入继续由三个通用公开方法处理，避免改变历史兼容语义。
+        """
+        line_arr = np.asarray(line_numbers)
+        if line_arr.ndim != 1 or line_arr.dtype.kind not in "iu":
+            raise ValueError("采样行号快路径只接受一维整数数组")
+        sample_count = int(line_arr.size)
+        if sample_count == 0:
+            return [], np.asarray([], dtype=float), np.asarray([], dtype=int)
+
+        group_arr = None
+        if group_keys is not None:
+            group_arr = np.asarray(group_keys)
+            if group_arr.ndim != 1 or group_arr.size != sample_count:
+                raise ValueError("采样分组键与行号数量不一致")
+
+        block_start_mask = np.zeros(sample_count, dtype=bool)
+        block_start_mask[0] = True
+        if sample_count > 1:
+            block_start_mask[1:] = line_arr[1:] < line_arr[:-1]
+            if group_arr is not None:
+                block_start_mask[1:] |= group_arr[1:] != group_arr[:-1]
+
+        block_starts = np.flatnonzero(block_start_mask)
+        block_ends = np.append(block_starts[1:] - 1, sample_count - 1)
+        blocks = [
+            (int(start), int(end))
+            for start, end in zip(block_starts, block_ends)
+        ]
+
+        run_start_mask = block_start_mask.copy()
+        if sample_count > 1:
+            run_start_mask[1:] |= line_arr[1:] != line_arr[:-1]
+        run_starts = np.flatnonzero(run_start_mask)
+        run_lengths = np.diff(np.append(run_starts, sample_count))
+        expanded_starts = np.repeat(run_starts, run_lengths)
+        expanded_lengths = np.repeat(run_lengths, run_lengths)
+        point_indices = np.arange(sample_count, dtype=int) - expanded_starts
+        x_positions = (
+            line_arr.astype(float, copy=False)
+            + point_indices.astype(float, copy=False) / expanded_lengths
+        )
+        return blocks, x_positions, point_indices
 
     def _compute_line_x_positions_single_block(self, line_numbers):
         """基于行号生成可视化x坐标
@@ -1127,6 +1186,63 @@ class PlotSupportMixin:
             except Exception:
                 continue
 
+    def _get_or_create_time_line_top_axis(self, ax):
+        """复用顶部程序行号轴，避免 draw_event 后重建造成首帧错位。"""
+        top_ax = getattr(ax, "_time_line_top_axis", None)
+        child_axes = list(getattr(ax, "child_axes", []) or [])
+        if top_ax is not None and top_ax in child_axes:
+            return top_ax
+        if top_ax is not None:
+            try:
+                top_ax.remove()
+            except Exception:
+                pass
+        top_ax = ax.secondary_xaxis("top")
+        ax._time_line_top_axis = top_ax
+        return top_ax
+
+    def _update_time_line_top_axis(self, ax, tick_positions, tick_labels):
+        """更新程序行号刻度，并按嵌入画布的紧凑模式保持文字在边界内。"""
+        top_ax = self._get_or_create_time_line_top_axis(ax)
+        top_ax.set_xticks(tick_positions)
+        tick_artists = top_ax.set_xticklabels(tick_labels)
+
+        compact = bool(
+            getattr(getattr(ax, "figure", None), "_data_compact_typography", False)
+        )
+        label_size = 8 if compact else PLOT_FONT_BASE
+        tick_size = 7 if compact else max(PLOT_FONT_BASE - 1, 8)
+        top_ax.set_xlabel(
+            "程序行号",
+            fontsize=label_size,
+            fontweight="bold",
+            color="black",
+            labelpad=2 if compact else 4,
+        )
+        top_ax.tick_params(
+            axis="x",
+            labelsize=tick_size,
+            colors="black",
+            pad=1 if compact else 2,
+            length=3,
+        )
+        for index, label in enumerate(tick_artists):
+            label.set_rotation(35)
+            label.set_rotation_mode("anchor")
+            if len(tick_artists) <= 1:
+                label.set_horizontalalignment("center")
+            elif index == 0:
+                label.set_horizontalalignment("left")
+            elif index == len(tick_artists) - 1:
+                label.set_horizontalalignment("right")
+            else:
+                label.set_horizontalalignment("center")
+        try:
+            top_ax.spines["top"].set_color("black")
+        except Exception:
+            pass
+        return top_ax
+
     def apply_line_axis_on_time(self, ax, sample_mask, max_ticks=60):
         """在时间轴上方附加程序行号辅助坐标轴。"""
         if self.sample_data_line_numbers is None:
@@ -1135,17 +1251,19 @@ class PlotSupportMixin:
         if time_arr is None:
             return None
 
-        self.remove_line_axis_on_time(ax)
         mask_arr = np.asarray(sample_mask, dtype=bool) if sample_mask is not None else np.ones(len(self.sample_data_line_numbers), dtype=bool)
         if mask_arr.size != len(self.sample_data_line_numbers):
+            self.remove_line_axis_on_time(ax)
             return None
 
         _, ordered_spans = self.build_sample_line_time_spans(mask_arr)
         if not ordered_spans:
+            self.remove_line_axis_on_time(ax)
             return None
 
         anchor_spans = self.build_line_anchor_spans(ordered_spans)
         if not anchor_spans:
+            self.remove_line_axis_on_time(ax)
             return None
 
         x_min, x_max = ax.get_xlim()
@@ -1172,19 +1290,14 @@ class PlotSupportMixin:
             tick_positions.append(float(anchor_t))
             tick_labels.append(str(int(ln)))
 
-        top_ax = ax.secondary_xaxis('top')
-        top_ax.set_xticks(tick_positions)
-        top_ax.set_xticklabels(tick_labels, rotation=45, ha='left')
-        top_ax.set_xlabel('程序行号', fontsize=PLOT_FONT_BASE, fontweight='bold', color='black')
-        top_ax.tick_params(axis='x', labelsize=PLOT_FONT_BASE - 1, colors='black')
-        try:
-            top_ax.spines['top'].set_color('black')
-        except Exception:
-            pass
+        top_ax = self._update_time_line_top_axis(
+            ax,
+            tick_positions,
+            tick_labels,
+        )
         ax._time_line_mask = mask_arr.copy()
         ax._time_line_axis_mode = 'time'
         ax._time_line_positions = None
-        ax._time_line_top_axis = top_ax
         ax._time_line_view_key = self._get_time_line_view_key(ax)
         self.bind_time_line_axis_updates(ax)
         return top_ax
@@ -1237,13 +1350,14 @@ class PlotSupportMixin:
         if self.sample_data_line_numbers is None or sample_positions is None:
             return None
 
-        self.remove_line_axis_on_time(ax)
         _, ordered_spans = self.build_sample_line_position_spans(sample_positions, sample_mask)
         if not ordered_spans:
+            self.remove_line_axis_on_time(ax)
             return None
 
         anchor_spans = self.build_line_anchor_spans(ordered_spans)
         if not anchor_spans:
+            self.remove_line_axis_on_time(ax)
             return None
 
         x_min, x_max = ax.get_xlim()
@@ -1270,19 +1384,14 @@ class PlotSupportMixin:
             tick_positions.append(float(anchor_pos))
             tick_labels.append(str(int(ln)))
 
-        top_ax = ax.secondary_xaxis('top')
-        top_ax.set_xticks(tick_positions)
-        top_ax.set_xticklabels(tick_labels, rotation=45, ha='left')
-        top_ax.set_xlabel('程序行号', fontsize=PLOT_FONT_BASE, fontweight='bold', color='black')
-        top_ax.tick_params(axis='x', labelsize=PLOT_FONT_BASE - 1, colors='black')
-        try:
-            top_ax.spines['top'].set_color('black')
-        except Exception:
-            pass
+        top_ax = self._update_time_line_top_axis(
+            ax,
+            tick_positions,
+            tick_labels,
+        )
         ax._time_line_mask = np.asarray(sample_mask, dtype=bool) if sample_mask is not None else None
         ax._time_line_axis_mode = 'path'
         ax._time_line_positions = np.asarray(sample_positions, dtype=float) if sample_positions is not None else None
-        ax._time_line_top_axis = top_ax
         ax._time_line_view_key = self._get_time_line_view_key(ax)
         self.bind_time_line_axis_updates(ax)
         return top_ax
@@ -1474,12 +1583,58 @@ class PlotSupportMixin:
         )
         interval_records = self._get_steady_interval_records(interval_records)
         interval_mask = np.zeros(len(base_mask), dtype=bool)
+
+        projected_by_id = {}
+        projected_getter = getattr(
+            self,
+            "_get_authoritative_segmentation_sample_records",
+            None,
+        )
+        if callable(projected_getter):
+            try:
+                projected_records = projected_getter()
+            except Exception:
+                projected_records = []
+            for projected in projected_records or []:
+                if not isinstance(projected, dict):
+                    continue
+                projected_id = str(
+                    projected.get("interval_id")
+                    or projected.get("zone_id")
+                    or ""
+                ).strip()
+                if projected_id:
+                    projected_by_id[projected_id] = projected
+
         for interval in interval_records:
-            interval_mask |= self._build_interval_sample_mask(
-                interval,
-                len(base_mask),
-                line_numbers=self.sample_data_line_numbers,
-            )
+            interval_id = str(
+                interval.get("interval_id")
+                or interval.get("zone_id")
+                or ""
+            ).strip()
+            resolved = projected_by_id.get(interval_id, interval)
+            try:
+                start_idx = int(resolved.get("sample_start_idx"))
+                end_idx = int(resolved.get("sample_end_idx"))
+            except (AttributeError, TypeError, ValueError):
+                span_getter = getattr(self, "_get_interval_sample_index_span", None)
+                span = (
+                    span_getter(
+                        interval,
+                        line_numbers=self.sample_data_line_numbers,
+                    )
+                    if callable(span_getter)
+                    else None
+                )
+                if not span:
+                    continue
+                start_idx, end_idx = map(int, span)
+            if end_idx < start_idx:
+                start_idx, end_idx = end_idx, start_idx
+            safe_start = max(0, start_idx)
+            safe_end = min(len(interval_mask) - 1, end_idx)
+            if safe_end >= safe_start:
+                interval_mask[safe_start:safe_end + 1] = True
         measured_mask = base_mask & interval_mask
         if not measured_mask.any():
             return None, 0, steady_ranges
@@ -1514,8 +1669,8 @@ class PlotSupportMixin:
     def collect_line_point_intervals_for_tool(self, program_name, tool_id):
         """获取指定程序+刀具的空载/稳态区间行点范围（含区间均值）
         
-        使用工艺信息索引的精确x坐标边界来匹配SampleData点，
-        确保与图表绘制的区间边界完全一致。
+        优先复用六态划分的权威采样投影；旧数据没有投影时，
+        才按工艺信息的精确 x 坐标边界匹配 SampleData 点。
         """
         if not self.sample_data_loaded or self.sample_data_line_numbers is None:
             return []
@@ -1559,6 +1714,28 @@ class PlotSupportMixin:
             sample_values = self.sample_data_values[:, data_source_idx]
         else:
             sample_values = self.sample_data_values
+
+        projected_by_id = {}
+        projected_getter = getattr(
+            self,
+            "_get_authoritative_segmentation_sample_records",
+            None,
+        )
+        if callable(projected_getter):
+            try:
+                projected_records = projected_getter()
+            except Exception:
+                projected_records = []
+            for projected in projected_records or []:
+                if not isinstance(projected, dict):
+                    continue
+                projected_id = str(
+                    projected.get("interval_id")
+                    or projected.get("zone_id")
+                    or ""
+                ).strip()
+                if projected_id:
+                    projected_by_id[projected_id] = projected
         
         interval_strings = []
         
@@ -1581,22 +1758,50 @@ class PlotSupportMixin:
                     break
             if not in_range:
                 continue
-            
-            # 获取工艺信息区间的边界（与图表绘制一致）
-            display_start_x = interval.get("display_start_x")
-            display_end_x = interval.get("display_end_x")
-            if np.isfinite(display_start_x) and np.isfinite(display_end_x) and float(display_end_x) > float(display_start_x):
-                interval_start_x = float(display_start_x)
-                interval_end_x = float(display_end_x)
-            else:
-                if start_idx_iv >= len(process_start_bounds) or end_idx_iv >= len(process_end_bounds):
+
+            interval_id = str(
+                interval.get("interval_id")
+                or interval.get("zone_id")
+                or ""
+            ).strip()
+            projected = projected_by_id.get(interval_id)
+            if projected is not None:
+                try:
+                    projected_start = int(projected.get("sample_start_idx"))
+                    projected_end = int(projected.get("sample_end_idx"))
+                except (TypeError, ValueError):
                     continue
-                interval_start_x = process_start_bounds[start_idx_iv]
-                interval_end_x = process_end_bounds[end_idx_iv]
-            
-            # 在SampleData中找x坐标落在区间内的点
-            # 使用半开区间 [start_x, end_x)
-            mask = base_mask & (sample_x_positions >= interval_start_x) & (sample_x_positions < interval_end_x)
+                if projected_end < projected_start:
+                    projected_start, projected_end = projected_end, projected_start
+                safe_start = max(0, projected_start)
+                safe_end = min(len(base_mask) - 1, projected_end)
+                mask = np.zeros(len(base_mask), dtype=bool)
+                if safe_end >= safe_start:
+                    mask[safe_start:safe_end + 1] = True
+                mask &= base_mask
+            else:
+                # 兼容没有权威采样投影的旧数据。
+                display_start_x = interval.get("display_start_x")
+                display_end_x = interval.get("display_end_x")
+                try:
+                    has_display_bounds = (
+                        np.isfinite(display_start_x)
+                        and np.isfinite(display_end_x)
+                        and float(display_end_x) > float(display_start_x)
+                    )
+                except (TypeError, ValueError):
+                    has_display_bounds = False
+                if has_display_bounds:
+                    interval_start_x = float(display_start_x)
+                    interval_end_x = float(display_end_x)
+                else:
+                    if start_idx_iv >= len(process_start_bounds) or end_idx_iv >= len(process_end_bounds):
+                        continue
+                    interval_start_x = process_start_bounds[start_idx_iv]
+                    interval_end_x = process_end_bounds[end_idx_iv]
+
+                # 使用半开区间 [start_x, end_x)。
+                mask = base_mask & (sample_x_positions >= interval_start_x) & (sample_x_positions < interval_end_x)
             if not mask.any():
                 continue
 

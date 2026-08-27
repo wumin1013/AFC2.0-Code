@@ -3,6 +3,28 @@ from __future__ import annotations
 from .shared import *
 
 
+PARENT_WINDOW_WIDTH = 1080
+PARENT_WINDOW_HEIGHT = 630
+PARENT_WINDOW_X = 0
+PARENT_WINDOW_Y = 0
+CHILD_WINDOW_RATIO = 0.9
+MIN_WINDOW_WIDTH = 640
+MIN_WINDOW_HEIGHT = 400
+DATA_UI_FONT_NORMAL = ("Microsoft YaHei UI", 9)
+DATA_UI_FONT_BOLD = ("Microsoft YaHei UI", 9, "bold")
+DATA_UI_FONT_SMALL = ("Microsoft YaHei UI", 8)
+DATA_UI_FONT_HEADING = ("Microsoft YaHei UI", 10, "bold")
+DEFAULT_DATA_PREVIEW_RATIO = 0.68
+RELEASE_UI_BUILD_MARKER = "AFC2.0.2alpha 20260827-v3"
+
+
+def calculate_initial_window_geometry():
+    """沿用实际负载工具相对 Afo 主窗口的上方布局。"""
+    window_width = max(MIN_WINDOW_WIDTH, int(PARENT_WINDOW_WIDTH * CHILD_WINDOW_RATIO))
+    window_height = max(MIN_WINDOW_HEIGHT, int(PARENT_WINDOW_HEIGHT * CHILD_WINDOW_RATIO))
+    return window_width, window_height, PARENT_WINDOW_X, PARENT_WINDOW_Y
+
+
 class BootstrapUiMixin:
     def _report_view_refresh_error(self, context, exc):
         message = f"{context}失败: {str(exc)}"
@@ -42,6 +64,16 @@ class BootstrapUiMixin:
                 pass
         _run()
 
+    def _finish_startup_layout(self):
+        """结束启动抑制后补做一次真实画布布局，避免同步导入吞掉首帧。"""
+        self._startup_layout_pending = False
+        try:
+            self._adapt_data_processing_layout()
+            self._sync_data_controls_preview_ratio()
+            self.adjust_figure_sizes()
+        except Exception as exc:
+            self._report_view_refresh_error("完成启动布局", exc)
+
     def _on_main_notebook_tab_changed(self, _event=None):
         try:
             selected = self.notebook.select()
@@ -60,41 +92,27 @@ class BootstrapUiMixin:
             getattr(self, "enable_profile_config", not self.release_mode)
         )
         self._startup_layout_pending = bool(self.release_mode)
-        self.root.title("🔬 铣削工艺信息分析工具 - 智能分析系统")
+        window_title = (
+            f"🔬 铣削工艺信息分析工具 - {RELEASE_UI_BUILD_MARKER}"
+            if self.release_mode
+            else "🔬 铣削工艺信息分析工具 - 智能分析系统"
+        )
+        self.root.title(window_title)
         
         # 配置科技感主题样式
         self.setup_tech_theme()
         
-        # 获取屏幕尺寸并设置自适应窗口大小
-        screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
-        
-        # 计算合适的窗口大小（屏幕的85%，但不超过最大尺寸，不小于最小尺寸）
-        max_width, max_height = 1600, 1000
-        min_width, min_height = 1000, 700
-        
-        window_width = min(max_width, max(min_width, int(screen_width * 0.85)))
-        window_height = min(max_height, max(min_height, int(screen_height * 0.85)))
-        
-        # 计算居中位置
-        center_x = (screen_width - window_width) // 2
-        center_y = (screen_height - window_height) // 2
-        
-        # 设置窗口大小和位置
-        self.root.geometry(f"{window_width}x{window_height}+{center_x}+{center_y}")
+        # 与旧版实际负载工具一致：占 Afo 主窗口的 90%，沿用左上角位置。
+        window_width, window_height, window_x, window_y = (
+            calculate_initial_window_geometry()
+        )
+        self.root.geometry(f"{window_width}x{window_height}+{window_x}+{window_y}")
         
         # 设置最小窗口大小
-        self.root.minsize(min_width, min_height)
+        self.root.minsize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
         
         # 使窗口可调整大小
         self.root.resizable(True, True)
-        try:
-            self.root.state("zoomed")
-        except Exception:
-            try:
-                self.root.attributes("-zoomed", True)
-            except Exception:
-                self.root.geometry(f"{screen_width}x{screen_height}+0+0")
         
         # 初始化所有变量
         self.input_file_path = tk.StringVar()
@@ -153,7 +171,7 @@ class BootstrapUiMixin:
         )
         self.model_detail_collapsed = tk.BooleanVar(value=True)
         self.model_detail_toggle_text = tk.StringVar(value="展开详情")
-        self._model_detail_widgets = []
+        self._model_detail_frame = None
         self.idle_power_model = None
         self.idle_model_signature = ""
         self.step_feed_model_signature = ""
@@ -360,7 +378,13 @@ class BootstrapUiMixin:
 
         # 创建标签页
         self.notebook = ttk.Notebook(root)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        page_margin = 4 if self.release_mode else 6
+        self.notebook.pack(
+            fill=tk.BOTH,
+            expand=True,
+            padx=page_margin,
+            pady=page_margin,
+        )
         
         # 创建工艺信息分析标签页
         self.data_processing_tab = ttk.Frame(self.notebook)
@@ -390,10 +414,7 @@ class BootstrapUiMixin:
         else:
             # 启动窗口在 withdraw/deiconify/zoomed 之间会连续产生多次 Configure。
             # 分割条初始化已负责首次布局，短暂忽略这些重复尺寸事件。
-            self.root.after(
-                600,
-                lambda: setattr(self, "_startup_layout_pending", False),
-            )
+            self.root.after(600, self._finish_startup_layout)
         # 仅保留工艺信息分析页，无需实际负载页的自适应逻辑
         self.root.after(200, self.auto_load_sample_bundle)
 
@@ -449,11 +470,7 @@ class BootstrapUiMixin:
         canvas_widget.grid(row=0, column=0, sticky="nsew")
         canvas_widget.configure(relief=tk.FLAT, bd=0)
 
-        # 让图表随预览区域变化实时放缩（防抖）
-        try:
-            canvas_widget.bind('<Configure>', self._on_preview_canvas_configure)
-        except Exception:
-            pass
+        self._bind_data_canvas_resize(canvas_widget)
         
         # 为数据处理图表添加鼠标滚轮横向缩放功能
         self.canvas_data.mpl_connect('scroll_event', self.on_data_scroll_zoom)
@@ -500,6 +517,19 @@ class BootstrapUiMixin:
             except Exception:
                 continue
 
+    def _bind_data_canvas_resize(self, canvas_widget):
+        """在不覆盖 Matplotlib 自带 resize 绑定的前提下追加页面重排。"""
+        if canvas_widget is None:
+            return
+        try:
+            canvas_widget.bind(
+                "<Configure>",
+                self._on_preview_canvas_configure,
+                add="+",
+            )
+        except Exception:
+            pass
+
     def _sync_data_controls_preview_ratio(self):
         paned = getattr(self, "_data_paned", None)
         controls = getattr(self, "_data_controls", None)
@@ -512,20 +542,53 @@ class BootstrapUiMixin:
             requested_h = int(controls.winfo_reqheight())
             if total_h <= 10 or requested_h <= 0:
                 return
-            minimum_preview_h = 300
-            if not self.enable_research_features:
-                # 发布版没有机理辨识区，按控件自然高度收拢，避免上半区
-                # 被固定比例撑出大块空白。
-                target_h = max(150, requested_h + 8)
-            else:
-                baseline_ratio = 0.36 if bool(self.model_detail_collapsed.get()) else 0.46
-                baseline_h = int(total_h * baseline_ratio)
-                target_h = max(requested_h + 12, baseline_h, 220)
-            maximum_controls_h = max(total_h - minimum_preview_h, 150)
-            target_h = min(target_h, maximum_controls_h)
-            paned.sashpos(0, target_h)
+            target_h = self._resolve_data_controls_height(total_h, requested_h)
+            if target_h > 0:
+                paned.sashpos(0, target_h)
         except Exception:
             pass
+
+    def _resolve_data_controls_height(self, total_h, requested_h):
+        """为主版和发布版计算同一套默认控件/预览高度预算。"""
+        try:
+            total_h = int(total_h)
+            requested_h = int(requested_h)
+        except (TypeError, ValueError):
+            return 0
+        if total_h <= 10 or requested_h <= 0:
+            return 0
+
+        collapsed_research = bool(
+            self.enable_research_features
+            and self.model_detail_collapsed.get()
+        )
+        compact_default = bool(
+            not self.enable_research_features or collapsed_research
+        )
+        if compact_default:
+            minimum_controls_h = 120
+            natural_h = max(minimum_controls_h, requested_h + 4)
+            majority_limit = max(
+                minimum_controls_h,
+                int(total_h * (1.0 - DEFAULT_DATA_PREVIEW_RATIO)),
+            )
+            if requested_h <= majority_limit:
+                return min(natural_h, majority_limit)
+
+            # 极矮窗口无法同时满足 68% 和控件自然高度时优先防止裁切；
+            # 默认 972x567 布局由折叠整个机理区保证不会进入此分支。
+            maximum_controls_h = max(total_h - 120, minimum_controls_h)
+            return min(natural_h, maximum_controls_h)
+
+        minimum_controls_h = 220
+        minimum_preview_h = 330
+        baseline_h = int(total_h * 0.46)
+        natural_h = max(requested_h + 12, baseline_h, minimum_controls_h)
+        maximum_controls_h = max(
+            total_h - minimum_preview_h,
+            minimum_controls_h,
+        )
+        return min(natural_h, maximum_controls_h)
 
     def _adapt_data_processing_layout(self):
         controls = getattr(self, "_data_controls", None)
@@ -547,7 +610,9 @@ class BootstrapUiMixin:
                 elif total_w >= 1360:
                     detail_width = 370
                 else:
-                    detail_width = 350
+                    # 972px 上方窗口内优先保证左侧单行操作完整可见；
+                    # 运行结果允许换行，不能用固定 310px 挤掉理想功率。
+                    detail_width = 270
             elif total_w >= 1850:
                 detail_width = 510
             elif total_w >= 1600:
@@ -555,11 +620,15 @@ class BootstrapUiMixin:
             elif total_w >= 1360:
                 detail_width = 440
             else:
-                detail_width = 400
+                detail_width = 320
+
+            minimum_left_width = 660 if not self.enable_research_features else 620
+            maximum_detail_width = max(total_w - minimum_left_width, 230)
+            detail_width = max(230, min(detail_width, maximum_detail_width))
             controls.grid_columnconfigure(1, weight=0, minsize=detail_width)
             detail_frame.configure(width=detail_width)
             for label in getattr(self, "interval_overview_labels", ()):
-                label.configure(wraplength=max(detail_width - 30, 280))
+                label.configure(wraplength=max(detail_width - 24, 205))
         except Exception:
             pass
 
@@ -567,7 +636,15 @@ class BootstrapUiMixin:
         collapsed = bool(collapsed)
         self.model_detail_collapsed.set(collapsed)
         self.model_detail_toggle_text.set("展开详情" if collapsed else "收起详情")
-        self._set_grid_widgets_visible(getattr(self, "_model_detail_widgets", []), not collapsed)
+        model_frame = getattr(self, "_model_detail_frame", None)
+        if model_frame is not None:
+            try:
+                if collapsed:
+                    model_frame.grid_remove()
+                else:
+                    model_frame.grid()
+            except Exception:
+                pass
         self.root.after_idle(self._sync_data_controls_preview_ratio)
 
     def _toggle_model_detail_section(self):
@@ -578,41 +655,36 @@ class BootstrapUiMixin:
 
         发布版不调用本方法，从而不实例化辨识或 profile 相关控件。
         """
-        model_frame = ttk.LabelFrame(parent, text="🧠 机理辨识", padding=8, style='Tech.TLabelframe')
-        model_frame.grid(row=row, column=0, sticky="ew", pady=(0, 6))
+        model_frame = ttk.LabelFrame(parent, text="🧠 机理辨识", padding=4, style='Data.TLabelframe')
+        model_frame.grid(row=row, column=0, sticky="ew", pady=(0, 3))
+        self._model_detail_frame = model_frame
         model_frame.grid_columnconfigure(7, weight=1)
         model_frame.grid_columnconfigure(9, weight=1)
 
         model_action_frame = ttk.Frame(model_frame)
-        model_action_frame.grid(row=0, column=0, columnspan=10, sticky="ew", pady=(0, 6))
+        model_action_frame.grid(row=0, column=0, columnspan=10, sticky="ew")
         model_action_frame.grid_columnconfigure(3, weight=1)
 
         self.import_nc_btn = ttk.Button(
             model_action_frame, text="📄 导入G代码NC(可选)", command=self.browse_nc_file,
-            width=16, style='Tech.TButton'
+            width=15, style='Data.TButton'
         )
-        self.import_nc_btn.grid(row=0, column=0, padx=(0, 6), pady=(0, 6), sticky="w")
+        self.import_nc_btn.grid(row=0, column=0, padx=(0, 4), sticky="w")
         self.identify_idle_btn = ttk.Button(
             model_action_frame, text="🌀 辨识空载功率", command=self.identify_no_load_power,
-            width=14, style='Tech.TButton'
+            width=13, style='Data.TButton'
         )
-        self.identify_idle_btn.grid(row=0, column=1, padx=(0, 6), pady=(0, 6), sticky="w")
+        self.identify_idle_btn.grid(row=0, column=1, padx=(0, 4), sticky="w")
         self.identify_model_btn = ttk.Button(
             model_action_frame, text="🔁 重新辨识", command=self.identify_model_parameters,
-            width=13, style='Tech.TButton'
+            width=12, style='Data.TButton'
         )
-        self.identify_model_btn.grid(row=0, column=2, padx=(0, 6), pady=(0, 6), sticky="w")
+        self.identify_model_btn.grid(row=0, column=2, padx=(0, 4), sticky="w")
         self.identify_model_btn.bind(
             "<ButtonPress-1>",
             lambda _event: self._arm_model_param_commit_refresh_suppression(duration_seconds=1.2),
             add="+",
         )
-        self.model_detail_toggle_btn = ttk.Button(
-            model_action_frame, textvariable=self.model_detail_toggle_text,
-            command=self._toggle_model_detail_section, width=10, style='Secondary.TButton'
-        )
-        self.model_detail_toggle_btn.grid(row=0, column=4, padx=(6, 0), pady=(0, 6), sticky="e")
-
         model_option_frame = ttk.Frame(model_frame)
         model_option_frame.grid(row=1, column=0, columnspan=10, sticky="ew", pady=(0, 4))
         model_option_frame.grid_columnconfigure(2, weight=1)
@@ -704,13 +776,6 @@ class BootstrapUiMixin:
             font=UI_FONT_SMALL, foreground=UI_COLOR_TEXT_MUTED
         )
         self.kc_profile_status_label.grid(row=7, column=0, columnspan=10, sticky="w", pady=(2, 0))
-        self._model_detail_widgets = [
-            self.model_detail_hint_label, self.sigma_idle_label, self.sigma_idle_entry,
-            self.delta_mrr_label, self.delta_mrr_entry, self.steady_gate_status_label,
-            self.gcode_status_label, self.no_load_status_label, self.step_feed_status_label,
-            self.kc_profile_status_label,
-        ]
-
         self.idle_curve_frame = ttk.LabelFrame(
             model_frame, text="P_idle-S 图", padding=(6, 4), style='Tech.TLabelframe'
         )
@@ -738,11 +803,11 @@ class BootstrapUiMixin:
         """创建图形工具栏中样式一致的勾选项。"""
         button = tk.Checkbutton(
             parent, text=text, variable=variable, command=command,
-            font=UI_FONT_SMALL, bg=UI_COLOR_BG_LIGHT, fg=UI_COLOR_TEXT,
+            font=DATA_UI_FONT_SMALL, bg=UI_COLOR_BG_LIGHT, fg=UI_COLOR_TEXT,
             activebackground=UI_COLOR_BG_LIGHT, activeforeground=UI_COLOR_PRIMARY,
             selectcolor="white", relief=tk.FLAT, bd=0, highlightthickness=0, anchor="w",
         )
-        button.grid(row=row, column=column, sticky="e", padx=(6, 0), pady=1)
+        button.grid(row=row, column=column, sticky="e", padx=(4, 0), pady=0)
         return button
 
     def create_data_processing_tab(self):
@@ -755,7 +820,7 @@ class BootstrapUiMixin:
 
         # 上下可调分区（上：控件区；下：图表预览）
         paned = ttk.PanedWindow(self.data_processing_tab, orient=tk.VERTICAL)
-        paned.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        paned.grid(row=0, column=0, sticky="nsew", padx=6, pady=4)
         self._data_paned = paned
 
         controls = ttk.Frame(paned)
@@ -767,32 +832,37 @@ class BootstrapUiMixin:
 
         # ===== 控件区布局 =====
         controls.grid_columnconfigure(0, weight=1)  # 左侧控件区自适应
-        controls.grid_columnconfigure(1, weight=0, minsize=340)
+        controls.grid_columnconfigure(1, weight=0, minsize=300)
 
         # ===== 左侧主控件区 =====
         left_frame = ttk.Frame(controls)
         left_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
         left_frame.grid_columnconfigure(0, weight=1)
+        self._data_left_frame = left_frame
 
         # ===== 第一行：当前程序 =====
-        program_frame = ttk.LabelFrame(left_frame, text="📊 当前程序", padding=8, style='Tech.TLabelframe')
-        program_frame.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        program_frame = ttk.LabelFrame(left_frame, text="📊 当前程序", padding=4, style='Data.TLabelframe')
+        program_frame.grid(row=0, column=0, sticky="ew", pady=(0, 3))
         program_frame.grid_columnconfigure(1, weight=1)
         program_frame.grid_columnconfigure(3, weight=1)
         program_frame.grid_columnconfigure(5, weight=1)
 
         # 程序名
-        ttk.Label(program_frame, text="程序名:", font=UI_FONT_NORMAL).grid(row=0, column=0, sticky="w", padx=(0, 4))
+        ttk.Label(program_frame, text="程序名:", font=DATA_UI_FONT_NORMAL).grid(row=0, column=0, sticky="w", padx=(0, 3))
+        program_combo_width = 15 if self.enable_research_features else 20
         self.sample_program_combo = ttk.Combobox(program_frame, textvariable=self.sample_program_name,
-                                                 state="readonly", width=20, font=UI_FONT_NORMAL)
-        self.sample_program_combo.grid(row=0, column=1, padx=(0, 16), sticky="w")
+                                                 state="readonly", width=program_combo_width, font=DATA_UI_FONT_NORMAL,
+                                                 style='Data.TCombobox')
+        self.sample_program_combo.grid(row=0, column=1, padx=(0, 10), sticky="w")
         self.sample_program_combo.bind("<<ComboboxSelected>>", self.on_sample_program_selected)
 
         # 刀具号
-        ttk.Label(program_frame, text="刀具号:", font=UI_FONT_NORMAL).grid(row=0, column=2, sticky="w", padx=(0, 4))
+        ttk.Label(program_frame, text="刀具号:", font=DATA_UI_FONT_NORMAL).grid(row=0, column=2, sticky="w", padx=(0, 3))
+        tool_combo_width = 12 if self.enable_research_features else 16
         self.sample_tool_combo = ttk.Combobox(program_frame, textvariable=self.sample_tool_name,
-                                              state="readonly", width=16, font=UI_FONT_NORMAL)
-        self.sample_tool_combo.grid(row=0, column=3, padx=(0, 16), sticky="w")
+                                              state="readonly", width=tool_combo_width, font=DATA_UI_FONT_NORMAL,
+                                              style='Data.TCombobox')
+        self.sample_tool_combo.grid(row=0, column=3, padx=(0, 10), sticky="w")
         self.sample_tool_combo.bind("<<ComboboxSelected>>", self.on_sample_selection_change)
 
         self.sample_source_buttons = []
@@ -800,12 +870,12 @@ class BootstrapUiMixin:
         if self.enable_research_features:
             self.import_sample_btn = ttk.Button(
                 program_frame, text="📦 导入SampleData", command=self.browse_sample_bundle,
-                width=15, style='Tech.TButton'
+                width=13, style='Data.TButton'
             )
             self.import_sample_btn.grid(row=0, column=4, padx=(12, 6), sticky="w")
             self.import_experiment_btn = ttk.Button(
                 program_frame, text="📡 导入实验实测", command=self.browse_experiment_measurement_file,
-                width=15, style='Tech.TButton'
+                width=13, style='Data.TButton'
             )
             self.import_experiment_btn.grid(row=0, column=5, sticky="w")
 
@@ -814,76 +884,97 @@ class BootstrapUiMixin:
             self._create_research_model_controls(left_frame, row=next_left_row)
             next_left_row += 1
         # ===== 第三行：平均功率信息（无框头） =====
-        power_frame = ttk.Frame(left_frame, padding=(8, 4))
-        power_frame.grid(row=next_left_row, column=0, sticky="ew", pady=(0, 6))
+        power_frame = ttk.Frame(left_frame, padding=(4, 2))
+        power_frame.grid(row=next_left_row, column=0, sticky="ew", pady=(0, 2))
         next_left_row += 1
 
         # 平均功率显示
-        ttk.Label(power_frame, text="⚡ 平均功率:", font=UI_FONT_BOLD, foreground=UI_COLOR_PRIMARY).pack(
+        ttk.Label(power_frame, text="⚡ 平均功率:", font=DATA_UI_FONT_BOLD, foreground=UI_COLOR_PRIMARY).pack(
             side=tk.LEFT, padx=(0, 4))
         self.sample_avg_label = ttk.Label(power_frame, textvariable=self.sample_avg_var, 
-                                          font=UI_FONT_BOLD, foreground="#0066CC")
-        self.sample_avg_label.pack(side=tk.LEFT, padx=(0, 24))
+                                          font=DATA_UI_FONT_BOLD, foreground="#0066CC")
+        self.sample_avg_label.pack(side=tk.LEFT, padx=(0, 12))
 
         # 优化倍率滑块
-        ttk.Label(power_frame, text="⚙ 优化倍率:", font=UI_FONT_BOLD, foreground=UI_COLOR_PRIMARY).pack(
+        ttk.Label(power_frame, text="⚙ 优化倍率:", font=DATA_UI_FONT_BOLD, foreground=UI_COLOR_PRIMARY).pack(
             side=tk.LEFT, padx=(0, 4))
         rg_frame = ttk.Frame(power_frame)
         rg_frame.pack(side=tk.LEFT, padx=(0, 8))
         self.adjustment_ratio_scale = tk.Scale(
             rg_frame, from_=0.1, to=5.0, resolution=0.05, orient=tk.HORIZONTAL,
-            variable=self.adjustment_ratio, length=140, showvalue=0,
+            variable=self.adjustment_ratio, length=88, showvalue=0,
             bg='white', troughcolor='#D6EAF8', highlightthickness=0,
             command=self._on_ratio_scale_change  # 使用 command 替代 trace_add 精确控制更新
         )
         self.adjustment_ratio_scale.pack(side=tk.LEFT)
         self.adjustment_ratio_scale.bind("<ButtonPress-1>", self._on_ratio_press)
         self.adjustment_ratio_scale.bind("<ButtonRelease-1>", self._on_ratio_release)
-        self.rg_entry = ttk.Entry(rg_frame, textvariable=self.adjustment_ratio_display, width=6, font=UI_FONT_NORMAL)
-        self.rg_entry.pack(side=tk.LEFT, padx=(6, 0))
+        self.rg_entry = ttk.Entry(rg_frame, textvariable=self.adjustment_ratio_display, width=5, font=DATA_UI_FONT_NORMAL)
+        self.rg_entry.pack(side=tk.LEFT, padx=(4, 0))
         self.rg_entry.bind("<Return>", self._on_rg_entry_commit)
         self.rg_entry.bind("<FocusOut>", self._on_rg_entry_commit)
 
         # 理想功率显示（紧贴优化倍率）
-        ttk.Label(power_frame, text="🎯 理想功率:", font=UI_FONT_BOLD, foreground=UI_COLOR_PRIMARY).pack(
-            side=tk.LEFT, padx=(8, 4))
+        ttk.Label(power_frame, text="🎯 理想功率:", font=DATA_UI_FONT_BOLD, foreground=UI_COLOR_PRIMARY).pack(
+            side=tk.LEFT, padx=(4, 3))
         self.sample_ideal_label = ttk.Label(power_frame, textvariable=self.sample_ideal_var,
-                                            font=UI_FONT_BOLD, foreground="#E67300")
+                                            font=DATA_UI_FONT_BOLD, foreground="#E67300")
         self.sample_ideal_label.pack(side=tk.LEFT)
 
         # 独立主操作栏：分类在导入工艺信息后自动执行，不再提供手动划分入口。
-        action_frame = ttk.Frame(left_frame, padding=(8, 6))
-        action_frame.grid(row=next_left_row, column=0, sticky="ew", pady=(0, 6))
-        action_frame.grid_columnconfigure(2, weight=1)
+        action_frame = ttk.Frame(left_frame, padding=(4, 2))
+        action_frame.grid(row=next_left_row, column=0, sticky="ew", pady=(0, 2))
+        action_spacer_column = 3 if self.enable_research_features else 2
+        action_frame.grid_columnconfigure(action_spacer_column, weight=1)
+        process_button_width = 16 if self.enable_research_features else 18
+        action_padding = 4 if self.enable_research_features else 8
         self.choose_process_btn = ttk.Button(
             action_frame, text="📂 导入工艺信息文件",
             command=self.choose_process_file_for_current_program,
-            width=20, style='Orange.TButton'
+            width=process_button_width, style='DataOrange.TButton'
         )
-        self.choose_process_btn.grid(row=0, column=0, padx=(0, 8), sticky="w")
+        self.choose_process_btn.grid(
+            row=0, column=0, padx=(0, action_padding), sticky="w"
+        )
         self.export_i_code_btn = ttk.Button(
             action_frame, text="💾 保存结果", command=self.save_interval_info,
-            width=12, style='Orange.TButton', state="disabled"
+            width=10, style='DataOrange.TButton', state="disabled"
         )
-        self.export_i_code_btn.grid(row=0, column=1, padx=(0, 12), sticky="w")
-        ttk.Label(action_frame, text="横轴:", font=UI_FONT_SMALL).grid(
-            row=0, column=3, padx=(8, 6), sticky="e"
+        self.export_i_code_btn.grid(
+            row=0, column=1,
+            padx=(0, 4 if self.enable_research_features else 12),
+            sticky="w",
+        )
+        if self.enable_research_features:
+            self.model_detail_toggle_btn = ttk.Button(
+                action_frame,
+                textvariable=self.model_detail_toggle_text,
+                command=self._toggle_model_detail_section,
+                width=8,
+                style='Data.TButton',
+            )
+            self.model_detail_toggle_btn.grid(
+                row=0, column=2, padx=(0, 4), sticky="w"
+            )
+        axis_label_column = 4 if self.enable_research_features else 3
+        ttk.Label(action_frame, text="横轴:", font=DATA_UI_FONT_SMALL).grid(
+            row=0, column=axis_label_column, padx=(5, 3), sticky="e"
         )
         ttk.Radiobutton(
             action_frame, text="时域+指令域", variable=self.process_axis_mode, value="时域+指令域",
-            command=self.on_sample_selection_change, style='Tech.TRadiobutton'
-        ).grid(row=0, column=4, padx=(0, 4), sticky="e")
+            command=self.on_sample_selection_change, style='Data.TRadiobutton'
+        ).grid(row=0, column=axis_label_column + 1, padx=(0, 4), sticky="e")
         ttk.Radiobutton(
-            action_frame, text="行程域+指令域", variable=self.process_axis_mode, value="行程域+指令域",
-            command=self.on_sample_selection_change, style='Tech.TRadiobutton'
-        ).grid(row=0, column=5, sticky="e")
+            action_frame, text="行程+指令域", variable=self.process_axis_mode, value="行程域+指令域",
+            command=self.on_sample_selection_change, style='Data.TRadiobutton'
+        ).grid(row=0, column=axis_label_column + 2, sticky="e")
         # ===== 右侧：只读运行结果 =====
         detail_title = "✅ 运行结果" if self.release_mode else "📌 区间划分详情"
         ideal_frame = ttk.LabelFrame(
-            controls, text=detail_title, padding=10, style='Tech.TLabelframe'
+            controls, text=detail_title, padding=6, style='Data.TLabelframe'
         )
         ideal_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
-        ideal_frame.configure(width=470)
+        ideal_frame.configure(width=310)
         ideal_frame.grid_columnconfigure(0, weight=1)
         self.ideal_detail_frame = ideal_frame
 
@@ -893,26 +984,20 @@ class BootstrapUiMixin:
                 self.interval_overview_mapping_var,
                 self.inverse_prediction_status_var,
             ]
-            first_overview_row = 0
         else:
-            ttk.Label(
-                ideal_frame, text="区间划分概况", font=UI_FONT_BOLD,
-                foreground=UI_COLOR_PRIMARY
-            ).grid(row=0, column=0, sticky="w", pady=(0, 8))
             overview_rows = [
                 self.interval_overview_success_var,
                 self.interval_overview_total_var,
                 self.interval_overview_counts_var,
                 self.interval_overview_mapping_var,
             ]
-            first_overview_row = 1
         self.interval_overview_labels = []
-        for row_index, variable in enumerate(overview_rows, start=first_overview_row):
+        for row_index, variable in enumerate(overview_rows):
             label = ttk.Label(
-                ideal_frame, textvariable=variable, font=UI_FONT_NORMAL,
-                foreground=UI_COLOR_TEXT, justify=tk.LEFT, wraplength=370,
+                ideal_frame, textvariable=variable, font=DATA_UI_FONT_NORMAL,
+                foreground=UI_COLOR_TEXT, justify=tk.LEFT, wraplength=286,
             )
-            label.grid(row=row_index, column=0, sticky="w", pady=(0, 5))
+            label.grid(row=row_index, column=0, sticky="w", pady=(0, 1))
             self.interval_overview_labels.append(label)
         self._refresh_ideal_tree()
         # 收集控件引用
@@ -928,31 +1013,31 @@ class BootstrapUiMixin:
 
         # ===== 预览区 =====
         preview.grid_columnconfigure(0, weight=1)
-        preview.grid_rowconfigure(1, weight=1)
-
-        nav_frame = ttk.Frame(preview)
-        nav_frame.grid(row=0, column=0, sticky="ew", pady=(0, 2))
-        nav_frame.grid_columnconfigure(0, weight=1)
-
-        self.figure_label = ttk.Label(nav_frame, text="", font=UI_FONT_LARGE, foreground=UI_COLOR_PRIMARY)
-        self.figure_label.grid(row=0, column=0, sticky="w")
+        preview.grid_rowconfigure(0, weight=1)
 
         self.data_figure_frame = ttk.LabelFrame(
             preview,
             text="📈 图形显示（滚轮：横向缩放；Ctrl+滚轮：纵向缩放）",
-            padding=4,
-            style='Tech.TLabelframe',
+            padding=2,
+            style='Data.TLabelframe',
         )
-        self.data_figure_frame.grid(row=1, column=0, sticky="nsew")
+        self.data_figure_frame.grid(row=0, column=0, sticky="nsew")
         self.data_figure_frame.grid_rowconfigure(1, weight=1)
         self.data_figure_frame.grid_columnconfigure(0, weight=1)
         self.data_figure_frame.bind("<Configure>", self._on_preview_canvas_configure)
 
         # 图形选项常驻右上角；实际负载固定显示，不提供主曲线开关。
         self.data_plot_toolbar = tk.Frame(self.data_figure_frame, bg=UI_COLOR_BG_LIGHT, bd=0)
-        self.data_plot_toolbar.grid(row=0, column=0, sticky="ew", padx=(4, 6), pady=(0, 3))
+        self.data_plot_toolbar.grid(row=0, column=0, sticky="ew", padx=(3, 4), pady=0)
         self.data_plot_toolbar.grid_columnconfigure(0, weight=1)
-        ttk.Label(self.data_plot_toolbar, text="显示:", font=UI_FONT_SMALL).grid(
+        self.figure_label = ttk.Label(
+            self.data_plot_toolbar,
+            text="",
+            font=DATA_UI_FONT_HEADING,
+            foreground=UI_COLOR_PRIMARY,
+        )
+        self.figure_label.grid(row=0, column=0, sticky="w")
+        ttk.Label(self.data_plot_toolbar, text="显示:", font=DATA_UI_FONT_SMALL).grid(
             row=0, column=1, sticky="e", padx=(0, 2)
         )
         toolbar_column = 2
@@ -1027,7 +1112,7 @@ class BootstrapUiMixin:
             self.status_var_data = tk.StringVar(value=default_status)
         self.sample_auto_status_var = self.status_var_data
         status_bar = ttk.Label(self.data_processing_tab, textvariable=self.status_var_data, relief=tk.SUNKEN, anchor=tk.W, background='#E8F4FD')
-        status_bar.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 6))
+        status_bar.grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 3))
 
         # 初始化分割条位置
         def _init_sash():
@@ -1036,12 +1121,9 @@ class BootstrapUiMixin:
                 if total_h <= 10:
                     return
                 requested_h = int(controls.winfo_reqheight()) if controls.winfo_reqheight() > 0 else 0
-                if not self.enable_research_features:
-                    ctrl_h = max(150, requested_h + 8)
-                else:
-                    ctrl_h = max(requested_h + 12, int(total_h * 0.36), 220)
-                ctrl_h = min(ctrl_h, max(total_h - 300, 150))
-                paned.sashpos(0, ctrl_h)
+                ctrl_h = self._resolve_data_controls_height(total_h, requested_h)
+                if ctrl_h > 0:
+                    paned.sashpos(0, ctrl_h)
 
                 def _finish_initial_layout():
                     self._sync_data_controls_preview_ratio()
@@ -1260,6 +1342,96 @@ class BootstrapUiMixin:
         style.map('Tech.TRadiobutton',
                  background=[('active', '#E8F4FD')],
                  foreground=[('selected', UI_COLOR_PRIMARY), ('active', UI_COLOR_PRIMARY)])
+
+        # 主数据页使用独立紧凑样式。旧全局样式为全屏设计，11pt 字号与
+        # (16, 8) 按钮内边距在 972×567 窗口中会直接挤掉右侧控件。
+        style.configure(
+            'Data.TButton',
+            background=btn_base,
+            foreground='white',
+            font=DATA_UI_FONT_BOLD,
+            borderwidth=1,
+            relief='solid',
+            bordercolor=btn_base,
+            focuscolor=btn_base,
+            padding=(8, 3),
+        )
+        style.map(
+            'Data.TButton',
+            background=[
+                ('active', btn_active),
+                ('pressed', btn_pressed),
+                ('disabled', btn_disabled),
+            ],
+            foreground=[
+                ('active', 'white'),
+                ('pressed', 'white'),
+                ('disabled', '#CCCCCC'),
+            ],
+            bordercolor=[('!disabled', btn_base)],
+        )
+        style.configure(
+            'DataOrange.TButton',
+            background=btn_orange,
+            foreground='white',
+            font=DATA_UI_FONT_BOLD,
+            borderwidth=1,
+            relief='solid',
+            bordercolor=btn_orange,
+            focuscolor=btn_orange,
+            padding=(8, 3),
+        )
+        style.map(
+            'DataOrange.TButton',
+            background=[
+                ('active', btn_orange_active),
+                ('pressed', btn_orange_pressed),
+                ('disabled', '#FDBA74'),
+            ],
+            foreground=[
+                ('active', 'white'),
+                ('pressed', 'white'),
+                ('disabled', '#CCCCCC'),
+            ],
+            bordercolor=[('!disabled', btn_orange)],
+        )
+        style.configure(
+            'Data.TLabelframe',
+            background=UI_COLOR_BG_LIGHT,
+            foreground=UI_COLOR_TEXT,
+            borderwidth=1,
+            relief='solid',
+            bordercolor=UI_COLOR_BORDER,
+        )
+        style.configure(
+            'Data.TLabelframe.Label',
+            background=UI_COLOR_BG_LIGHT,
+            foreground=UI_COLOR_PRIMARY,
+            font=DATA_UI_FONT_BOLD,
+        )
+        style.configure(
+            'Data.TRadiobutton',
+            background=UI_COLOR_BG_LIGHT,
+            foreground=UI_COLOR_TEXT,
+            font=DATA_UI_FONT_SMALL,
+            indicatormargin=2,
+            padding=(1, 0),
+        )
+        style.map(
+            'Data.TRadiobutton',
+            background=[('active', '#E8F4FD')],
+            foreground=[
+                ('selected', UI_COLOR_PRIMARY),
+                ('active', UI_COLOR_PRIMARY),
+            ],
+        )
+        style.configure(
+            'Data.TCombobox',
+            font=DATA_UI_FONT_NORMAL,
+            padding=2,
+            fieldbackground='white',
+            background=UI_COLOR_BG_LIGHT,
+        )
         
         # 复选框样式 - 科技蓝
         style.configure('Tech.TCheckbutton',
@@ -1621,24 +1793,218 @@ class BootstrapUiMixin:
         self._sync_data_controls_preview_ratio()
         self.adjust_figure_sizes()
 
+    def _apply_data_figure_typography(self, fig, canvas_height_px):
+        """按图表实际高度缩放文字；紧凑窗口隐藏与界面标题重复的图内标题。"""
+        if fig is None:
+            return
+        try:
+            height_px = int(canvas_height_px)
+        except Exception:
+            height_px = 0
+
+        compact = 0 < height_px < 390
+        fig._data_compact_typography = compact
+        if compact:
+            title_size, label_size, tick_size, legend_size = 9, 8, 7, 7
+        elif 0 < height_px < 520:
+            title_size, label_size, tick_size, legend_size = 11, 9, 8, 8
+        else:
+            title_size = PLOT_FONT_BASE + 1
+            label_size = PLOT_FONT_BASE
+            tick_size = max(PLOT_FONT_BASE - 1, 8)
+            legend_size = max(PLOT_FONT_BASE - 1, 8)
+
+        axes = list(getattr(fig, "axes", []) or [])
+        for axis_index, axis in enumerate(axes):
+            try:
+                axis.title.set_fontsize(title_size)
+                # 页面工具栏已显示当前图名，嵌入图内不再重复标题。
+                if axis_index == 0:
+                    axis.title.set_visible(False)
+                axis.xaxis.label.set_fontsize(label_size)
+                axis.yaxis.label.set_fontsize(label_size)
+                axis.tick_params(axis="both", labelsize=tick_size, pad=2)
+                legend = axis.get_legend()
+                if legend is not None:
+                    for text_item in legend.get_texts():
+                        text_item.set_fontsize(legend_size)
+                    try:
+                        legend.set_in_layout(False)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            for child_axis in list(getattr(axis, "child_axes", []) or []):
+                try:
+                    child_axis.xaxis.label.set_fontsize(label_size)
+                    child_axis.yaxis.label.set_fontsize(label_size)
+                    child_axis.tick_params(axis="both", labelsize=tick_size, pad=2)
+                except Exception:
+                    pass
+
+    def _fit_data_figure_text_bounds(self, fig, padding_px=2.0):
+        """按最终文字包围框补足边距，不输出额外可见帧。"""
+        if fig is None:
+            return False
+
+        boundary_artists = []
+
+        def _append_visible_text(artist):
+            if artist is None or not bool(getattr(artist, "get_visible", lambda: False)()):
+                return
+            try:
+                if not str(artist.get_text() or "").strip():
+                    return
+            except Exception:
+                return
+            boundary_artists.append(artist)
+
+        for axis in list(getattr(fig, "axes", []) or []):
+            _append_visible_text(getattr(getattr(axis, "xaxis", None), "label", None))
+            top_axis = getattr(axis, "_time_line_top_axis", None)
+            if top_axis is None:
+                continue
+            _append_visible_text(
+                getattr(getattr(top_axis, "xaxis", None), "label", None)
+            )
+            for tick_label in list(top_axis.get_xticklabels() or []):
+                _append_visible_text(tick_label)
+
+        if not boundary_artists:
+            return False
+
+        draw_without_rendering = getattr(fig, "draw_without_rendering", None)
+        if not callable(draw_without_rendering):
+            return False
+        try:
+            draw_without_rendering()
+            renderer = fig.canvas.get_renderer()
+        except Exception:
+            return False
+
+        artist_bounds = []
+        for artist in boundary_artists:
+            try:
+                bounds = artist.get_window_extent(renderer)
+                coordinates = np.asarray(
+                    [bounds.x0, bounds.y0, bounds.x1, bounds.y1],
+                    dtype=float,
+                )
+            except Exception:
+                continue
+            if np.all(np.isfinite(coordinates)):
+                artist_bounds.append(coordinates)
+
+        if not artist_bounds:
+            return False
+
+        figure_bounds = fig.bbox
+        combined = np.vstack(artist_bounds)
+        raw_overflow = np.asarray(
+            [
+                float(figure_bounds.x0) - float(np.min(combined[:, 0])),
+                float(np.max(combined[:, 2])) - float(figure_bounds.x1),
+                float(figure_bounds.y0) - float(np.min(combined[:, 1])),
+                float(np.max(combined[:, 3])) - float(figure_bounds.y1),
+            ],
+            dtype=float,
+        )
+        raw_overflow = np.maximum(raw_overflow, 0.0)
+        if not np.any(raw_overflow > 0.0):
+            return False
+
+        try:
+            padding = max(0.0, float(padding_px))
+        except (TypeError, ValueError):
+            padding = 2.0
+        correction_px = np.where(
+            raw_overflow > 0.0,
+            raw_overflow + padding,
+            0.0,
+        )
+
+        figure_width = float(figure_bounds.width)
+        figure_height = float(figure_bounds.height)
+        if figure_width <= 0.0 or figure_height <= 0.0:
+            return False
+
+        subplotpars = fig.subplotpars
+        left = float(subplotpars.left)
+        right = float(subplotpars.right)
+        bottom = float(subplotpars.bottom)
+        top = float(subplotpars.top)
+        horizontal_correction = correction_px[:2] / figure_width
+        vertical_correction = correction_px[2:] / figure_height
+
+        minimum_width = 0.20
+        available_width = max(0.0, right - left - minimum_width)
+        requested_width = float(np.sum(horizontal_correction))
+        if requested_width > available_width and requested_width > 0.0:
+            horizontal_correction *= available_width / requested_width
+
+        minimum_height = 0.25
+        available_height = max(0.0, top - bottom - minimum_height)
+        requested_height = float(np.sum(vertical_correction))
+        if requested_height > available_height and requested_height > 0.0:
+            vertical_correction *= available_height / requested_height
+
+        fig.subplots_adjust(
+            left=left + float(horizontal_correction[0]),
+            right=right - float(horizontal_correction[1]),
+            bottom=bottom + float(vertical_correction[0]),
+            top=top - float(vertical_correction[1]),
+        )
+        return True
+
+    def _layout_data_figure_for_viewport(self, fig, width_px, height_px):
+        """按真实画布一次完成尺寸、字体、副轴与边距布局。"""
+        if fig is None:
+            return False
+        try:
+            width_px = int(width_px)
+            height_px = int(height_px)
+        except (TypeError, ValueError):
+            return False
+        if width_px < 50 or height_px < 50:
+            return False
+
+        try:
+            dpi = float(fig.get_dpi()) if fig.get_dpi() else 100.0
+        except Exception:
+            dpi = 100.0
+        fig.set_size_inches(width_px / dpi, height_px / dpi, forward=True)
+        self._apply_data_figure_typography(fig, height_px)
+
+        overlay_layout = getattr(fig, "_optional_overlay_layout", None)
+        layout_applier = getattr(self, "_apply_optional_overlay_layout", None)
+        if isinstance(overlay_layout, dict) and callable(layout_applier):
+            layout_applier(
+                fig,
+                overlay_layout.get("overlay_count", 0),
+            )
+        else:
+            try:
+                fig.tight_layout(pad=0.6)
+            except Exception:
+                pass
+
+        line_axis_refresher = getattr(
+            self,
+            "on_time_line_axis_xlim_changed",
+            None,
+        )
+        if callable(line_axis_refresher):
+            for axis in list(getattr(fig, "axes", []) or []):
+                if getattr(axis, "_time_line_top_axis", None) is None:
+                    continue
+                line_axis_refresher(axis)
+        BootstrapUiMixin._fit_data_figure_text_bounds(self, fig)
+        return True
+
     def adjust_figure_sizes(self):
         """根据当前窗口大小调整图表大小 - 让图表随容器实时放缩、尽量铺满"""
         try:
-            def _apply_responsive_layout(fig, pad=0.6):
-                overlay_layout = getattr(fig, "_optional_overlay_layout", None)
-                layout_applier = getattr(
-                    self,
-                    "_apply_optional_overlay_layout",
-                    None,
-                )
-                if isinstance(overlay_layout, dict) and callable(layout_applier):
-                    layout_applier(
-                        fig,
-                        overlay_layout.get("overlay_count", 0),
-                    )
-                    return
-                fig.tight_layout(pad=pad)
-
             def _resize_figure_by_canvas(fig_attr, canvas_attr, pad_px=0, apply_tight_layout=True):
                 if not hasattr(self, fig_attr) or not hasattr(self, canvas_attr):
                     return
@@ -1656,16 +2022,21 @@ class BootstrapUiMixin:
                     return
                 width_px = max(10, int(width_px) - int(pad_px))
                 height_px = max(10, int(height_px) - int(pad_px))
-                try:
-                    dpi = float(fig.get_dpi()) if fig.get_dpi() else 100.0
-                except Exception:
-                    dpi = 100.0
-                fig.set_size_inches(width_px / dpi, height_px / dpi, forward=True)
                 if apply_tight_layout:
                     try:
-                        _apply_responsive_layout(fig)
+                        self._layout_data_figure_for_viewport(
+                            fig,
+                            width_px,
+                            height_px,
+                        )
                     except Exception:
                         pass
+                else:
+                    try:
+                        dpi = float(fig.get_dpi()) if fig.get_dpi() else 100.0
+                    except Exception:
+                        dpi = 100.0
+                    fig.set_size_inches(width_px / dpi, height_px / dpi, forward=True)
                 canvas.draw_idle()
 
             # 优先用当前图表canvas的实际像素尺寸（比LabelFrame更准）
@@ -1692,13 +2063,11 @@ class BootstrapUiMixin:
                 if hasattr(self, 'figures') and self.figures:
                     for fig in self.figures:
                         try:
-                            dpi = float(fig.get_dpi()) if fig.get_dpi() else 100.0
-                        except Exception:
-                            dpi = 100.0
-                        fig.set_size_inches(w_px / dpi, h_px / dpi, forward=True)
-                        # tight_layout 的 pad 过大会显得“没铺满”
-                        try:
-                            _apply_responsive_layout(fig)
+                            self._layout_data_figure_for_viewport(
+                                fig,
+                                w_px,
+                                h_px,
+                            )
                         except Exception:
                             pass
 

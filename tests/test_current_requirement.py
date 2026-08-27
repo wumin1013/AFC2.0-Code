@@ -181,7 +181,7 @@ class _SequenceProjectionHarness(AcademicWorkbenchMixin):
         return mask
 
 
-class _QuantizedProjectionHarness(AcademicWorkbenchMixin):
+class _QuantizedProjectionHarness(AcademicWorkbenchMixin, PlotSupportMixin):
     """模拟短过程区间落在两个实际采样点之间的精确行号映射。"""
 
     def __init__(self):
@@ -267,6 +267,47 @@ class _SizedCanvasStub(_CanvasStub):
 
     def get_tk_widget(self):
         return self.widget
+
+
+class _PanedHeightStub:
+    def __init__(self, height):
+        self.height = int(height)
+        self.sash_height = None
+
+    def update_idletasks(self):
+        return None
+
+    def winfo_height(self):
+        return self.height
+
+    def sashpos(self, _index, value):
+        self.sash_height = int(value)
+
+
+class _RequestedHeightStub:
+    def __init__(self, requested_height):
+        self.requested_height = int(requested_height)
+
+    def winfo_reqheight(self):
+        return self.requested_height
+
+
+class _GridVisibilityStub:
+    def __init__(self):
+        self.remove_count = 0
+        self.restore_count = 0
+
+    def grid_remove(self):
+        self.remove_count += 1
+
+    def grid(self):
+        self.restore_count += 1
+
+
+class _ImmediateIdleRoot:
+    def after_idle(self, callback):
+        callback()
+        return None
 
 
 class _SampleSelectionHarness(SampleManagerMixin):
@@ -462,6 +503,120 @@ def _fill_heights_at_x(collections, x_values) -> np.ndarray:
 
 
 class CurrentRequirementRegressionTests(unittest.TestCase):
+    def test_experiment_channel_parser_batch_reads_only_required_columns(self):
+        payload = "\n".join((
+            "<Scope>",
+            "<ChannelInfo>,<True>,<5>,<实际速度>,<5>,<SP轴>",
+            "<ChannelInfo>,<True>,<5>,<G寄存器>,<5>,<X轴>,<432>",
+            "<ChannelInfo>,<True>,<5>,<实际速度>,<5>,<X轴>",
+            "<ChannelInfo>,<True>,<5>,<实际速度>,<5>,<Y轴>",
+            "<ChannelInfo>,<True>,<5>,<实际速度>,<5>,<Z轴>",
+            "<ChannelInfo>,<True>,<5>,<程序行号>,<5>,<AX>",
+            "<ChannelData>,1,2,",
+            "<ChannelData>,1000,-25,3,4,,10,",
+            "<ChannelData>,<2000>,<6>,<0>,<5>,<12>,<11>,",
+            "<ChannelData>,3000,7,1,2,2,bad,",
+            "<OtherRecord>,4000,8,6,8,0,12,",
+        ))
+        parser = ProcessingCoreMixin()
+        parser.detect_file_encoding = lambda _path: "utf-8"
+
+        with TemporaryDirectory() as temp_dir:
+            data_path = Path(temp_dir) / "measurement.csv"
+            data_path.write_text(payload, encoding="utf-8")
+            with patch(
+                "project.processing_core.pd.read_csv",
+                wraps=pd.read_csv,
+            ) as batch_reader:
+                result = parser.parse_channel_data_file(data_path)
+
+        self.assertEqual(1, batch_reader.call_count)
+        read_options = batch_reader.call_args.kwargs
+        self.assertEqual("c", read_options["engine"])
+        self.assertEqual([0, 1, 2, 3, 4, 5, 6], read_options["usecols"])
+        self.assertEqual(2, result["sample_count"])
+        self.assertEqual(1, result["negative_load_corrected_count"])
+        np.testing.assert_allclose(result["actual_load"], [25.0, 6.0])
+        np.testing.assert_allclose(result["actual_spindle_speed"], [1000.0, 2000.0])
+        np.testing.assert_allclose(result["actual_feed_speed"], [5.0, 13.0])
+        np.testing.assert_array_equal(result["program_line"], [10, 11])
+
+    def test_sample_sequence_layout_fast_path_matches_legacy_coordinates(self):
+        harness = PlotSupportMixin()
+        line_numbers = np.asarray(
+            [10, 10, 11, 11, 9, 9, 9, 10, 10, 10],
+            dtype=int,
+        )
+        group_keys = np.asarray(
+            ["A", "A", "A", "A", "A", "A", "B", "B", "B", "B"],
+            dtype=object,
+        )
+
+        blocks, x_positions, point_indices = (
+            harness.compute_sample_sequence_layout(line_numbers, group_keys)
+        )
+        expected_blocks = harness.compute_sequence_blocks(
+            line_numbers,
+            group_keys,
+        )
+        expected_x = harness.compute_line_x_positions(
+            line_numbers,
+            blocks=expected_blocks,
+        )
+        expected_points = harness.compute_line_point_indices(
+            line_numbers,
+            blocks=expected_blocks,
+        )
+
+        self.assertEqual(expected_blocks, blocks)
+        np.testing.assert_array_equal(point_indices, expected_points)
+        np.testing.assert_allclose(x_positions, expected_x, rtol=0.0, atol=0.0)
+        empty = harness.compute_sample_sequence_layout(
+            np.asarray([], dtype=int),
+            np.asarray([], dtype=object),
+        )
+        self.assertEqual([], empty[0])
+        self.assertEqual(0, empty[1].size)
+        self.assertEqual(0, empty[2].size)
+
+    def test_process_header_detection_skips_normal_rows_after_layout_is_known(self):
+        parser = ProcessingCoreMixin()
+        header = [
+            "序号",
+            "N",
+            "ap(mm)",
+            "ae(mm)",
+            "F(mm/min)",
+            "MRR(mm3/s)",
+            "s(mm)",
+            "S(r/min)",
+            "G代码",
+        ]
+        layout = parser._detect_process_header_layout(header)
+        self.assertIsNotNone(layout)
+        data_row = ["1", "N10", "1", "2", "600", "20", "0.5", "8000", "G1 X1"]
+
+        with patch.object(
+            parser,
+            "_detect_process_header_layout",
+            wraps=parser._detect_process_header_layout,
+        ) as detector:
+            for _index in range(200):
+                parsed, updated_layout = parser._parse_process_tokens(
+                    data_row,
+                    layout_hint=layout,
+                )
+                self.assertIsNotNone(parsed)
+                self.assertEqual(layout, updated_layout)
+            repeated_header, repeated_layout = parser._parse_process_tokens(
+                header,
+                layout_hint=layout,
+            )
+
+        self.assertIsNone(repeated_header)
+        self.assertEqual(layout, repeated_layout)
+        self.assertEqual(1, detector.call_count)
+
     def test_main_page_prediction_and_pit_viewer_are_separate_components(self):
         mro = list(MillingAnalysisTool.__mro__)
 
@@ -473,6 +628,63 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
         )
         self.assertNotIn("_refresh_manual_measurement_prediction", PitViewerMixin.__dict__)
         self.assertNotIn("has_prediction_model_ready", PitModelMixin.__dict__)
+
+    def test_default_preview_is_majority_and_consistent_across_both_apps(self):
+        total_height = 480
+        observed = {}
+        for label, research_enabled, requested_height in (
+            ("release", False, 129),
+            ("main_collapsed", True, 140),
+        ):
+            with self.subTest(label=label):
+                harness = BootstrapUiMixin.__new__(BootstrapUiMixin)
+                harness.enable_research_features = research_enabled
+                harness.model_detail_collapsed = _ValueVar(True)
+                harness._data_paned = _PanedHeightStub(total_height)
+                harness._data_controls = _RequestedHeightStub(requested_height)
+                harness._adapt_data_processing_layout = lambda: None
+
+                harness._sync_data_controls_preview_ratio()
+
+                controls_height = harness._data_paned.sash_height
+                self.assertIsNotNone(controls_height)
+                self.assertGreaterEqual(controls_height, requested_height)
+                preview_ratio = (
+                    total_height - controls_height
+                ) / float(total_height)
+                self.assertGreaterEqual(preview_ratio, 0.68)
+                observed[label] = preview_ratio
+
+        self.assertLessEqual(
+            abs(observed["release"] - observed["main_collapsed"]),
+            0.04,
+        )
+
+    def test_research_detail_toggle_hides_and_restores_whole_model_frame(self):
+        harness = BootstrapUiMixin.__new__(BootstrapUiMixin)
+        harness.model_detail_collapsed = _ValueVar(False)
+        harness.model_detail_toggle_text = _ValueVar("")
+        harness._model_detail_frame = _GridVisibilityStub()
+        harness.root = _ImmediateIdleRoot()
+        sync_count = []
+        harness._sync_data_controls_preview_ratio = lambda: sync_count.append(1)
+        harness.model_detail_toggle_btn = object()
+
+        harness._set_model_detail_collapsed(True)
+
+        self.assertTrue(harness.model_detail_collapsed.get())
+        self.assertEqual("展开详情", harness.model_detail_toggle_text.get())
+        self.assertEqual(1, harness._model_detail_frame.remove_count)
+        self.assertEqual(0, harness._model_detail_frame.restore_count)
+        self.assertIsNotNone(harness.model_detail_toggle_btn)
+
+        harness._toggle_model_detail_section()
+
+        self.assertFalse(harness.model_detail_collapsed.get())
+        self.assertEqual("收起详情", harness.model_detail_toggle_text.get())
+        self.assertEqual(1, harness._model_detail_frame.remove_count)
+        self.assertEqual(1, harness._model_detail_frame.restore_count)
+        self.assertEqual(2, len(sync_count))
 
     def test_main_ui_removes_smif_and_data_analysis_pages(self):
         ui_source = (SRC_ROOT / "project" / "ui_bootstrap.py").read_text(encoding="utf-8")
@@ -670,6 +882,7 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
         )
 
     def test_04_max_segment_atoms_is_only_a_batch_size(self):
+        self.assertEqual(512, SegmentationConfig().max_segment_atoms)
         mrr = (
             [0.0] * 4
             + [1.0, 2.0, 3.0, 2.0]
@@ -686,7 +899,7 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
             batch_size: SegmentationPipeline(
                 _test_config(max_segment_atoms=batch_size)
             ).run(frame)
-            for batch_size in (32, 48, 64)
+            for batch_size in (32, 48, 64, 512)
         }
         for result in results.values():
             self.assert_valid_result(result)
@@ -696,12 +909,60 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
             )
         reference_points, reference_intervals = _result_shape(results[32])
         reference_signature = _process_signature(results[32])
-        for batch_size in (48, 64):
+        for batch_size in (48, 64, 512):
             with self.subTest(max_segment_atoms=batch_size):
                 points, intervals = _result_shape(results[batch_size])
                 pd.testing.assert_frame_equal(reference_points, points)
                 pd.testing.assert_frame_equal(reference_intervals, intervals)
                 self.assertEqual(reference_signature, _process_signature(results[batch_size]))
+
+    def test_interval_statistics_remain_stable_after_large_idle_baseline_jump(self):
+        point_count = 21
+        ap_values = np.concatenate((
+            np.asarray([0.0]),
+            1.0e12 + np.arange(point_count - 1, dtype=float) % 2.0,
+        ))
+        frame = pd.DataFrame(
+            {
+                "source_index": range(point_count),
+                "line_id": range(100, 100 + point_count),
+                "line_no_raw": range(100, 100 + point_count),
+                "ap": ap_values,
+                "ae": np.ones(point_count, dtype=float),
+                "F_program": np.full(point_count, 60.0, dtype=float),
+                "s": np.full(point_count, 0.1, dtype=float),
+            }
+        )
+
+        result = SegmentationPipeline(_test_config()).run(frame)
+        observed_small_variation = False
+        for interval in result.intervals.to_dict(orient="records"):
+            start_idx = int(interval["start_idx"])
+            end_idx = int(interval["end_idx"])
+            for metric_name in ("ap", "ae", "F_program", "MRR_program"):
+                values = result.point_labels[metric_name].to_numpy(
+                    dtype=float,
+                    copy=False,
+                )[start_idx:end_idx + 1]
+                self.assertEqual(
+                    float(np.mean(values)),
+                    float(interval[f"{metric_name}_mean"]),
+                )
+                self.assertEqual(
+                    float(np.std(values, ddof=0)),
+                    float(interval[f"{metric_name}_std"]),
+                )
+            if start_idx > 0 and end_idx > start_idx:
+                observed_small_variation |= bool(
+                    np.isclose(
+                        float(interval["ap_std"]),
+                        0.5,
+                        rtol=0.0,
+                        atol=0.0,
+                    )
+                )
+
+        self.assertTrue(observed_small_variation)
 
     def test_05_sample_mapping_success_or_failure_preserves_process_result(self):
         process_result = _run(
@@ -779,6 +1040,10 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
             partial_n_harness._materialize_segmentation_sample_bounds(sequence_records)
 
         quantized_harness = _QuantizedProjectionHarness()
+        # 真实对象初始化后这两个缓存字段可能明确为 None；
+        # 快路径必须回退到现有上下文计算，而不是在 asarray 处报错。
+        quantized_harness.sample_data_point_indices = None
+        quantized_harness.sample_data_x_positions = None
         quantized_records = [
             {
                 "interval_id": "SEG0001",
@@ -827,6 +1092,46 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
                     record["sample_end_idx"] + 1,
                 )
             ],
+        )
+
+        quantized_harness.sample_data_loaded = True
+        quantized_harness.sample_data_point_indices = np.arange(6, dtype=int)
+        quantized_harness.sample_data_x_positions = (
+            20.0 + np.arange(6, dtype=float) / 6.0
+        )
+        quantized_harness.sample_data_program_numbers = np.ones(6, dtype=int)
+        quantized_harness.sample_data_values = np.asarray(
+            [[10.0], [20.0], [30.0], [40.0], [50.0], [60.0]],
+            dtype=float,
+        )
+        quantized_harness.sample_data_source = _ValueVar(0)
+        optimizable_records = [
+            {
+                **dict(quantized_records[index]),
+                "start_line": 20,
+                "end_line": 20,
+                "display_start_x": float(quantized_records[index]["process_start_x"]),
+                "display_end_x": float(
+                    quantized_records[index]["process_display_end_x"]
+                ),
+            }
+            for index in (0, 2)
+        ]
+        quantized_harness._get_optimizable_interval_records = (
+            lambda: [dict(record) for record in optimizable_records]
+        )
+        quantized_harness._get_authoritative_segmentation_sample_records = (
+            lambda: [dict(record) for record in quantized_projection]
+        )
+        quantized_harness.get_program_number_by_name = lambda _name: 1
+        quantized_harness.get_tool_ranges_by_id = lambda _name, _tool: [(20, 20)]
+
+        self.assertEqual(
+            [
+                "20.0-20.1:15.000000",
+                "20.3-20.5:50.000000",
+            ],
+            quantized_harness.collect_line_point_intervals_for_tool("P1", "T0"),
         )
 
         plotter = PlotSupportMixin()
@@ -1382,6 +1687,9 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
         visualization._sample_mapping_status = "valid"
         visualization._current_mapping_signature = "mapping-valid"
         visualization._segmentation_sample_projection_records = mapping_records
+        visualization.apply_line_axis_on_time = (
+            PlotSupportMixin.apply_line_axis_on_time.__get__(visualization)
+        )
 
         self.assertTrue(visualization.generate_plots(silent=True))
         figure = visualization.figures[0]
@@ -1391,6 +1699,59 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
             self.assertEqual(1, len(figure.axes))
             visualization._current_preview_fig = figure
             visualization.canvas_data = _CanvasStub()
+            original_canvas = visualization.canvas_data
+            actual_line = next(
+                line
+                for line in figure.axes[0].lines
+                if line.get_label() == "实际负载"
+            )
+            original_ylim = figure.axes[0].get_ylim()
+            original_title = figure.axes[0].get_title()
+            original_line_axis_mask = np.asarray(
+                figure._measurement_curve_context["line_axis_mask"],
+                dtype=bool,
+            ).copy()
+            original_top_axis = figure.axes[0]._time_line_top_axis
+            zoomed_xlim = (5.0, float(point_count - 6))
+            figure.axes[0].set_xlim(*zoomed_xlim)
+
+            self.assertTrue(visualization.generate_plots(silent=True))
+            self.assertIs(figure, visualization.figures[0])
+            self.assertIs(original_canvas, visualization.canvas_data)
+            refreshed_actual_line = next(
+                line
+                for line in figure.axes[0].lines
+                if line.get_label() == "实际负载"
+            )
+            self.assertIs(actual_line, refreshed_actual_line)
+            np.testing.assert_allclose(
+                zoomed_xlim,
+                figure.axes[0].get_xlim(),
+                rtol=0.0,
+                atol=0.0,
+            )
+            self.assertEqual(original_ylim, figure.axes[0].get_ylim())
+            self.assertEqual(original_title, figure.axes[0].get_title())
+            self.assertEqual("时间 (ms)", figure.axes[0].get_xlabel())
+            self.assertEqual("功率 (W)", figure.axes[0].get_ylabel())
+            np.testing.assert_array_equal(
+                original_line_axis_mask,
+                figure._measurement_curve_context["line_axis_mask"],
+            )
+            np.testing.assert_array_equal(
+                original_line_axis_mask,
+                figure.axes[0]._time_line_mask,
+            )
+            self.assertIs(original_top_axis, figure.axes[0]._time_line_top_axis)
+            self.assertEqual(1, visualization.canvas_data.draw_count)
+            self.assertLessEqual(
+                len([
+                    artist
+                    for artist in figure.axes[0].collections
+                    if isinstance(artist, PolyCollection)
+                ]),
+                6,
+            )
 
             visualization.show_feed_overlay_var.set(True)
             visualization.show_speed_overlay_var.set(True)
@@ -1398,7 +1759,7 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
             visualization.show_ae_overlay_var.set(True)
             visualization.on_optional_overlay_toggle()
             self.assertEqual(5, len(figure.axes))
-            self.assertEqual(1, visualization.canvas_data.draw_count)
+            self.assertEqual(2, visualization.canvas_data.draw_count)
             overlay_labels = {
                 line.get_label()
                 for axis in figure.axes[1:]
@@ -1420,7 +1781,7 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
             visualization.show_ae_overlay_var.set(False)
             visualization.on_optional_overlay_toggle()
             self.assertEqual(1, len(figure.axes))
-            self.assertEqual(2, visualization.canvas_data.draw_count)
+            self.assertEqual(3, visualization.canvas_data.draw_count)
         finally:
             plt.close(figure)
 
@@ -1488,6 +1849,219 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
             sampledata_labels,
         )
 
+    def test_mapped_preview_reuses_objects_and_refreshes_mapping_context(self):
+        process_result = _run(
+            [0.0] * 3
+            + [1.0, 2.0, 3.0, 2.0]
+            + [4.0] * 12
+            + [3.0, 2.0, 1.0]
+            + [0.0] * 3
+        )
+        point_count = len(process_result.point_labels)
+        sample_x = np.arange(point_count, dtype=float)
+        actual_load = np.linspace(50.0, 80.0, point_count)
+        projected_mask = np.zeros(point_count, dtype=bool)
+        projected_mask[2:point_count - 2] = True
+
+        visualization = _OptionalOverlayVisualizationHarness(process_result)
+        visualization.sample_data_loaded = True
+        visualization.sample_data_values = actual_load.reshape(-1, 1)
+        visualization.sample_data_line_numbers = np.arange(
+            100,
+            100 + point_count,
+            dtype=int,
+        )
+        visualization.sample_data_time_indices = sample_x
+        visualization.sample_data_mode = "experiment_measurement"
+        visualization.manual_measurement_data = {"actual_load": actual_load}
+        visualization._sample_mapping_status = "valid"
+        visualization._current_mapping_signature = "mapping-trimmed"
+        visualization._segmentation_sample_projection_records = [{
+            "segment_type": "steady",
+            "sample_start_idx": 2,
+            "sample_end_idx": point_count - 3,
+        }]
+        visualization.apply_line_axis_on_time = (
+            PlotSupportMixin.apply_line_axis_on_time.__get__(visualization)
+        )
+
+        figure, axis = plt.subplots(figsize=(9.0, 3.0), dpi=100)
+        actual_line, = axis.plot(
+            sample_x,
+            actual_load,
+            label="实际负载",
+        )
+        axis.set_xlim(-5.0, float(point_count + 4))
+        axis.set_xlabel("时间 (ms)")
+        axis.set_ylabel("曲线值")
+        preview_mask = np.ones(point_count, dtype=bool)
+        top_axis = visualization.apply_line_axis_on_time(axis, preview_mask)
+        figure._measurement_curve_context = {
+            "axis": axis,
+            "sample_count": point_count,
+            "source_index": 0,
+            "data_values_id": id(visualization.sample_data_values),
+            "x_values": sample_x.copy(),
+            "line_axis_mask": preview_mask.copy(),
+            "actual_lines": [actual_line],
+            "segmentation_artists": [],
+            "prediction_lines": [],
+            "message_artists": [],
+        }
+        visualization.figures = [figure]
+        visualization.figure_names = ["实测负载预览"]
+        visualization._current_preview_fig = figure
+        visualization.canvas_data = _CanvasStub()
+        original_canvas = visualization.canvas_data
+        original_x = np.asarray(actual_line.get_xdata(), dtype=float).copy()
+        original_y = np.asarray(actual_line.get_ydata(), dtype=float).copy()
+
+        try:
+            self.assertTrue(visualization.generate_plots(silent=True))
+
+            self.assertIs(figure, visualization.figures[0])
+            self.assertIs(original_canvas, visualization.canvas_data)
+            self.assertIs(actual_line, next(
+                line
+                for line in axis.lines
+                if line.get_label() == "实际负载"
+            ))
+            self.assertIs(top_axis, axis._time_line_top_axis)
+            np.testing.assert_array_equal(original_x, actual_line.get_xdata())
+            np.testing.assert_array_equal(original_y, actual_line.get_ydata())
+            np.testing.assert_allclose(
+                (2.0, float(point_count - 3)),
+                axis.get_xlim(),
+                rtol=0.0,
+                atol=0.0,
+            )
+            self.assertGreater(axis.get_xlim()[0], sample_x[0])
+            self.assertLess(axis.get_xlim()[1], sample_x[-1])
+            np.testing.assert_array_equal(
+                projected_mask,
+                figure._measurement_curve_context["line_axis_mask"],
+            )
+            np.testing.assert_array_equal(projected_mask, axis._time_line_mask)
+            self.assertEqual(
+                "mapping-trimmed",
+                figure._measurement_curve_context["mapping_signature"],
+            )
+            self.assertEqual("时间 (ms)", axis.get_xlabel())
+            self.assertEqual("功率 (W)", axis.get_ylabel())
+            final_xlim = axis.get_xlim()
+            self.assertTrue(all(
+                final_xlim[0] <= float(tick) <= final_xlim[1]
+                for tick in axis.get_xticks()
+            ))
+            self.assertEqual(1, visualization.canvas_data.draw_count)
+        finally:
+            plt.close(figure)
+
+    def test_compact_line_axis_layout_fits_long_labels_without_drift(self):
+        class _LayoutHarness(
+            BootstrapUiMixin,
+            SampleManagerMixin,
+            PlotSupportMixin,
+        ):
+            pass
+
+        line_numbers = np.repeat(
+            np.asarray([123456, -123456, 1234567890], dtype=np.int64),
+            25,
+        )
+        expected_labels = {str(value) for value in np.unique(line_numbers)}
+
+        for dpi in (100, 150):
+            with self.subTest(dpi=dpi):
+                harness = _LayoutHarness.__new__(_LayoutHarness)
+                harness.sample_data_line_numbers = line_numbers.copy()
+                harness.sample_data_time_indices = np.arange(
+                    line_numbers.size,
+                    dtype=float,
+                )
+                figure, axis = plt.subplots(figsize=(9.0, 2.1), dpi=dpi)
+                axis.plot(
+                    harness.sample_data_time_indices,
+                    np.linspace(100.0, 500.0, line_numbers.size),
+                )
+                axis.set_xlim(
+                    0.0,
+                    float(harness.sample_data_time_indices[-1]),
+                )
+                axis.set_title("实际负载与区间划分")
+                axis.set_xlabel("时间 (ms)")
+                original_mask = np.ones(line_numbers.size, dtype=bool)
+                top_axis = harness.apply_line_axis_on_time(axis, original_mask)
+                harness._apply_optional_overlay_layout(
+                    figure,
+                    0,
+                    {
+                        "left": 0.06,
+                        "right": 0.985,
+                        "top": 0.94,
+                        "bottom": 0.09,
+                    },
+                )
+
+                try:
+                    observed_margins = []
+                    for _iteration in range(2):
+                        self.assertTrue(
+                            harness._layout_data_figure_for_viewport(
+                                figure,
+                                900,
+                                210,
+                            )
+                        )
+                        figure.canvas.draw()
+                        observed_margins.append(np.asarray([
+                            figure.subplotpars.left,
+                            figure.subplotpars.right,
+                            figure.subplotpars.bottom,
+                            figure.subplotpars.top,
+                        ]))
+
+                    np.testing.assert_allclose(
+                        observed_margins[0],
+                        observed_margins[1],
+                        rtol=0.0,
+                        atol=1.0e-9,
+                    )
+                    self.assertIs(top_axis, axis._time_line_top_axis)
+                    np.testing.assert_array_equal(
+                        original_mask,
+                        axis._time_line_mask,
+                    )
+                    self.assertGreaterEqual(
+                        figure.subplotpars.top - figure.subplotpars.bottom,
+                        0.25 - 1.0e-9,
+                    )
+
+                    visible_tick_labels = [
+                        label
+                        for label in top_axis.get_xticklabels()
+                        if label.get_visible() and label.get_text()
+                    ]
+                    self.assertTrue(expected_labels.issubset({
+                        label.get_text()
+                        for label in visible_tick_labels
+                    }))
+                    renderer = figure.canvas.get_renderer()
+                    figure_bounds = figure.bbox
+                    visible_artists = [
+                        axis.xaxis.label,
+                        top_axis.xaxis.label,
+                        *visible_tick_labels,
+                    ]
+                    for artist in visible_artists:
+                        bounds = artist.get_window_extent(renderer)
+                        self.assertGreaterEqual(bounds.x0, figure_bounds.x0 - 2.0)
+                        self.assertLessEqual(bounds.x1, figure_bounds.x1 + 2.0)
+                        self.assertGreaterEqual(bounds.y0, figure_bounds.y0 - 2.0)
+                        self.assertLessEqual(bounds.y1, figure_bounds.y1 + 2.0)
+                finally:
+                    plt.close(figure)
+
     def test_10_optional_axes_stay_compact_and_do_not_overlap_after_resize(self):
         process_result = _run(
             [0.0] * 3
@@ -1497,6 +2071,14 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
             + [0.0] * 3
         )
         visualization = _OptionalOverlayVisualizationHarness(process_result)
+        # 本测试需要验证 Bootstrap 的视口布局，但不改变其他
+        # 可视化测试的精简 harness MRO，避免把真实 Tk 生命周期引入无头测试。
+        visualization._apply_data_figure_typography = (
+            BootstrapUiMixin._apply_data_figure_typography.__get__(visualization)
+        )
+        visualization._layout_data_figure_for_viewport = (
+            BootstrapUiMixin._layout_data_figure_for_viewport.__get__(visualization)
+        )
         visualization.data = [
             {"S": 4000.0 + index * 10.0}
             for index in range(len(process_result.point_labels))
@@ -1531,6 +2113,130 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
             self.assertLessEqual(ae_label_bounds.x1, figure.bbox.x1)
         finally:
             plt.close(figure)
+
+        compact_figure, compact_axis = plt.subplots(figsize=(7.0, 2.6), dpi=100)
+        compact_axis.set_title("实际负载与区间划分")
+        compact_axis.set_xlabel("时间 (ms)")
+        compact_axis._time_line_top_axis = object()
+        try:
+            BootstrapUiMixin._apply_data_figure_typography(
+                visualization,
+                compact_figure,
+                260,
+            )
+            visualization._apply_optional_overlay_layout(
+                compact_figure,
+                0,
+                {
+                    "left": 0.06,
+                    "right": 0.985,
+                    "top": 0.94,
+                    "bottom": 0.09,
+                },
+            )
+            compact_figure.canvas.draw()
+            renderer = compact_figure.canvas.get_renderer()
+            xlabel_bounds = compact_axis.xaxis.label.get_window_extent(renderer)
+
+            self.assertGreaterEqual(xlabel_bounds.y0, compact_figure.bbox.y0)
+            self.assertGreater(
+                compact_figure.subplotpars.bottom,
+                0.09,
+            )
+            self.assertLess(
+                compact_figure.subplotpars.top,
+                0.94,
+            )
+            self.assertGreater(
+                compact_figure.subplotpars.top - compact_figure.subplotpars.bottom,
+                0.5,
+            )
+            self.assertFalse(compact_axis.title.get_visible())
+            self.assertLessEqual(compact_axis.xaxis.label.get_fontsize(), 8)
+        finally:
+            plt.close(compact_figure)
+
+        class _EmbeddedAxisHarness(
+            BootstrapUiMixin,
+            SampleManagerMixin,
+            PlotSupportMixin,
+        ):
+            pass
+
+        axis_harness = _EmbeddedAxisHarness.__new__(_EmbeddedAxisHarness)
+        axis_harness.sample_data_line_numbers = np.repeat(
+            np.arange(17, 25, dtype=int),
+            25,
+        )
+        axis_harness.sample_data_time_indices = np.arange(
+            axis_harness.sample_data_line_numbers.size,
+            dtype=float,
+        )
+        embedded_figure, embedded_axis = plt.subplots(figsize=(9.0, 2.1), dpi=100)
+        embedded_axis.plot(
+            axis_harness.sample_data_time_indices,
+            np.linspace(100.0, 500.0, axis_harness.sample_data_time_indices.size),
+        )
+        embedded_axis.set_xlim(
+            0.0,
+            float(axis_harness.sample_data_time_indices[-1]),
+        )
+        embedded_axis.set_title("实际负载与区间划分")
+        embedded_axis.set_xlabel("时间 (ms)")
+        original_mask = np.ones(
+            axis_harness.sample_data_line_numbers.size,
+            dtype=bool,
+        )
+        top_axis = axis_harness.apply_line_axis_on_time(
+            embedded_axis,
+            original_mask,
+        )
+        top_axis_id = id(top_axis)
+        axis_harness._apply_optional_overlay_layout(
+            embedded_figure,
+            0,
+            {
+                "left": 0.06,
+                "right": 0.985,
+                "top": 0.94,
+                "bottom": 0.09,
+            },
+        )
+        try:
+            self.assertTrue(
+                axis_harness._layout_data_figure_for_viewport(
+                    embedded_figure,
+                    900,
+                    210,
+                )
+            )
+            embedded_figure.canvas.draw()
+            self.assertEqual(top_axis_id, id(embedded_axis._time_line_top_axis))
+            np.testing.assert_array_equal(
+                original_mask,
+                embedded_axis._time_line_mask,
+            )
+            self.assertFalse(embedded_axis.title.get_visible())
+
+            renderer = embedded_figure.canvas.get_renderer()
+            figure_bounds = embedded_figure.bbox
+            visible_artists = [
+                embedded_axis.xaxis.label,
+                embedded_axis._time_line_top_axis.xaxis.label,
+                *[
+                    label
+                    for label in embedded_axis._time_line_top_axis.get_xticklabels()
+                    if label.get_visible() and label.get_text()
+                ],
+            ]
+            for artist in visible_artists:
+                bounds = artist.get_window_extent(renderer)
+                self.assertGreaterEqual(bounds.x0, figure_bounds.x0 - 2.0)
+                self.assertLessEqual(bounds.x1, figure_bounds.x1 + 2.0)
+                self.assertGreaterEqual(bounds.y0, figure_bounds.y0 - 2.0)
+                self.assertLessEqual(bounds.y1, figure_bounds.y1 + 2.0)
+        finally:
+            plt.close(embedded_figure)
 
         visualization.show_feed_overlay_var.set(True)
         visualization.show_speed_overlay_var.set(True)

@@ -123,7 +123,7 @@ class ProcessingCoreMixin:
             "路径长度",
         }:
             return "s(mm)"
-        if lowered in {"g", "gcode", "nc", "程序段", "代码"}:
+        if lowered in {"g", "gcode", "g代码", "nc", "程序段", "代码"}:
             return "G"
         if lowered in {
             "state",
@@ -164,6 +164,19 @@ class ProcessingCoreMixin:
             if base_layout:
                 return f"{base_layout}{PROCESS_LAYOUT_STATE_SUFFIX}"
         return PROCESS_HEADER_MAP.get(normalized)
+
+    def _process_tokens_may_be_header(self, tokens, layout_hint=None):
+        """用首字段快速排除普通数据行，避免逐行规范化整张表头。"""
+        if not tokens:
+            return False
+        if layout_hint is None:
+            return True
+        first_token = str(tokens[0] or "").strip().lstrip("\ufeff")
+        if not first_token:
+            return True
+        # 带序号布局首列是整数；无序号布局首列是 N 或 N123。
+        # 两者都能由 N 前缀解析器识别。解析失败时才可能是重复表头。
+        return self._parse_prefixed_numeric_token(first_token, "N") is None
 
     def _is_process_header_row(self, tokens):
         """判断是否为工艺信息表头行。"""
@@ -373,9 +386,10 @@ class ProcessingCoreMixin:
         if len(cleaned) < 5:
             return None, layout_hint
 
-        detected_layout = self._detect_process_header_layout(cleaned)
-        if detected_layout:
-            return None, detected_layout
+        if self._process_tokens_may_be_header(cleaned, layout_hint=layout_hint):
+            detected_layout = self._detect_process_header_layout(cleaned)
+            if detected_layout:
+                return None, detected_layout
 
         reported_layout = layout_hint
         if (
@@ -884,10 +898,9 @@ class ProcessingCoreMixin:
     def _restore_missing_line_numbers_from_nc_profile(self, rows):
         """按已有 N 锚点和 NC 指令顺序补全缺失的真实文件行号。"""
         process_rows = [row for row in rows if not bool(row.get("_is_synthetic_fill"))]
-        groups = self._collect_process_gcode_groups(process_rows)
         diagnostics = {
             "line_number_source": "missing",
-            "nc_process_group_count": len(groups),
+            "nc_process_group_count": 0,
             "nc_matched_group_count": 0,
         }
         if not process_rows:
@@ -901,6 +914,9 @@ class ProcessingCoreMixin:
                 row["line_number_source"] = "input"
             self.process_line_number_diagnostics = diagnostics
             return diagnostics
+
+        groups = self._collect_process_gcode_groups(process_rows)
+        diagnostics["nc_process_group_count"] = len(groups)
 
         # AfoMilling 会把同一条 NC 指令细分为多个工艺点。部分细分点的 N
         # 为空时，优先使用最后一列 G 代码把它归入同一连续指令组，并继承该组
@@ -1859,18 +1875,35 @@ class ProcessingCoreMixin:
         self.sample_data_line_numbers = np.asarray(self.sample_data_line_numbers_raw, dtype=int)
 
         self.sample_data_time_indices = np.arange(len(self.sample_data_line_numbers), dtype=int)
-        self.sample_data_base_blocks = self.compute_sequence_blocks(
-            self.sample_data_line_numbers,
-            self.sample_data_program_numbers
-        )
-        self.sample_data_x_positions = np.asarray(
-            self.compute_line_x_positions(self.sample_data_line_numbers, blocks=self.sample_data_base_blocks),
-            dtype=float
-        )
-        self.sample_data_point_indices = np.asarray(
-            self.compute_line_point_indices(self.sample_data_line_numbers, blocks=self.sample_data_base_blocks),
-            dtype=int
-        )
+        try:
+            (
+                self.sample_data_base_blocks,
+                self.sample_data_x_positions,
+                self.sample_data_point_indices,
+            ) = self.compute_sample_sequence_layout(
+                self.sample_data_line_numbers,
+                self.sample_data_program_numbers,
+            )
+        except (AttributeError, TypeError, ValueError):
+            # 非整数历史输入保留原有通用实现，快路径不扩大兼容边界。
+            self.sample_data_base_blocks = self.compute_sequence_blocks(
+                self.sample_data_line_numbers,
+                self.sample_data_program_numbers,
+            )
+            self.sample_data_x_positions = np.asarray(
+                self.compute_line_x_positions(
+                    self.sample_data_line_numbers,
+                    blocks=self.sample_data_base_blocks,
+                ),
+                dtype=float,
+            )
+            self.sample_data_point_indices = np.asarray(
+                self.compute_line_point_indices(
+                    self.sample_data_line_numbers,
+                    blocks=self.sample_data_base_blocks,
+                ),
+                dtype=int,
+            )
         self.sample_data_valid_mask = None
         self.sample_data_valid_blocks = []
         self._sample_line_point_context_cache = None
@@ -1940,11 +1973,11 @@ class ProcessingCoreMixin:
         """解析实验实测文件，提取实际负载、实际转速、合成进给与程序行号。"""
         encoding = self.detect_file_encoding(file_path)
         channel_columns = {}
-        channel_data_rows = []
+        first_channel_data_row = None
 
         with open(file_path, 'r', encoding=encoding, errors='ignore') as f:
             channel_info_index = 0
-            for raw_line in f:
+            for row_index, raw_line in enumerate(f):
                 line = raw_line.strip()
                 if not line:
                     continue
@@ -1956,9 +1989,8 @@ class ProcessingCoreMixin:
                     channel_info_index += 1
                     continue
                 if line.startswith("<ChannelData>"):
-                    tokens = self._parse_tagged_csv_tokens(line)
-                    if len(tokens) > 1:
-                        channel_data_rows.append(tokens[1:])
+                    first_channel_data_row = row_index
+                    break
 
         required_keys = ("actual_spindle_speed", "actual_load", "program_line")
         missing_keys = [key for key in required_keys if key not in channel_columns]
@@ -1968,66 +2000,96 @@ class ProcessingCoreMixin:
         if missing_keys:
             missing_text = ", ".join(missing_keys)
             raise ValueError(f"实验实测文件缺少必要通道: {missing_text}")
-
-        max_col_index = max(channel_columns.values())
-        actual_load = []
-        actual_spindle_speed = []
-        actual_feed_speed = []
-        program_line = []
-        negative_load_corrected_count = 0
-
-        def _safe_float(row, idx):
-            if idx is None or idx >= len(row):
-                return np.nan
-            text = str(row[idx]).strip()
-            if not text:
-                return np.nan
-            try:
-                return float(text)
-            except Exception:
-                return np.nan
-
-        for row in channel_data_rows:
-            if len(row) <= max_col_index:
-                continue
-
-            line_val = _safe_float(row, channel_columns["program_line"])
-            if np.isnan(line_val):
-                continue
-
-            load_val = _safe_float(row, channel_columns["actual_load"])
-            if np.isfinite(load_val) and load_val < 0:
-                load_val = abs(load_val)
-                negative_load_corrected_count += 1
-            spindle_val = _safe_float(row, channel_columns["actual_spindle_speed"])
-
-            feed_components = []
-            for axis_key in ("axis_feed_x", "axis_feed_y", "axis_feed_z"):
-                if axis_key not in channel_columns:
-                    continue
-                component = _safe_float(row, channel_columns[axis_key])
-                if not np.isnan(component):
-                    feed_components.append(component)
-            feed_val = float(math.sqrt(sum(component * component for component in feed_components))) if feed_components else np.nan
-
-            actual_load.append(load_val)
-            actual_spindle_speed.append(spindle_val)
-            actual_feed_speed.append(feed_val)
-            program_line.append(int(line_val))
-
-        if not program_line:
+        if first_channel_data_row is None:
             raise ValueError("未在实验实测文件中解析到有效的程序行号数据")
+
+        # ChannelData 往往包含数十万行。旧实现先把每一行拆成 Python
+        # 字符串列表，再逐格执行 float()，真实 129 MB 文件的大部分导入
+        # 时间都消耗在这里。只读取所需列并交给 pandas 的 C 解析器，一次
+        # 生成连续数组；首列仍参与筛选，避免尾部其它记录被误当作采样点。
+        source_columns = {
+            key: int(column_index) + 1
+            for key, column_index in channel_columns.items()
+            if key in {
+                "actual_spindle_speed",
+                "actual_load",
+                "axis_feed_x",
+                "axis_feed_y",
+                "axis_feed_z",
+                "program_line",
+            }
+        }
+        csv_columns = sorted({0, *source_columns.values()})
+        # 显式给出导出列宽：若第一条 ChannelData 恰好被截断，
+        # pandas 否则会以该短行推断列数，随后在 usecols 阶段直接失败。
+        # 末尾多留一列兼容设备导出惯用的结尾逗号。
+        csv_width = max(channel_info_index + 2, max(csv_columns) + 1)
+        channel_frame = pd.read_csv(
+            file_path,
+            encoding=encoding,
+            encoding_errors="ignore",
+            skiprows=first_channel_data_row,
+            header=None,
+            names=list(range(csv_width)),
+            usecols=csv_columns,
+            engine="c",
+            low_memory=False,
+            memory_map=True,
+            on_bad_lines="skip",
+        )
+        if channel_frame.empty:
+            raise ValueError("未在实验实测文件中解析到有效的程序行号数据")
+
+        channel_tags = channel_frame[0].astype("string").str.strip()
+        channel_frame = channel_frame.loc[channel_tags.eq("<ChannelData>")]
+
+        def _numeric_channel(channel_key):
+            series = channel_frame[source_columns[channel_key]]
+            if not pd.api.types.is_numeric_dtype(series.dtype):
+                # 小型测试文件或旧导出可能把数值写成 <1.0>；真实导出为
+                # 普通数字，因此正常路径不会承担字符串清洗成本。
+                series = (
+                    series.astype("string")
+                    .str.strip()
+                    .str.removeprefix("<")
+                    .str.removesuffix(">")
+                )
+            return pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
+
+        program_line_values = _numeric_channel("program_line")
+        valid_rows = np.isfinite(program_line_values)
+        if not np.any(valid_rows):
+            raise ValueError("未在实验实测文件中解析到有效的程序行号数据")
+
+        actual_load = _numeric_channel("actual_load")[valid_rows]
+        actual_spindle_speed = _numeric_channel("actual_spindle_speed")[valid_rows]
+        program_line = program_line_values[valid_rows].astype(int)
+
+        feed_components = np.vstack([
+            _numeric_channel(axis_key)[valid_rows]
+            for axis_key in ("axis_feed_x", "axis_feed_y", "axis_feed_z")
+            if axis_key in source_columns
+        ])
+        finite_feed = np.isfinite(feed_components)
+        actual_feed_speed = np.sqrt(
+            np.sum(np.where(finite_feed, feed_components, 0.0) ** 2, axis=0)
+        )
+        actual_feed_speed[~np.any(finite_feed, axis=0)] = np.nan
+
+        negative_load_mask = np.isfinite(actual_load) & (actual_load < 0.0)
+        negative_load_corrected_count = int(np.count_nonzero(negative_load_mask))
+        actual_load = np.abs(actual_load)
 
         return {
             "source_file": file_path,
             "encoding": encoding,
-            "sample_count": len(program_line),
+            "sample_count": int(program_line.size),
             "channel_columns": dict(channel_columns),
             "negative_load_corrected_count": int(negative_load_corrected_count),
-            "actual_load": np.asarray(actual_load, dtype=float),
-            "actual_spindle_speed": np.asarray(actual_spindle_speed, dtype=float),
-            "actual_feed_speed": np.asarray(actual_feed_speed, dtype=float),
-            "program_line": np.asarray(program_line, dtype=int),
+            "actual_load": actual_load,
+            "actual_spindle_speed": actual_spindle_speed,
+            "actual_feed_speed": actual_feed_speed,
+            "program_line": program_line,
         }
 
     def process_single_file(self, input_file):
@@ -2069,7 +2131,17 @@ class ProcessingCoreMixin:
                     if str(line).strip():
                         raw_nonempty_row_count += 1
                     raw_csv_line = str(line or "").strip().lstrip("\ufeff")
-                    if raw_csv_line and "," in raw_csv_line:
+                    if (
+                        raw_csv_line
+                        and "," in raw_csv_line
+                        and (
+                            process_layout is None
+                            or self._process_tokens_may_be_header(
+                                [raw_csv_line.split(",", 1)[0]],
+                                layout_hint=process_layout,
+                            )
+                        )
+                    ):
                         try:
                             header_tokens = next(csv.reader([raw_csv_line]))
                         except Exception:

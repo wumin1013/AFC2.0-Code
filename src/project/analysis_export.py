@@ -473,6 +473,7 @@ class AnalysisExportMixin:
         values = np.asarray(getattr(self, "sample_data_values", []), dtype=float)
         if result is None or values.size == 0 or not mapping_records:
             return False
+        source_index = 0
         if values.ndim == 2:
             source_var = getattr(self, "sample_data_source", None)
             try:
@@ -556,6 +557,9 @@ class AnalysisExportMixin:
             ),
             dtype=bool,
         )
+        mapping_signature = str(
+            getattr(self, "_current_mapping_signature", "") or ""
+        )
         overlay_context_mask = np.isfinite(sample_x)
 
         show_interval_states = self._plot_option_enabled(
@@ -563,11 +567,124 @@ class AnalysisExportMixin:
             True,
         )
 
-        fig, sample_ax = plt.subplots(figsize=(16, 7.2), dpi=100)
-        fig.patch.set_facecolor(PLOT_FIG_BG)
-        self.apply_plot_style(sample_ax, grid=True)
+        data_values_id = id(getattr(self, "sample_data_values", None))
+        fig = None
+        sample_ax = None
+        curve_context = None
+        candidate_figures = [getattr(self, "_current_preview_fig", None)]
+        candidate_figures.extend(list(getattr(self, "figures", []) or []))
+        for candidate in candidate_figures:
+            if candidate is None or candidate is fig:
+                continue
+            candidate_context = getattr(
+                candidate,
+                "_measurement_curve_context",
+                None,
+            )
+            if not isinstance(candidate_context, dict):
+                continue
+            candidate_axis = candidate_context.get("axis")
+            actual_lines = list(candidate_context.get("actual_lines") or [])
+            candidate_x = np.asarray(
+                candidate_context.get("x_values", []),
+                dtype=float,
+            ).reshape(-1)
+            if (
+                candidate_context.get("sample_count") != actual_values.size
+                or candidate_context.get("source_index") != source_index
+                or candidate_context.get("data_values_id") != data_values_id
+                or candidate_x.size != sample_x.size
+                or not np.array_equal(candidate_x, sample_x, equal_nan=True)
+                or candidate_axis not in getattr(candidate, "axes", [])
+                or not any(line in candidate_axis.lines for line in actual_lines)
+            ):
+                continue
+            fig = candidate
+            sample_ax = candidate_axis
+            curve_context = candidate_context
+            break
+
+        reused_measurement_figure = fig is not None
+        previous_line_axis_mask = np.asarray([], dtype=bool)
+        if reused_measurement_figure:
+            previous_line_axis_mask = np.asarray(
+                curve_context.get("line_axis_mask", []),
+                dtype=bool,
+            ).reshape(-1)
+        mapping_context_unchanged = bool(
+            reused_measurement_figure
+            and str(curve_context.get("mapping_signature", "") or "")
+            == mapping_signature
+            and str(curve_context.get("x_label", "") or "") == x_label
+            and previous_line_axis_mask.size == projected_mask.size
+            and np.array_equal(previous_line_axis_mask, projected_mask)
+        )
+        if not reused_measurement_figure:
+            fig, sample_ax = plt.subplots(figsize=(16, 7.2), dpi=100)
+            fig.patch.set_facecolor(PLOT_FIG_BG)
+            self.apply_plot_style(sample_ax, grid=True)
+            preview_limit = int(getattr(self, "preview_plot_max_points", 60000) or 60000)
+            plot_x, plot_values = self._compress_plot_series_preserve_gaps(
+                sample_x,
+                actual_values,
+                preview_limit,
+            )
+            actual_lines = sample_ax.plot(
+                plot_x,
+                plot_values,
+                color=STYLE_MEASURED["color"],
+                linewidth=1.35,
+                linestyle="-",
+                label="实际负载",
+                zorder=4,
+            )
+            curve_context = {
+                "axis": sample_ax,
+                "sample_count": int(actual_values.size),
+                "source_index": source_index,
+                "data_values_id": data_values_id,
+                "x_values": np.asarray(sample_x, dtype=float),
+                "line_axis_mask": np.asarray(projected_mask, dtype=bool),
+                "actual_lines": list(actual_lines),
+                "segmentation_artists": [],
+                "prediction_lines": [],
+                "message_artists": [],
+            }
+            fig._measurement_curve_context = curve_context
+        else:
+            # 仅撤销上一次工艺叠加层；实际负载 Line2D 和 Tk 画布保持原样。
+            # 这既避免大文件曲线再次压缩/创建，也消除了导入工艺后的闪烁。
+            for artist_key in (
+                "segmentation_artists",
+                "prediction_lines",
+                "message_artists",
+            ):
+                for artist in list(curve_context.get(artist_key) or []):
+                    try:
+                        artist.remove()
+                    except Exception:
+                        pass
+                curve_context[artist_key] = []
+
+            optional_contexts = getattr(self, "_optional_overlay_contexts", {}) or {}
+            previous_optional_context = optional_contexts.get(id(fig), {})
+            for aux_axis in list(previous_optional_context.get("aux_axes") or []):
+                try:
+                    aux_axis.remove()
+                except Exception:
+                    try:
+                        fig.delaxes(aux_axis)
+                    except Exception:
+                        pass
+
+            actual_lines = [
+                line
+                for line in list(curve_context.get("actual_lines") or [])
+                if line in sample_ax.lines
+            ]
+        segmentation_artists = []
         if show_interval_states:
-            self.draw_segmentation_curve_background(
+            segmentation_artists = list(self.draw_segmentation_curve_background(
                 sample_ax,
                 sample_x,
                 fill_values,
@@ -575,34 +692,21 @@ class AnalysisExportMixin:
                 alpha=0.20,
                 show_labels=True,
                 zorder=1,
-            )
+            ))
 
-        preview_limit = int(getattr(self, "preview_plot_max_points", 60000) or 60000)
-        plot_x, plot_values = self._compress_plot_series_preserve_gaps(
-            sample_x,
-            actual_values,
-            preview_limit,
-        )
-        sample_ax.plot(
-            plot_x,
-            plot_values,
-            color=STYLE_MEASURED["color"],
-            linewidth=1.35,
-            linestyle="-",
-            label="实际负载",
-            zorder=4,
-        )
+        prediction_lines = []
         if (
             show_prediction
             and predicted_values is not None
             and np.any(np.isfinite(predicted_values))
         ):
+            preview_limit = int(getattr(self, "preview_plot_max_points", 60000) or 60000)
             predicted_x, predicted_plot_values = self._compress_plot_series_preserve_gaps(
                 sample_x,
                 predicted_values,
                 preview_limit,
             )
-            sample_ax.plot(
+            prediction_lines = list(sample_ax.plot(
                 predicted_x,
                 predicted_plot_values,
                 color=STYLE_PREDICTED["color"],
@@ -610,7 +714,7 @@ class AnalysisExportMixin:
                 linestyle=STYLE_PREDICTED["linestyle"],
                 label="预测负载",
                 zorder=5,
-            )
+            ))
         aux_axes = []
         overlay_plotter = getattr(
             self,
@@ -627,8 +731,9 @@ class AnalysisExportMixin:
                 )
                 or []
             )
+        message_artists = []
         if not np.any(actual_finite):
-            sample_ax.text(
+            message_artists.append(sample_ax.text(
                 0.5,
                 0.5,
                 "当前实际负载没有可显示的有效数值",
@@ -637,7 +742,7 @@ class AnalysisExportMixin:
                 transform=sample_ax.transAxes,
                 fontsize=PLOT_FONT_BASE,
                 color="#666666",
-            )
+            ))
 
         sample_ax.set_title(
             (
@@ -651,18 +756,33 @@ class AnalysisExportMixin:
         )
         sample_ax.set_xlabel(x_label)
         sample_ax.set_ylabel("功率 (W)")
+        # AutoLocator 会为整十万量级的时间轴返回略超出 xlim 的首末刻度；
+        # Tick 文本默认不裁剪，嵌入紧凑画布后会直接越过左右边界。
+        # 最终映射图使用 prune='both' 的响应式定位器，只隐藏边界外的
+        # 两端候选刻度，不改变有效数据范围、顶部程序行号轴或用户缩放。
+        sample_ax.xaxis.set_major_locator(
+            MaxNLocator(nbins="auto", prune="both")
+        )
         visible_x_mask = np.isfinite(sample_x) & projected_mask
         if not np.any(visible_x_mask):
             visible_x_mask = np.isfinite(sample_x)
         finite_x = sample_x[visible_x_mask]
-        if finite_x.size:
+        if not mapping_context_unchanged and finite_x.size:
             x_min = float(np.min(finite_x))
             x_max = float(np.max(finite_x))
             if x_max <= x_min:
                 x_max = x_min + 1.0
             sample_ax.set_xlim(x_min, x_max)
-        sample_ax.set_ylim(bottom=0.0)
-        sample_ax.margins(x=0)
+            sample_ax.margins(x=0)
+        if not reused_measurement_figure:
+            sample_ax.set_ylim(bottom=0.0)
+        elif prediction_lines:
+            finite_prediction = predicted_values[np.isfinite(predicted_values)]
+            if finite_prediction.size:
+                current_bottom, current_top = sample_ax.get_ylim()
+                prediction_top = float(np.max(finite_prediction)) * 1.05
+                if prediction_top > current_top:
+                    sample_ax.set_ylim(current_bottom, prediction_top)
 
         if x_label == "时间 (ms)" and hasattr(self, "apply_line_axis_on_time"):
             self.apply_line_axis_on_time(sample_ax, projected_mask)
@@ -676,7 +796,7 @@ class AnalysisExportMixin:
         )
         legend_style = {
             "loc": "upper left",
-            "ncol": min(5, max(legend_count, 1)),
+            "ncol": min(7, max(legend_count, 1)),
             "fontsize": PLOT_FONT_BASE - 1,
             "framealpha": 0.88,
             "borderpad": 0.35,
@@ -710,11 +830,6 @@ class AnalysisExportMixin:
             "top": 0.94,
             "bottom": 0.09,
         }
-        layout_applier = getattr(self, "_apply_optional_overlay_layout", None)
-        if callable(layout_applier):
-            layout_applier(fig, len(aux_axes), subplot_adjust)
-        else:
-            fig.subplots_adjust(**subplot_adjust)
         context_register = getattr(self, "_register_optional_overlay_context", None)
         if callable(context_register):
             context_register(
@@ -729,6 +844,26 @@ class AnalysisExportMixin:
                 legend_style=legend_style,
                 subplot_adjust=subplot_adjust,
             )
+        else:
+            layout_applier = getattr(self, "_apply_optional_overlay_layout", None)
+            if callable(layout_applier):
+                layout_applier(fig, len(aux_axes), subplot_adjust)
+            else:
+                fig.subplots_adjust(**subplot_adjust)
+
+        curve_context.update({
+            "sample_count": int(actual_values.size),
+            "source_index": source_index,
+            "data_values_id": data_values_id,
+            "x_values": np.asarray(sample_x, dtype=float),
+            "x_label": x_label,
+            "mapping_signature": mapping_signature,
+            "line_axis_mask": np.asarray(projected_mask, dtype=bool).copy(),
+            "segmentation_artists": segmentation_artists,
+            "prediction_lines": prediction_lines,
+            "message_artists": message_artists,
+        })
+        fig._measurement_curve_context = curve_context
         self.figures = [fig]
         self.figure_names = [
             "实际负载、预测负载与区间划分"
@@ -742,7 +877,28 @@ class AnalysisExportMixin:
             self._refresh_ideal_tree()
         if save:
             self.save_all_plots(silent=True)
-        self.show_current_figure(0)
+        current_fig = getattr(self, "_current_preview_fig", None)
+        current_canvas = getattr(self, "canvas_data", None)
+        if current_fig is fig and current_canvas is not None:
+            if hasattr(self, "figure_label") and hasattr(self, "update_nav_buttons"):
+                self.update_nav_buttons()
+            viewport_layout = getattr(
+                self,
+                "_layout_data_figure_for_viewport",
+                None,
+            )
+            if callable(viewport_layout):
+                try:
+                    canvas_widget = current_canvas.get_tk_widget()
+                    canvas_width = int(canvas_widget.winfo_width())
+                    canvas_height = int(canvas_widget.winfo_height())
+                except Exception:
+                    canvas_width = int(fig.get_figwidth() * fig.get_dpi())
+                    canvas_height = int(fig.get_figheight() * fig.get_dpi())
+                viewport_layout(fig, canvas_width, canvas_height)
+            current_canvas.draw_idle()
+        else:
+            self.show_current_figure(0)
         return True
 
     def _finish_segmentation_fast_plot(self, rendered, message):
@@ -4675,6 +4831,9 @@ class AnalysisExportMixin:
         canvas_widget = self.canvas_data.get_tk_widget()
         canvas_widget.grid(row=0, column=0, sticky="nsew")
         canvas_widget.configure(relief=tk.FLAT, bd=0)
+        resize_binder = getattr(self, "_bind_data_canvas_resize", None)
+        if callable(resize_binder):
+            resize_binder(canvas_widget)
         canvas_widget.bind("<Enter>", lambda _e: canvas_widget.focus_set())
         canvas_widget.focus_set()
         self._preview_canvas_widget = canvas_widget

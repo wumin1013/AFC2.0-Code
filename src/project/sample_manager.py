@@ -9,6 +9,8 @@ from .shared import *
 class SampleManagerMixin:
     _OPTIONAL_OVERLAY_SPINE_STEP_POINTS = 56.0
     _OPTIONAL_OVERLAY_EDGE_PADDING_POINTS = 64.0
+    _PLOT_BOTTOM_MARGIN_POINTS = 35.0
+    _PLOT_TOP_LINE_AXIS_MARGIN_POINTS = 34.0
 
     def show_sample_preview(self):
         """仅显示实测数据预览"""
@@ -49,46 +51,63 @@ class SampleManagerMixin:
 
         data_source_name = self.get_sample_data_source_name()
         show_measured_curve = bool(getattr(self, "show_measured_curve_var", tk.BooleanVar(value=True)).get())
+        preview_limit = int(getattr(self, "preview_plot_max_points", 60000) or 60000)
+        actual_curve_artists = []
         if context_blocks:
             drew_series = False
             if show_measured_curve and invalid_blocks:
-                self.plot_series_by_blocks(
+                actual_curve_artists.extend(self.plot_series_by_blocks(
                     ax,
                     sample_time_indices_all,
                     sample_values_all,
                     invalid_blocks,
+                    max_points=preview_limit,
                     color="#B0BEC5",
                     linewidth=1.1,
                     alpha=0.8,
                     label="非当前有效段",
                     zorder=3
-                )
+                ))
                 drew_series = True
             if show_measured_curve and valid_blocks:
-                self.plot_series_by_blocks(
+                measurement_label = (
+                    "实际负载"
+                    if str(getattr(self, "sample_data_mode", "") or "") == "experiment_measurement"
+                    and source_idx == 0
+                    else f"实测({data_source_name})"
+                )
+                actual_curve_artists.extend(self.plot_series_by_blocks(
                     ax,
                     sample_time_indices_all,
                     sample_values_all,
                     valid_blocks,
+                    max_points=preview_limit,
                     color=STYLE_MEASURED["color"],
                     linewidth=1.6,
                     alpha=0.95,
-                    label=f"实测({data_source_name})",
+                    label=measurement_label,
                     zorder=4
-                )
+                ))
                 drew_series = True
             elif show_measured_curve and context_blocks:
-                self.plot_series_by_blocks(
+                measurement_label = (
+                    "实际负载"
+                    if str(getattr(self, "sample_data_mode", "") or "") == "experiment_measurement"
+                    and source_idx == 0
+                    else f"实测({data_source_name})"
+                )
+                actual_curve_artists.extend(self.plot_series_by_blocks(
                     ax,
                     sample_time_indices_all,
                     sample_values_all,
                     context_blocks,
+                    max_points=preview_limit,
                     color="#B0BEC5",
                     linewidth=1.1,
                     alpha=0.8,
-                    label=f"实测({data_source_name})",
+                    label=measurement_label,
                     zorder=3
-                )
+                ))
                 drew_series = True
             if not drew_series:
                 ax.text(0.5, 0.5, "当前未启用任何主曲线显示", ha='center', va='center',
@@ -152,6 +171,17 @@ class SampleManagerMixin:
                 "bottom": 0.09,
             },
         )
+        fig._measurement_curve_context = {
+            "axis": ax,
+            "sample_count": int(sample_values_all.size),
+            "source_index": source_idx,
+            "data_values_id": id(getattr(self, "sample_data_values", None)),
+            "x_values": np.asarray(sample_time_indices_all, dtype=float),
+            "line_axis_mask": np.asarray(context_mask, dtype=bool),
+            "actual_lines": list(actual_curve_artists),
+            "segmentation_artists": [],
+            "prediction_lines": [],
+        }
         self.figures = [fig]
         self.figure_names = ["实测负载预览"]
         self.show_current_figure(0)
@@ -334,6 +364,18 @@ class SampleManagerMixin:
                     "linestyle": "-.",
                 })
 
+        optional_curve_variables = (
+            "show_feed_overlay_var",
+            "show_speed_overlay_var",
+            "show_ap_overlay_var",
+            "show_ae_overlay_var",
+        )
+        if not any(
+            self._optional_curve_enabled(variable_name)
+            for variable_name in optional_curve_variables
+        ):
+            return overlays
+
         process_overlays = self._get_optional_process_geometry_values()
         existing_labels = {str(item.get("label") or "") for item in overlays}
         if (
@@ -502,11 +544,49 @@ class SampleManagerMixin:
             if layout["overlay_count"] > 0
             else float(layout["base_right"])
         )
+        bottom_margin = float(layout["bottom"])
+        top_margin = float(layout["top"])
+        try:
+            figure_height_points = float(fig.get_figheight()) * 72.0
+        except Exception:
+            figure_height_points = 0.0
+        if np.isfinite(figure_height_points) and figure_height_points > 0.0:
+            compact_typography = bool(
+                getattr(fig, "_data_compact_typography", False)
+            )
+            bottom_margin_points = (
+                30.0 if compact_typography else self._PLOT_BOTTOM_MARGIN_POINTS
+            )
+            top_line_margin_points = (
+                30.0 if compact_typography else self._PLOT_TOP_LINE_AXIS_MARGIN_POINTS
+            )
+            # 原始 Figure 高度为 720/900 px，固定 9% 的下边距尚可；嵌入
+            # 较矮的发布窗口后，同一比例只剩十几像素，横轴标题会越过画布
+            # 边界并与相邻界面内容叠在一起。这里按物理字号保留最小空间。
+            bottom_margin = max(
+                bottom_margin,
+                min(0.35, bottom_margin_points / figure_height_points),
+            )
+            has_top_line_axis = any(
+                getattr(axis, "_time_line_top_axis", None) is not None
+                for axis in getattr(fig, "axes", [])
+            )
+            if has_top_line_axis:
+                responsive_top = (
+                    1.0
+                    - top_line_margin_points
+                    / figure_height_points
+                )
+                top_margin = min(top_margin, responsive_top)
+            # 极小预览区仍须给主绘图区留下可见高度。
+            top_margin = max(top_margin, bottom_margin + 0.25)
+            top_margin = min(top_margin, 0.97)
+
         fig.subplots_adjust(
             left=float(layout["left"]),
             right=right_margin,
-            top=float(layout["top"]),
-            bottom=float(layout["bottom"]),
+            top=top_margin,
+            bottom=bottom_margin,
             hspace=float(layout["hspace"]),
         )
         fig._optional_overlay_layout = layout
@@ -997,11 +1077,30 @@ class SampleManagerMixin:
         # 无 BOM 的日文/韩文旧编码与中文双字节编码有重叠。若候选解码中
         # 出现该语言特有字符，优先于本机代码页，避免“能解码但名称乱码”。
         language_hints = (
-            ("shift_jis", lambda char: 0x3040 <= ord(char) <= 0x30FF),
-            ("euc_jp", lambda char: 0x3040 <= ord(char) <= 0x30FF),
-            ("euc_kr", lambda char: 0xAC00 <= ord(char) <= 0xD7AF),
+            (
+                "shift_jis",
+                lambda char: 0x3040 <= ord(char) <= 0x30FF,
+                2,
+                0.5,
+            ),
+            (
+                "euc_jp",
+                lambda char: 0x3040 <= ord(char) <= 0x30FF,
+                2,
+                0.5,
+            ),
+            # GB18030 的部分常用中文双字节也能被 EUC-KR 严格解码，
+            # 例如“2D10-曲面-中.NC”会变成韩文与生僻汉字的混合串。
+            # 只有文本主体呈现明确的韩文特征时才提前采用 EUC-KR；否则
+            # 继续使用本机中文代码页/GB18030，避免“能解码但名称乱码”。
+            (
+                "euc_kr",
+                lambda char: 0xAC00 <= ord(char) <= 0xD7AF,
+                2,
+                0.8,
+            ),
         )
-        for encoding, character_test in language_hints:
+        for encoding, character_test, minimum_count, minimum_ratio in language_hints:
             try:
                 hinted_text = payload.decode(encoding, errors="strict")
             except UnicodeError:
@@ -1013,7 +1112,10 @@ class SampleManagerMixin:
                 or 0xAC00 <= ord(char) <= 0xD7AF
                 for char in hinted_text
             )
-            if specific_count >= 2 and specific_count / max(east_asian_count, 1) >= 0.5:
+            if (
+                specific_count >= minimum_count
+                and specific_count / max(east_asian_count, 1) >= minimum_ratio
+            ):
                 candidates.append(encoding)
         preferred = str(locale.getpreferredencoding(False) or "").strip().casefold()
         preferred_alias = {

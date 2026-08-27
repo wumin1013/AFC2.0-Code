@@ -511,9 +511,6 @@ class InputIdleMixin:
                 )
                 stage_times["plot"] = time.perf_counter() - stage_start
                 self.set_progress(96, "正在刷新过程域预览...")
-                # 导入工艺信息表后立即刷新“已设定理想值”视图
-                self._refresh_ideal_tree()
-                self._refresh_current_ideal_display()
                 total_elapsed = time.perf_counter() - total_start
                 self._refresh_import_order_controls()
                 self.set_progress(100, f"已使用解析缓存完成划分（总耗时 {total_elapsed:.1f}s）")
@@ -553,9 +550,6 @@ class InputIdleMixin:
             )
             stage_times["plot"] = time.perf_counter() - stage_start
             self.set_progress(96, "正在刷新过程域预览...")
-            # 导入工艺信息表后立即刷新“已设定理想值”视图
-            self._refresh_ideal_tree()
-            self._refresh_current_ideal_display()
             total_elapsed = time.perf_counter() - total_start
             summary_parts = []
             for key, label in (

@@ -536,14 +536,22 @@ class SegmentationPipeline:
             features["source_index"],
             errors="coerce",
         ).to_numpy(dtype=float)
-        metric_series = {
-            name: features[name]
+        metric_values = {
+            name: features[name].to_numpy(dtype=float, copy=False)
             for name in ("ap", "ae", "F_program", "MRR_program")
         }
 
-        def _range_mean_std(name: str, start_idx: int, end_idx: int) -> tuple[float, float]:
-            values = metric_series[name].iloc[int(start_idx):int(end_idx) + 1]
-            return float(values.mean()), float(values.std(ddof=0))
+        def _range_mean_std(
+            name: str,
+            start_idx: int,
+            end_idx: int,
+        ) -> tuple[float, float]:
+            # 最终区间构成不重叠的全行程分区，因此对各区间的
+            # NumPy 视图直接聚合，四个指标的总扫描量仍为 O(N)。
+            # 这同时避免 E[x^2] - E[x]^2 在大基线小波动下的
+            # 灾难性相消，也不再创建 pandas Series 切片。
+            values = metric_values[name][int(start_idx):int(end_idx) + 1]
+            return float(np.mean(values)), float(np.std(values, ddof=0))
 
         for number, segment in enumerate(decoded.segments, 1):
             interval_id = f"SEG{number:04d}"

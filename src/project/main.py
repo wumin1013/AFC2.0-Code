@@ -75,15 +75,6 @@ def main() -> int:
     root.protocol("WM_DELETE_WINDOW", _cleanup_on_exit)
     root.after(100, app.adjust_figure_sizes)
     root.deiconify()
-    def _maximize_root():
-        try:
-            root.state("zoomed")
-        except Exception:
-            try:
-                root.attributes("-zoomed", True)
-            except Exception:
-                pass
-    root.after(0, _maximize_root)
     root.mainloop()
     return 0
 

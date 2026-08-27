@@ -144,7 +144,9 @@ class SegmentationConfig:
     max_exit_mm: float = 40.0
     short_duration_penalty: float = 2.0
     # 仅是 DP 候选窗口的计算上限；持续长度约束始终使用毫米。
-    max_segment_atoms: int = 32
+    # 仅控制稳态候选评分的 NumPy 批次，不限制区间长度或候选集合。
+    # 512 可显著减少大文件上的小数组调度，同时保持评分与解码结果不变。
+    max_segment_atoms: int = 512
 
     idle_match_weight: float = 7.0
     cutting_match_weight: float = 5.0

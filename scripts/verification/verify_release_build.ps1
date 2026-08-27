@@ -132,18 +132,25 @@ if (-not (Test-Path -LiteralPath $InternalDirectory -PathType Container)) {
     throw "发布目录缺少 PyInstaller _internal 目录。"
 }
 
-$RequiredMklRuntimeFiles = @(
+$RequiredCondaRuntimeFiles = @(
     "mkl_rt.2.dll",
     "mkl_core.2.dll",
     "mkl_intel_thread.2.dll",
     "mkl_def.2.dll",
     "mkl_vml_def.2.dll",
-    "libiomp5md.dll"
+    "libiomp5md.dll",
+    "ffi.dll",
+    "libsharpyuv.dll",
+    "libwebp.dll",
+    "libwebpdemux.dll",
+    "libwebpmux.dll",
+    "tcl86t.dll",
+    "tk86t.dll"
 )
-foreach ($runtimeName in $RequiredMklRuntimeFiles) {
+foreach ($runtimeName in $RequiredCondaRuntimeFiles) {
     $runtimePath = Join-Path $InternalDirectory $runtimeName
     if (-not (Test-Path -LiteralPath $runtimePath -PathType Leaf)) {
-        throw "发布目录缺少 NumPy/Pandas 所需 MKL 运行库: $runtimeName"
+        throw "发布目录缺少所需 Conda 运行库: $runtimeName"
     }
 }
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import numpy as np
@@ -29,12 +30,14 @@ def _parse_iipinc_numeric_prefix(tokens, physical_line_number):
             f"iipinc.txt 第 {physical_line_number} 行少于 8 列"
         )
     try:
-        values = np.asarray([float(value) for value in tokens[:8]], dtype=float)
+        # 真实 iipinc 可超过 60 万行。这里保留 Python tuple，避免为每一行
+        # 创建 8 元素 NumPy 数组；最终只按物理行分组转换约数百次。
+        values = tuple(map(float, tokens[:8]))
     except (TypeError, ValueError) as exc:
         raise IipincFormatError(
             f"iipinc.txt 第 {physical_line_number} 行前 8 列包含非法数值"
         ) from exc
-    if not np.all(np.isfinite(values)):
+    if not all(map(math.isfinite, values)):
         raise IipincFormatError(
             f"iipinc.txt 第 {physical_line_number} 行前 8 列包含非有限数值"
         )
@@ -95,7 +98,7 @@ def parse_iipinc_rows(rows):
         if pending_values is None:
             pending_values = values
             continue
-        if not np.array_equal(pending_values, values):
+        if paired_format and pending_values != values:
             paired_format = False
         pending_values = None
 

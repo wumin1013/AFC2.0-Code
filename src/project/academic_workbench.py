@@ -499,13 +499,59 @@ class AcademicWorkbenchMixin:
                 "请补齐 N 列或绑定原始 NC 文件后重试"
             )
 
-        context = self._get_current_sample_line_point_context(line_numbers=sample_lines)
-        if not context:
-            raise ValueError("无法建立实际负载的行号/点号上下文")
-        point_indices = np.asarray(context.get("point_indices", []), dtype=int)
-        sample_x = np.asarray(context.get("x_positions", []), dtype=float)
+        # 导入阶段已经同时生成了全局点内序号与横坐标；映射只需要这两项，
+        # 无需再为 66 万点构造当前路径不使用的 point_widths 等完整上下文。
+        cached_point_indices = getattr(self, "sample_data_point_indices", None)
+        cached_sample_x = getattr(self, "sample_data_x_positions", None)
+        point_indices = (
+            np.asarray(cached_point_indices, dtype=int).reshape(-1)
+            if cached_point_indices is not None
+            else np.asarray([], dtype=int)
+        )
+        sample_x = (
+            np.asarray(cached_sample_x, dtype=float).reshape(-1)
+            if cached_sample_x is not None
+            else np.asarray([], dtype=float)
+        )
+        context = None
+        if point_indices.size != sample_lines.size or sample_x.size != sample_lines.size:
+            context = self._get_current_sample_line_point_context(
+                line_numbers=sample_lines
+            )
+            if not context:
+                raise ValueError("无法建立实际负载的行号/点号上下文")
+            point_indices = np.asarray(
+                context.get("point_indices", []),
+                dtype=int,
+            ).reshape(-1)
+            sample_x = np.asarray(
+                context.get("x_positions", []),
+                dtype=float,
+            ).reshape(-1)
         if point_indices.size != sample_lines.size or sample_x.size != sample_lines.size:
             raise ValueError("实际负载的点号或坐标数量与采样数量不一致")
+
+        line_index_lookup = (
+            context.get("line_index_lookup")
+            if isinstance(context, dict)
+            else None
+        )
+        if not isinstance(line_index_lookup, dict):
+            sort_order = np.argsort(sample_lines, kind="stable")
+            sorted_lines = sample_lines[sort_order]
+            unique_lines, first_positions = np.unique(
+                sorted_lines,
+                return_index=True,
+            )
+            end_positions = np.append(first_positions[1:], sorted_lines.size)
+            line_index_lookup = {
+                int(line_no): sort_order[int(start_pos):int(end_pos)]
+                for line_no, start_pos, end_pos in zip(
+                    unique_lines,
+                    first_positions,
+                    end_positions,
+                )
+            }
 
         process_starts = []
         previous_process_end = -1
@@ -629,10 +675,16 @@ class AcademicWorkbenchMixin:
             else "按程序行号与点内顺序精确映射"
         )
 
-        pair_counts = {}
-        for line_no, point_idx in zip(sample_lines, point_indices):
-            key = (int(line_no), int(point_idx))
-            pair_counts[key] = pair_counts.get(key, 0) + 1
+        def _coordinate_occurrence_count(line_no, point_idx):
+            matching_indices = np.asarray(
+                line_index_lookup.get(int(line_no), []),
+                dtype=int,
+            )
+            if matching_indices.size == 0:
+                return 0
+            return int(np.count_nonzero(
+                point_indices[matching_indices] == int(point_idx)
+            ))
 
         materialized = []
         for record, local_start, local_end in zip(
@@ -696,7 +748,7 @@ class AcademicWorkbenchMixin:
                 (int(record["sample_start_line"]), int(record["sample_start_point_index"])),
                 (int(record["sample_end_line"]), int(record["sample_end_point_index"])),
             ):
-                if pair_counts.get(key, 0) != 1:
+                if _coordinate_occurrence_count(*key) != 1:
                     raise ValueError(
                         f"实际采样坐标 {key[0]}.{key[1]} 在重复程序块中不唯一"
                     )

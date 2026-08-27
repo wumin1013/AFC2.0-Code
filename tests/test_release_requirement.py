@@ -24,6 +24,7 @@ from project.analysis_export import AnalysisExportMixin
 from project.config_state import ConfigStateMixin
 from project.interval_runtime import IntervalRuntimeMixin
 from project.plot_support import PlotSupportMixin
+from project.processing_core import ProcessingCoreMixin
 from project.prediction_support import (
     append_inverse_prediction_channels,
     apply_steady_representative_prediction,
@@ -39,6 +40,10 @@ from project.release_prediction import (
     parse_iipinc_rows,
 )
 from project.sample_manager import SampleManagerMixin
+from project.ui_bootstrap import (
+    DEFAULT_DATA_PREVIEW_RATIO,
+    calculate_initial_window_geometry,
+)
 
 
 class _ReleaseStartupHarness(InputIdleMixin):
@@ -274,6 +279,110 @@ class _ReleasePlotHarness(AnalysisExportMixin, PlotSupportMixin):
 
 
 class ReleaseRequirementTests(unittest.TestCase):
+    def test_contiguous_blocks_cover_boolean_mask_boundaries(self):
+        harness = PlotSupportMixin()
+        cases = (
+            (None, []),
+            (np.asarray([], dtype=bool), []),
+            (np.asarray([False, False, False]), []),
+            (np.asarray([True, True, True]), [(0, 2)]),
+            (np.asarray([True]), [(0, 0)]),
+            (np.asarray([False]), []),
+            (
+                np.asarray([False, True, True, False, True, False, True, True]),
+                [(1, 2), (4, 4), (6, 7)],
+            ),
+        )
+
+        for mask, expected in cases:
+            with self.subTest(mask=None if mask is None else mask.tolist()):
+                self.assertEqual(expected, harness.compute_contiguous_blocks(mask))
+
+    def test_optional_measurement_overlays_skip_geometry_when_all_disabled(self):
+        manager = SampleManagerMixin()
+        manager.sample_data_values = None
+        manager.sample_data_mode = "sampledata"
+        manager.show_feed_overlay_var = _ValueVar(False)
+        manager.show_speed_overlay_var = _ValueVar(False)
+        manager.show_ap_overlay_var = _ValueVar(False)
+        manager.show_ae_overlay_var = _ValueVar(False)
+
+        with patch.object(
+            manager,
+            "_get_optional_process_geometry_values",
+            side_effect=AssertionError("关闭附加曲线时不应构造工艺几何"),
+        ) as geometry_getter:
+            overlays = manager.get_optional_measurement_overlays()
+
+        self.assertEqual([], overlays)
+        geometry_getter.assert_not_called()
+
+    def test_optional_measurement_overlays_keep_enabled_geometry(self):
+        manager = SampleManagerMixin()
+        manager.sample_data_values = None
+        manager.sample_data_mode = "sampledata"
+        manager.show_feed_overlay_var = _ValueVar(False)
+        manager.show_speed_overlay_var = _ValueVar(False)
+        manager.show_ap_overlay_var = _ValueVar(True)
+        manager.show_ae_overlay_var = _ValueVar(False)
+        ap_values = np.asarray([1.0, 2.0])
+
+        with patch.object(
+            manager,
+            "_get_optional_process_geometry_values",
+            return_value={"ap": ap_values},
+        ) as geometry_getter:
+            overlays = manager.get_optional_measurement_overlays()
+
+        geometry_getter.assert_called_once_with()
+        self.assertEqual(1, len(overlays))
+        self.assertEqual("ap(切深)", overlays[0]["label"])
+        np.testing.assert_array_equal(ap_values, overlays[0]["values"])
+
+    def test_complete_line_numbers_skip_nc_group_collection(self):
+        harness = ProcessingCoreMixin()
+        rows = [
+            {"line_no_raw": 10, "gcode_content": "G1 X1"},
+            {"line_no_raw": 11, "gcode_content": "G1 X2"},
+        ]
+
+        with patch.object(
+            harness,
+            "_collect_process_gcode_groups",
+            side_effect=AssertionError("完整行号不应收集 G 代码组"),
+        ) as group_collector:
+            diagnostics = harness._restore_missing_line_numbers_from_nc_profile(rows)
+
+        group_collector.assert_not_called()
+        self.assertEqual("input", diagnostics["line_number_source"])
+        self.assertEqual(0, diagnostics["nc_process_group_count"])
+        self.assertEqual(0, diagnostics["nc_matched_group_count"])
+        self.assertEqual(["input", "input"], [row["line_number_source"] for row in rows])
+
+    def test_missing_line_number_keeps_nc_group_completion(self):
+        harness = ProcessingCoreMixin()
+        rows = [
+            {"line_no_raw": 42, "gcode_content": "G1 X1"},
+            {"line_no_raw": None, "gcode_content": "G1 X1"},
+        ]
+        original_collector = harness._collect_process_gcode_groups
+
+        with patch.object(
+            harness,
+            "_collect_process_gcode_groups",
+            wraps=original_collector,
+        ) as group_collector:
+            diagnostics = harness._restore_missing_line_numbers_from_nc_profile(rows)
+
+        group_collector.assert_called_once_with(rows)
+        self.assertEqual("input_with_gcode_group_completion", diagnostics["line_number_source"])
+        self.assertEqual(1, diagnostics["nc_process_group_count"])
+        self.assertEqual(0, diagnostics["nc_matched_group_count"])
+        self.assertEqual(1, diagnostics["gcode_group_completed_row_count"])
+        self.assertEqual([42, 42], [row["line_no_raw"] for row in rows])
+        self.assertEqual("input", rows[0]["line_number_source"])
+        self.assertEqual("gcode_group_anchor", rows[1]["line_number_source"])
+
     def test_frozen_release_output_root_is_executable_directory(self):
         with TemporaryDirectory() as temp_dir:
             release_root = Path(temp_dir).resolve()
@@ -373,6 +482,29 @@ if missing:
         self.assertFalse(AFCReleaseApplication.enable_research_features)
         self.assertFalse(AFCReleaseApplication.enable_profile_config)
 
+    def test_frozen_release_sets_unicode_tcl_tk_data_paths(self):
+        import project.release_main as release_main
+
+        with TemporaryDirectory(prefix="AFC中文路径-") as temp_dir:
+            internal_root = Path(temp_dir) / "_internal"
+            tcl_data = internal_root / "_tcl_data"
+            tk_data = internal_root / "_tk_data"
+            tcl_data.mkdir(parents=True)
+            tk_data.mkdir(parents=True)
+            with patch.object(sys, "frozen", True, create=True), patch.object(
+                sys,
+                "_MEIPASS",
+                str(internal_root),
+                create=True,
+            ), patch.dict(
+                os.environ,
+                {"TCL_LIBRARY": "stale-tcl", "TK_LIBRARY": "stale-tk"},
+                clear=False,
+            ):
+                release_main._configure_frozen_tk_data_paths()
+                self.assertEqual(str(tcl_data.resolve()), os.environ["TCL_LIBRARY"])
+                self.assertEqual(str(tk_data.resolve()), os.environ["TK_LIBRARY"])
+
     def test_release_main_smoke_mode_initializes_without_entering_mainloop(self):
         import project.release_main as release_main
 
@@ -386,7 +518,7 @@ if missing:
                 events.append("title")
 
             def update_idletasks(self):
-                events.append("update_idletasks")
+                raise AssertionError("冒烟模式不得无界排空 Tk idle 队列")
 
             def destroy(self):
                 events.append("destroy")
@@ -427,7 +559,6 @@ if missing:
             self.assertEqual(0, release_main.main())
 
         self.assertIn("application", events)
-        self.assertIn("update_idletasks", events)
         self.assertIn("destroy", events)
 
     def test_release_main_retries_transient_frozen_executable_lock(self):
@@ -470,18 +601,46 @@ if missing:
         self.assertEqual(3, loader.call_count)
         self.assertEqual(2, sleeper.call_count)
 
-    def test_packaging_spec_collects_dynamic_mkl_runtime(self):
+    def test_main_and_release_keep_parent_aligned_upper_window_geometry(self):
+        main_source = (SRC_ROOT / "project" / "main.py").read_text(
+            encoding="utf-8"
+        )
+        release_source = (SRC_ROOT / "project" / "release_main.py").read_text(
+            encoding="utf-8"
+        )
+        ui_source = (SRC_ROOT / "project" / "ui_bootstrap.py").read_text(
+            encoding="utf-8"
+        )
+
+        for source in (main_source, release_source, ui_source):
+            self.assertNotIn('state("zoomed")', source)
+            self.assertNotIn('attributes("-zoomed"', source)
+        self.assertEqual((972, 567, 0, 0), calculate_initial_window_geometry())
+        self.assertIn("CHILD_WINDOW_RATIO = 0.9", ui_source)
+        self.assertIn("MIN_WINDOW_WIDTH = 640", ui_source)
+        self.assertIn("MIN_WINDOW_HEIGHT = 400", ui_source)
+        self.assertEqual(0.68, DEFAULT_DATA_PREVIEW_RATIO)
+
+    def test_packaging_spec_collects_dynamic_conda_runtime(self):
         spec_text = (PROJECT_ROOT / "packaging" / "AFC2_onedir.spec").read_text(
             encoding="utf-8"
         )
-        for runtime_name in (
+        runtime_names = (
             "mkl_rt.2.dll",
             "mkl_core.2.dll",
             "mkl_intel_thread.2.dll",
             "mkl_def.2.dll",
             "mkl_vml_def.2.dll",
             "libiomp5md.dll",
-        ):
+            "ffi.dll",
+            "libsharpyuv.dll",
+            "libwebp.dll",
+            "libwebpdemux.dll",
+            "libwebpmux.dll",
+            "tcl86t.dll",
+            "tk86t.dll",
+        )
+        for runtime_name in runtime_names:
             self.assertIn(runtime_name, spec_text)
 
         self.assertNotIn('"project.prediction_support",', spec_text)
@@ -492,6 +651,8 @@ if missing:
         verifier_text = (
             PROJECT_ROOT / "scripts" / "verification" / "verify_release_build.ps1"
         ).read_text(encoding="utf-8")
+        for runtime_name in runtime_names:
+            self.assertIn(runtime_name, verifier_text)
         self.assertIn('$RequiredArchiveModules = @(', verifier_text)
         self.assertIn('"project.prediction_support"', verifier_text)
         self.assertIn('"project.release_prediction"', verifier_text)
@@ -598,6 +759,22 @@ if missing:
         self.assertEqual("gb18030", manager._sample_program_file_encoding)
         self.assertEqual("613448256", programs["1D10-外形.NC"]["program_number"])
         self.assertEqual([(23, 643)], programs["1D10-外形.NC"]["tools"]["T0"])
+
+    def test_sample_program_txt_does_not_mistake_gb18030_for_euc_kr(self):
+        manager = SampleManagerMixin()
+        with TemporaryDirectory() as temp_dir:
+            txt_path = Path(temp_dir) / "SampleData.txt"
+            txt_path.write_bytes(
+                "2D10-曲面-中.NC:613448256:T0:37-733;\r\n".encode("gb18030")
+            )
+            programs = manager.parse_sample_program_file(txt_path)
+
+        self.assertEqual("gb18030", manager._sample_program_file_encoding)
+        self.assertIn("2D10-曲面-中.NC", programs)
+        self.assertEqual(
+            [(37, 733)],
+            programs["2D10-曲面-中.NC"]["tools"]["T0"],
+        )
 
     def test_sample_program_txt_accepts_common_unicode_and_legacy_encodings(self):
         cases = (
@@ -1199,14 +1376,11 @@ if missing:
             "segment_type": "steady",
             "start_line": 10,
             "end_line": 11,
+            "sample_start_idx": 0,
+            "sample_end_idx": 2,
         }
         harness._get_current_interval_records = lambda **_kwargs: [steady_record]
         harness._get_steady_interval_records = lambda records=None: list(records or [])
-        harness._build_interval_sample_mask = (
-            lambda _interval, _size, line_numbers=None: np.asarray(
-                [True, False, True, False]
-            )
-        )
 
         mean_value, count, ranges = harness.compute_tool_measured_mean("P1", "T0")
 

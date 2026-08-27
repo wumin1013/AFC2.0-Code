@@ -1207,6 +1207,124 @@ class SemiMarkovDecoder:
             evidence_lengths = np.maximum(durations, max(tolerance, 1e-6))
             # 同一终点的六类候选共享一次向量化区间统计。
             local_values = scorer.score_candidates(starts, end_atom)
+            if len(starts) == 1:
+                # 绝大多数工艺点只有“当前单原子”一个候选。旧实现仍为
+                # 每个状态反复创建 1 元素 NumPy 数组；五万点文件会产生
+                # 数十万次小数组分配。标量路径保持同一评分、前驱选择和
+                # tie-break 规则，只消除这些固定开销。
+                start_atom = int(starts[0])
+                duration = float(durations[0])
+                evidence_length = float(evidence_lengths[0])
+                for (
+                    state,
+                    state_idx,
+                    minimum,
+                    maximum,
+                    _chunk_limited,
+                    previous_indices,
+                    previous_penalties,
+                    is_initial_state,
+                ) in state_plans:
+                    duration_adjustment = 0.0
+                    if minimum > tolerance and duration < minimum - tolerance:
+                        duration_adjustment = (
+                            -float(self.config.short_duration_penalty)
+                            * (minimum - duration)
+                            / minimum
+                        )
+                    valid_duration = duration <= maximum + tolerance
+                    if state is SegmentState.STEADY:
+                        valid_duration = bool(
+                            valid_duration
+                            and structural_steady_starts.size == 1
+                            and start_atom == int(structural_steady_starts[0])
+                            and duration >= minimum - tolerance
+                        )
+                    elif state in {SegmentState.IDLE, SegmentState.NONSTEADY}:
+                        valid_duration = bool(
+                            valid_duration and start_atom == end_atom
+                        )
+
+                    segment_score = (
+                        float(local_values[state][0]) * evidence_length
+                        + duration_adjustment
+                    )
+                    direct_usable = bool(
+                        valid_duration and np.isfinite(segment_score)
+                    )
+                    if state is not SegmentState.STEADY and not direct_usable:
+                        continue
+
+                    base_score = float("-inf")
+                    previous_choice = -1
+                    if (
+                        start_atom == 0
+                        and is_initial_state
+                        and direct_usable
+                    ):
+                        base_score = 0.0
+                    elif (
+                        start_atom > 0
+                        and direct_usable
+                        and previous_indices.size
+                    ):
+                        previous_values = (
+                            scores[start_atom - 1, previous_indices]
+                            - previous_penalties
+                        )
+                        row_max = float(np.max(previous_values))
+                        for column, previous_value in enumerate(previous_values):
+                            if (
+                                np.isfinite(previous_value)
+                                and previous_value >= row_max - epsilon
+                            ):
+                                base_score = float(previous_value)
+                                previous_choice = int(previous_indices[column])
+                                break
+
+                    candidate_score = (
+                        base_score + segment_score
+                        if direct_usable
+                        else float("-inf")
+                    )
+                    if (
+                        state is SegmentState.STEADY
+                        and start_atom == end_atom
+                        and start_atom > 0
+                        and np.isfinite(scores[start_atom - 1, state_idx])
+                    ):
+                        continuation_value = float(
+                            scorer.score_steady_continuation_candidates(
+                                (start_atom,),
+                                end_atom,
+                            )[0]
+                        )
+                        continuation_score = (
+                            float(scores[start_atom - 1, state_idx])
+                            + continuation_value * evidence_length
+                            if np.isfinite(continuation_value)
+                            else float("-inf")
+                        )
+                        prefer_continuation = (
+                            continuation_score > candidate_score + epsilon
+                        )
+                        tied_continuation = bool(
+                            np.isfinite(continuation_score)
+                            and np.isfinite(candidate_score)
+                            and abs(continuation_score - candidate_score)
+                            <= epsilon
+                            and previous_choice != state_idx
+                        )
+                        if prefer_continuation or tied_continuation:
+                            candidate_score = continuation_score
+                            previous_choice = state_idx
+
+                    if not np.isfinite(candidate_score):
+                        continue
+                    scores[end_atom, state_idx] = candidate_score
+                    back_start[end_atom, state_idx] = start_atom
+                    back_state[end_atom, state_idx] = previous_choice
+                continue
             for (
                 state,
                 state_idx,

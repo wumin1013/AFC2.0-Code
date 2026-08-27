@@ -12,6 +12,22 @@ _RUNTIME_LOAD_RETRY_ATTEMPTS = 12
 _RUNTIME_LOAD_RETRY_DELAY_SECONDS = 0.5
 
 
+def _configure_frozen_tk_data_paths() -> None:
+    """用 Unicode 路径显式定位冻结包内的 Tcl/Tk 数据目录。"""
+    if not getattr(sys, "frozen", False):
+        return
+    internal_root = Path(
+        getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent / "_internal")
+    ).resolve()
+    for variable_name, directory_name in (
+        ("TCL_LIBRARY", "_tcl_data"),
+        ("TK_LIBRARY", "_tk_data"),
+    ):
+        data_path = internal_root / directory_name
+        if data_path.is_dir():
+            os.environ[variable_name] = str(data_path)
+
+
 def _load_runtime_components():
     """延迟加载发布运行组件，使导入阶段错误也能被主入口记录。"""
     if __package__ in (None, ""):
@@ -110,6 +126,7 @@ def main() -> int:
     components = {}
     root = None
     try:
+        _configure_frozen_tk_data_paths()
         components = _load_runtime_components_with_retry()
         components["fast_startup"]()
         components["optimize_memory"]()
@@ -120,14 +137,13 @@ def main() -> int:
         components["configure_style"](style)
         app = components["application"](root)
         if os.environ.get("AFC_RELEASE_SMOKE_TEST") == "1":
-            root.update_idletasks()
+            # 冒烟模式只验证冻结依赖、Tk 和发布应用能完成构造。
+            # update_idletasks() 会无界排空 TkAgg 的 idle 队列，特定
+            # Windows/Tk/DPI 组合下可能陷入 Configure/draw_idle 反馈；
+            # root.update() 还会误执行自动加载定时器，因此这里直接退出。
             return 0
         root.protocol("WM_DELETE_WINDOW", components["cleanup"])
         root.deiconify()
-        try:
-            root.state("zoomed")
-        except Exception:
-            pass
         root.mainloop()
         return 0
     except Exception as exc:
