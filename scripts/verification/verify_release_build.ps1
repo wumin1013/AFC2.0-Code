@@ -2,7 +2,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$ReleaseDirectory,
     [string]$PythonPath = "",
-    [string]$ExpectedVersion = "AFC2.0.2alpha",
+    [Parameter(Mandatory = $true)][string]$ExpectedVersion,
     [string]$ProjectRoot = ""
 )
 

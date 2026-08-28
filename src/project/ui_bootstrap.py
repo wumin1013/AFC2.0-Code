@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .shared import *
+from .release_metadata import RELEASE_VERSION
 
 
 PARENT_WINDOW_WIDTH = 1080
@@ -15,7 +16,7 @@ DATA_UI_FONT_BOLD = ("Microsoft YaHei UI", 9, "bold")
 DATA_UI_FONT_SMALL = ("Microsoft YaHei UI", 8)
 DATA_UI_FONT_HEADING = ("Microsoft YaHei UI", 10, "bold")
 DEFAULT_DATA_PREVIEW_RATIO = 0.68
-RELEASE_UI_BUILD_MARKER = "AFC2.0.2alpha 20260827-v3"
+RELEASE_UI_BUILD_MARKER = RELEASE_VERSION
 
 
 def calculate_initial_window_geometry():

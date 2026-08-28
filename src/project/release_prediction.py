@@ -182,7 +182,7 @@ def _file_signature(path):
 
 
 class ReleasePredictionMixin:
-    """AFC2.0.2alpha 发布版的会话内反解与负载预测。"""
+    """AFC2 发布版的会话内反解与负载预测。"""
 
     release_idle_power_w = RELEASE_IDLE_POWER_W
 

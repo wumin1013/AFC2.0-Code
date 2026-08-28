@@ -17,7 +17,7 @@ python src/project/main.py
 
 主代码点击“导入 SampleData”时，应在同一个多选窗口内同时选择一对同目录、同主文件名的 CSV 和 TXT，例如 `SampleData_1.csv` 与 `SampleData_1.txt`；只选一个文件或文件名不配对时不会开始加载。
 
-### AFC2.0.2alpha 发布模式
+### 当前发布模式（AFC2.0.2alpha）
 
 发布模式使用独立入口，启动时优先自动读取文件名逐字符完全匹配的 `SampleData.csv` 与 `SampleData.txt`；CSV/TXT 支持 UTF-8/BOM、UTF-16/32、GB18030/GBK、Big5、Shift-JIS、EUC-JP/KR 和常见 Windows ANSI 编码，并避免把可被 EUC-KR 严格解码的 GB18030 中文程序名误判为韩文。文件对缺失或无效时，回退识别 EXE 同目录唯一的实验实测通道导出 CSV。错误大小写、增加后缀或改名后的文件不作为 SampleData。导入工艺信息并完成六态划分后，以固定 `P_idle=250 W` 和编程 F 反解全局 `Kc/Ke`，再优先使用 EXE 同目录 `iipinc.txt` 的指令进给计算预测负载；缺失、无效或未覆盖的指令进给逐行回退工艺信息中的编程进给。反解始终执行，预测曲线默认隐藏，可通过图形工具栏的“预测负载”勾选框显示。右侧“运行结果”只显示处理、实际负载和预测负载三项通俗状态，启动与导入过程中合并重复绘图刷新。六态解码为单原子候选使用等价的标量快速路径，长工艺文件不再为每个状态创建大量单元素数组。发布包仍不包含 PIT / SMIF、profile、scikit-learn 或 SciPy。
 
@@ -31,10 +31,30 @@ python src/project/main.py
 
 实验实测 CSV 与 `iipinc.txt` 均使用批量/轻量解析路径；`iipinc.txt` 不再为每个物理行创建小型 NumPy 数组。真实 53 MB、641,094 行文件的冷解析约由 5.1 秒降至 1.9 秒，同时继续保持“预测曲线默认隐藏、后台预测已经生成”的行为。
 
-发布目录采用 PyInstaller 6.12.0 的 `onedir`、`windowed` 模式：
+## 发布产物与版本规则
+
+当前发布版本由 `src/project/release_metadata.py` 中的 `RELEASE_VERSION` 唯一定义，当前值为 `AFC2.0.2alpha`。以后升级为 `AFC2.0.2beta`、`AFC2.0.3alpha` 等版本时，只修改这个常量；EXE 文件名、窗口标题、发布说明、构建清单、版本专属调试目录和最小 ZIP 名都会随之更新。调试目录中的阶段名首字母大写，例如 `alpha` 对应 `Alpha-debug`、`beta` 对应 `Beta-debug`。
+
+每个版本生成一套独立且长期保留的调试目录和最小发布包。当前 Alpha 版本为：
 
 ```text
-AFC2.0.2alpha/
+release_versions/
+├─ AFC2.0.2Alpha-debug/
+│  ├─ AFC2.0.2alpha.exe
+│  ├─ _internal/
+│  ├─ 发布说明.txt
+│  ├─ build-manifest.json
+│  ├─ SHA256SUMS.txt
+│  └─ 调试输入、运行结果、config/、data/ 等调试现场
+└─ AFC2.0.2alpha.zip
+```
+
+版本专属调试目录采用 PyInstaller 6.12.0 的 `onedir`、`windowed` 模式。该目录专门用于持续调试，允许并需要保留其中的输入、结果、本机配置和运行状态；重新构建同一版本时，脚本只替换 EXE、`_internal/`、发布说明、构建清单和校验清单，其余调试现场会完整备份、恢复并逐文件复核 SHA-256。不同版本的调试目录和 ZIP 彼此独立且长期保留，例如以后构建 `AFC2.0.2Beta-debug/` 与 `AFC2.0.2beta.zip` 时，不会迁移、覆盖或删除 Alpha 的两个发布产物。
+
+最小 ZIP 是唯一用于交付的干净发布包。它只包含以下可运行载荷，不包含调试目录中的 CSV/TXT 输入、结果文件、`config/`、`data/`、源码、测试或缓存：
+
+```text
+AFC2.0.2alpha.zip
 ├─ AFC2.0.2alpha.exe
 ├─ _internal/
 ├─ 发布说明.txt
@@ -42,7 +62,7 @@ AFC2.0.2alpha/
 └─ SHA256SUMS.txt
 ```
 
-必须交付完整目录，不能只发送 EXE。外部软件应在程序启动前将以下运行输入放到 EXE 同目录：
+必须交付完整 ZIP，不能只发送 EXE。解压后，外部软件应在程序启动前将以下运行输入放到 EXE 同目录：
 
 ```text
 SampleData.csv
@@ -72,20 +92,20 @@ iipinc.txt        # 可选；缺失或无效时使用工艺信息中的 F
   -PythonPath 'C:\path\to\AFC\python.exe'
 ```
 
-默认可交付候选包位于 `release_versions/AFC2.0.2alpha/`，不会执行正式归档。替换旧目录前，脚本会备份根目录现存的 CSV、`SampleData*.txt` 和 `iipinc.txt`，新包就位后按 SHA-256 原样恢复；这些运行文件不属于发布载荷。构建验证通过后会自动删除 `.build-AFC2.0.2alpha` 中间目录；如需在构建前清理失败构建留下的缓存，可增加 `-CleanBuild`。脚本只操作项目 `release_versions/` 下的专用目录，不会清理源码研究模式的 `output/`。
+默认生成 `release_versions/AFC2.0.2Alpha-debug/` 和 `release_versions/AFC2.0.2alpha.zip`。脚本先构建并验证纯净候选目录，再从该候选目录生成 ZIP、解压 ZIP 并再次完整验证；两者均成功后才替换当前版本的调试目录、恢复该版本的调试现场并替换同版本 ZIP。其他版本的 `*-debug/` 与 ZIP 保持独立并长期保留。构建验证通过后会自动删除 `.build-AFC2.0.2alpha` 中间目录；如需在构建前清理失败构建留下的缓存，可增加 `-CleanBuild`。脚本只操作当前版本的发布产物和专用构建中间目录，不会清理其他版本或源码研究模式的 `output/`。
 
 ```powershell
 & .\scripts\build_release.ps1 -CleanBuild
 ```
 
-正式归档必须显式提供完整目标目录，且要求 Git 工作区干净；脚本会自动使用全量干净构建，不复用候选缓存：
+如需在 `release_versions/` 之外额外留存正式归档，必须显式提供完整目标目录，且要求 Git 工作区干净；脚本会从已经验证的最小 ZIP 解压归档，不会带入任何版本调试目录的数据：
 
 ```powershell
 & .\scripts\build_release.ps1 `
   -ArchiveDestination 'C:\path\to\历史归档\AFC2.0.2alpha'
 ```
 
-归档流程先复制到目标父目录中的临时目录，重新校验 SHA-256 和 denylist，再在同一父目录内改名。最终目标已存在时立即停止，绝不覆盖。二进制发布包不提交 Git。
+归档流程先解压到目标父目录中的临时目录，重新校验 SHA-256 和 denylist，再在同一父目录内改名。最终目标已存在时立即停止，绝不覆盖。二进制发布包不提交 Git。
 
 ## 验证现有发布目录
 
@@ -93,9 +113,12 @@ iipinc.txt        # 可选；缺失或无效时使用工艺信息中的 F
 
 ```powershell
 & .\scripts\verification\verify_release_build.ps1 `
-  -ReleaseDirectory '.\release_versions\AFC2.0.2alpha' `
+  -ReleaseDirectory 'C:\temp\AFC2.0.2alpha-clean' `
+  -ExpectedVersion 'AFC2.0.2alpha' `
   -PythonPath 'C:\path\to\AFC\python.exe'
 ```
+
+其中 `ReleaseDirectory` 应指向最小 ZIP 解压得到的空白发布目录。版本专属调试目录包含额外调试现场，不用于纯净性验证；对它重点验证 EXE 启动和该版本调试数据是否保留。构建脚本会自动完成候选目录与最小 ZIP 解压目录的两轮完整验证。
 
 验证内容包括：
 
@@ -131,7 +154,7 @@ tests/                 自动化回归测试
 docs/                  需求与技术文档
 archive/               不参与当前运行的历史源码
 output/                源码研究模式的程序输出和临时结果
-release_versions/      本机多文件发布版本（不纳入 Git）
+release_versions/      各版本独立调试目录与当前最小 ZIP（不纳入 Git）
 ```
 
 `config/app_config.json`、`data/runtime/`、`profiles/cache/`、`output/` 和 `release_versions/` 属于本机可变内容，均不纳入版本管理。发布构建不会复制这些目录，也不会复制 `data/sample/` 或 `profiles/`。

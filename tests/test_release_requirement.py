@@ -39,6 +39,7 @@ from project.release_prediction import (
     map_iipinc_feed_to_samples,
     parse_iipinc_rows,
 )
+from project.release_metadata import RELEASE_VERSION
 from project.sample_manager import SampleManagerMixin
 from project.ui_bootstrap import (
     DEFAULT_DATA_PREVIEW_RATIO,
@@ -392,7 +393,7 @@ class ReleaseRequirementTests(unittest.TestCase):
 import sys
 from pathlib import Path
 sys.frozen = True
-sys.executable = str(Path(r'%s') / 'AFC2.0.2alpha.exe')
+sys.executable = str(Path(r'%s') / '%s.exe')
 sys._MEIPASS = str(Path(r'%s'))
 sys.path.insert(0, str(Path(r'%s')))
 import project.shared as shared
@@ -401,7 +402,7 @@ if shared.OUTPUT_DIR != expected:
     raise SystemExit(f'OUTPUT_DIR={shared.OUTPUT_DIR}, expected={expected}')
 if (expected / 'output').exists():
     raise SystemExit('frozen import created output directory')
-""" % (release_root, internal_root, SRC_ROOT, release_root)
+""" % (release_root, RELEASE_VERSION, internal_root, SRC_ROOT, release_root)
             completed = subprocess.run(
                 [sys.executable, "-c", code],
                 cwd=str(PROJECT_ROOT),
@@ -433,7 +434,7 @@ if (expected / 'output').exists():
             with patch.object(sys, "frozen", True, create=True), patch.object(
                 sys,
                 "executable",
-                str(release_root / "AFC2.0.2alpha.exe"),
+                str(release_root / f"{RELEASE_VERSION}.exe"),
             ):
                 log_path = Path(release_main._write_startup_error(RuntimeError("test")))
             self.assertEqual(release_root / "startup-error.log", log_path)
@@ -581,7 +582,7 @@ if missing:
             ),
             "ttk": SimpleNamespace(Style=lambda: object()),
         }
-        transient_error = PermissionError(13, "Permission denied", "AFC2.0.2alpha.exe")
+        transient_error = PermissionError(13, "Permission denied", f"{RELEASE_VERSION}.exe")
         with patch.dict(
             os.environ,
             {"AFC_RELEASE_SMOKE_TEST": "1", "SUPPRESS_MESSAGEBOXES": "1"},
@@ -665,18 +666,48 @@ if missing:
             encoding="utf-8"
         )
         self.assertIn('Join-Path $ProjectRoot "release_versions"', build_script)
-        self.assertIn('$FinalReleaseDirectory = Join-Path $OutputRoot $ProductName', build_script)
+        self.assertIn("Get-DebugDirectoryName", build_script)
+        self.assertIn(
+            "$DebugDirectoryName = Get-DebugDirectoryName -ProductName $ProductName",
+            build_script,
+        )
+        self.assertIn('$FinalReleaseDirectory = Join-Path $OutputRoot $DebugDirectoryName', build_script)
+        self.assertIn('$FinalMinimalArchive = Join-Path $OutputRoot "$ProductName.zip"', build_script)
         self.assertNotIn('Join-Path $ProjectOutputRoot "release"', build_script)
-        for runtime_name in (
-            "SampleData.csv",
-            "SampleData.txt",
-            "iipinc.txt",
-            "SampleData.rg",
-            "ProcessDataPath.txt",
-        ):
-            self.assertIn(runtime_name, build_script)
-        self.assertIn('$RuntimeInputPatterns = @("*.csv", "SampleData*.txt")', build_script)
+        self.assertIn('$DebugStateBackupDirectory = Join-Path $ReleaseBuildRoot "debug-state-backup"', build_script)
+        self.assertIn("Test-ReleasePayloadRootName", build_script)
+        self.assertIn("CreateFromDirectory", build_script)
+        self.assertIn("ExtractToDirectory", build_script)
         self.assertIn("Get-FileSha256WithRetry -Path $restoredPath", build_script)
+        self.assertIn("$FinalStartupLogExisted = Test-Path", build_script)
+        self.assertIn("(-not $FinalStartupLogExisted)", build_script)
+        self.assertIn(
+            "Remove-SafeFile -Path $FinalStartupLog -AllowedParent $ReleaseDirectory",
+            build_script,
+        )
+        self.assertNotIn("$ObsoleteReleaseEntries", build_script)
+        self.assertIn("其他版本的调试目录和 ZIP 必须长期保留", build_script)
+
+    def test_release_version_has_one_source_of_truth(self):
+        self.assertEqual("AFC2.0.2alpha", RELEASE_VERSION)
+        release_main_source = (SRC_ROOT / "project" / "release_main.py").read_text(
+            encoding="utf-8"
+        )
+        ui_source = (SRC_ROOT / "project" / "ui_bootstrap.py").read_text(
+            encoding="utf-8"
+        )
+        spec_source = (PROJECT_ROOT / "packaging" / "AFC2_onedir.spec").read_text(
+            encoding="utf-8"
+        )
+        build_source = (PROJECT_ROOT / "scripts" / "build_release.ps1").read_text(
+            encoding="utf-8"
+        )
+        for source in (release_main_source, ui_source, spec_source, build_source):
+            self.assertNotIn('"AFC2.0.2alpha"', source)
+        self.assertIn("RELEASE_VERSION", release_main_source)
+        self.assertIn("RELEASE_VERSION", ui_source)
+        self.assertIn("release_metadata.py", spec_source)
+        self.assertIn("release_metadata.py", build_source)
 
     def test_public_plot_toolbar_has_default_hidden_prediction_option(self):
         ui_source = (SRC_ROOT / "project" / "ui_bootstrap.py").read_text(

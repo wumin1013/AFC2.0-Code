@@ -9,7 +9,6 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ProductName = "AFC2.0.2alpha"
 $RequiredPyInstallerVersion = "6.12.0"
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
@@ -107,6 +106,27 @@ function Remove-SafeDirectory {
         }
     }
     throw "多次重试后仍无法清理专用构建目录: $resolvedPath；$($lastRemovalFailure.Exception.Message)"
+}
+
+function Remove-SafeFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$AllowedParent
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+    $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
+    $resolvedParent = (Resolve-Path -LiteralPath $AllowedParent).Path
+    if (-not (Test-PathWithin -Candidate $resolvedPath -Parent $resolvedParent)) {
+        throw "拒绝清理允许目录以外的文件: $resolvedPath"
+    }
+    $targetItem = Get-Item -LiteralPath $resolvedPath -Force
+    if ($targetItem.PSIsContainer) {
+        throw "目标不是文件，拒绝清理: $resolvedPath"
+    }
+    Remove-Item -LiteralPath $resolvedPath -Force
 }
 
 function Resolve-AfcPython {
@@ -212,18 +232,62 @@ function Write-Utf8NoBom {
     [System.IO.File]::WriteAllText($Path, $Content, $Utf8NoBom)
 }
 
+function Get-ReleaseProductName {
+    param([Parameter(Mandatory = $true)][string]$VersionSource)
+
+    $sourceText = [System.IO.File]::ReadAllText($VersionSource, [System.Text.Encoding]::UTF8)
+    $versionMatch = [regex]::Match(
+        $sourceText,
+        '(?m)^RELEASE_VERSION\s*=\s*["''](?<version>[^"'']+)["'']\s*$'
+    )
+    if (-not $versionMatch.Success) {
+        throw "未在版本文件中找到 RELEASE_VERSION: $VersionSource"
+    }
+    $version = $versionMatch.Groups["version"].Value
+    if ($version -notmatch '^AFC\d+\.\d+\.\d+(?:[-.]?[A-Za-z][0-9A-Za-z.-]*)?$') {
+        throw "发布版本格式无效: $version"
+    }
+    return $version
+}
+
+function Get-DebugDirectoryName {
+    param([Parameter(Mandatory = $true)][string]$ProductName)
+
+    $nameMatch = [regex]::Match(
+        $ProductName,
+        '^(?<base>AFC\d+\.\d+\.\d+)(?<stage>[A-Za-z][0-9A-Za-z.-]*)?$'
+    )
+    if (-not $nameMatch.Success) {
+        throw "无法从发布版本生成调试目录名: $ProductName"
+    }
+    $stage = $nameMatch.Groups["stage"].Value
+    if ($stage) {
+        $stage = $stage.Substring(0, 1).ToUpperInvariant() + $stage.Substring(1)
+    }
+    return "$($nameMatch.Groups['base'].Value)$stage-debug"
+}
+
 $ProjectRoot = Get-NormalizedPath -Path (Join-Path $PSScriptRoot "..")
 $ReleaseVersionsRoot = Get-NormalizedPath -Path (Join-Path $ProjectRoot "release_versions")
+$ReleaseVersionSource = Join-Path $ProjectRoot "src\project\release_metadata.py"
 $SpecPath = Join-Path $ProjectRoot "packaging\AFC2_onedir.spec"
 $ReleaseNotesTemplate = Join-Path $ProjectRoot "packaging\release_notes.txt"
 $VerificationScript = Join-Path $ProjectRoot "scripts\verification\verify_release_build.ps1"
 $ReleaseEntryPoint = Join-Path $ProjectRoot "src\project\release_main.py"
 
-foreach ($requiredFile in @($SpecPath, $ReleaseNotesTemplate, $VerificationScript, $ReleaseEntryPoint)) {
+foreach ($requiredFile in @(
+    $ReleaseVersionSource,
+    $SpecPath,
+    $ReleaseNotesTemplate,
+    $VerificationScript,
+    $ReleaseEntryPoint
+)) {
     if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
         throw "缺少发布构建所需文件: $requiredFile"
     }
 }
+$ProductName = Get-ReleaseProductName -VersionSource $ReleaseVersionSource
+$DebugDirectoryName = Get-DebugDirectoryName -ProductName $ProductName
 
 $ResolvedArchiveDestination = ""
 if ($ArchiveDestination) {
@@ -277,27 +341,25 @@ if ($ResolvedArchiveDestination -and $GitDirty) {
 New-Item -ItemType Directory -Path $ReleaseVersionsRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $OutputRoot -Force | Out-Null
 
-$FinalReleaseDirectory = Join-Path $OutputRoot $ProductName
+$FinalReleaseDirectory = Join-Path $OutputRoot $DebugDirectoryName
+$FinalMinimalArchive = Join-Path $OutputRoot "$ProductName.zip"
+$LegacyProductDirectory = Join-Path $OutputRoot $ProductName
 $ReleaseBuildRoot = Join-Path $OutputRoot ".build-$ProductName"
-$RuntimeInputNames = @(
-    "SampleData.csv",
-    "SampleData.txt",
-    "iipinc.txt",
-    "SampleData.rg",
-    "ProcessDataPath.txt"
+$ReleasePayloadRootNames = @(
+    "_internal",
+    "发布说明.txt",
+    "build-manifest.json",
+    "SHA256SUMS.txt"
 )
-$RuntimeInputPatterns = @("*.csv", "SampleData*.txt")
 
-function Test-RuntimeInputName {
+function Test-ReleasePayloadRootName {
     param([Parameter(Mandatory = $true)][string]$Name)
 
-    if ($RuntimeInputNames -icontains $Name) {
+    if ($ReleasePayloadRootNames -icontains $Name) {
         return $true
     }
-    foreach ($pattern in $RuntimeInputPatterns) {
-        if ($Name -like $pattern) {
-            return $true
-        }
+    if ($Name -match '^AFC.+\.exe$') {
+        return $true
     }
     return $false
 }
@@ -428,20 +490,63 @@ if ($LASTEXITCODE -ne 0) {
     throw "发布目录验证失败。"
 }
 
-$RuntimeInputBackupDirectory = Join-Path $ReleaseBuildRoot "runtime-input-backup"
-$RuntimeInputHashes = @{}
-if (Test-Path -LiteralPath $FinalReleaseDirectory -PathType Container) {
-    New-Item -ItemType Directory -Path $RuntimeInputBackupDirectory -Force | Out-Null
-    $RuntimeInputFiles = Get-ChildItem -LiteralPath $FinalReleaseDirectory -Force -File |
-        Where-Object { Test-RuntimeInputName -Name $_.Name }
-    foreach ($runtimeInputFile in $RuntimeInputFiles) {
-        $runtimeInputName = $runtimeInputFile.Name
-        $backupPath = Join-Path $RuntimeInputBackupDirectory $runtimeInputName
-        Copy-Item -LiteralPath $runtimeInputFile.FullName -Destination $backupPath -Force
-        $RuntimeInputHashes[$runtimeInputName] = Get-FileSha256WithRetry -Path $runtimeInputFile.FullName
-        if ($RuntimeInputNames -inotcontains $runtimeInputName) {
-            $RuntimeInputNames += $runtimeInputName
+# 最小 ZIP 只从尚未混入本机运行输入的候选目录生成。解压后再次执行
+# 完整验证，确保实际交付的压缩包与已验证候选目录一致且可启动。
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$StagedMinimalArchive = Join-Path $ReleaseBuildRoot "$ProductName.zip"
+$ZipVerificationDirectory = Join-Path $ReleaseBuildRoot "zip-verification"
+if (Test-Path -LiteralPath $StagedMinimalArchive) {
+    Remove-SafeFile -Path $StagedMinimalArchive -AllowedParent $ReleaseBuildRoot
+}
+if (Test-Path -LiteralPath $ZipVerificationDirectory) {
+    Remove-SafeDirectory -Path $ZipVerificationDirectory -AllowedParent $ReleaseBuildRoot
+}
+[System.IO.Compression.ZipFile]::CreateFromDirectory(
+    $ReleaseDirectory,
+    $StagedMinimalArchive,
+    [System.IO.Compression.CompressionLevel]::Optimal,
+    $false
+)
+[System.IO.Compression.ZipFile]::ExtractToDirectory(
+    $StagedMinimalArchive,
+    $ZipVerificationDirectory
+)
+& $VerificationScript `
+    -ReleaseDirectory $ZipVerificationDirectory `
+    -PythonPath $ResolvedPython `
+    -ExpectedVersion $ProductName `
+    -ProjectRoot $ProjectRoot
+if ($LASTEXITCODE -ne 0) {
+    throw "最小发布 ZIP 解压验证失败。"
+}
+
+$DebugStateBackupDirectory = Join-Path $ReleaseBuildRoot "debug-state-backup"
+$DebugStateHashes = @{}
+$DebugStateSourceDirectories = @($FinalReleaseDirectory, $LegacyProductDirectory) |
+    Select-Object -Unique
+foreach ($debugStateSourceDirectory in $DebugStateSourceDirectories) {
+    if (Test-Path -LiteralPath $debugStateSourceDirectory -PathType Container) {
+        New-Item -ItemType Directory -Path $DebugStateBackupDirectory -Force | Out-Null
+        $DebugStateEntries = Get-ChildItem -LiteralPath $debugStateSourceDirectory -Force |
+            Where-Object { -not (Test-ReleasePayloadRootName -Name $_.Name) }
+        foreach ($debugStateEntry in $DebugStateEntries) {
+            $backupPath = Join-Path $DebugStateBackupDirectory $debugStateEntry.Name
+            if (Test-Path -LiteralPath $backupPath) {
+                Write-Warning "同版本旧目录存在同名状态项，保留版本调试目录中的文件: $($debugStateEntry.Name)"
+                continue
+            }
+            Copy-Item -LiteralPath $debugStateEntry.FullName -Destination $backupPath -Recurse -Force
+            Write-Host "已备份调试状态: $($debugStateEntry.FullName)"
         }
+    }
+}
+if (Test-Path -LiteralPath $DebugStateBackupDirectory -PathType Container) {
+    $DebugStateFiles = Get-ChildItem -LiteralPath $DebugStateBackupDirectory -Recurse -Force -File
+    foreach ($debugStateFile in $DebugStateFiles) {
+        $relativePath = Get-PortableRelativePath `
+            -BasePath $DebugStateBackupDirectory `
+            -TargetPath $debugStateFile.FullName
+        $DebugStateHashes[$relativePath] = Get-FileSha256WithRetry -Path $debugStateFile.FullName
     }
 }
 
@@ -450,21 +555,28 @@ if (Test-Path -LiteralPath $FinalReleaseDirectory) {
 }
 [System.IO.Directory]::Move($StagedReleaseDirectory, $FinalReleaseDirectory)
 $ReleaseDirectory = $FinalReleaseDirectory
-foreach ($runtimeInputName in $RuntimeInputHashes.Keys) {
-    $backupPath = Join-Path $RuntimeInputBackupDirectory $runtimeInputName
-    $restoredPath = Join-Path $ReleaseDirectory $runtimeInputName
-    Copy-Item -LiteralPath $backupPath -Destination $restoredPath -Force
-    $restoredHash = Get-FileSha256WithRetry -Path $restoredPath
-    if ($restoredHash -cne $RuntimeInputHashes[$runtimeInputName]) {
-        throw "运行输入恢复后 SHA-256 不一致: $runtimeInputName"
+if (Test-Path -LiteralPath $DebugStateBackupDirectory -PathType Container) {
+    Get-ChildItem -LiteralPath $DebugStateBackupDirectory -Force | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $ReleaseDirectory -Recurse -Force
     }
-    Write-Host "已原样恢复运行输入: $runtimeInputName ($restoredHash)"
 }
+foreach ($relativePath in $DebugStateHashes.Keys) {
+    $restoredPath = Join-Path $ReleaseDirectory $relativePath.Replace(
+        "/",
+        [System.IO.Path]::DirectorySeparatorChar
+    )
+    $restoredHash = Get-FileSha256WithRetry -Path $restoredPath
+    if ($restoredHash -cne $DebugStateHashes[$relativePath]) {
+        throw "调试状态恢复后 SHA-256 不一致: $relativePath"
+    }
+}
+Write-Host "已原样恢复并校验 $($DebugStateHashes.Count) 个调试状态文件。"
 
 # 临时目录自检通过后，再从最终发布目录原地启动一次。同步盘可能在目录
 # 换入后短暂锁定新 EXE，这一步确保交付路径本身也能完成初始化。
 $FinalExecutable = Join-Path $ReleaseDirectory "$ProductName.exe"
 $FinalStartupLog = Join-Path $ReleaseDirectory "startup-error.log"
+$FinalStartupLogExisted = Test-Path -LiteralPath $FinalStartupLog -PathType Leaf
 $PreviousFinalSmokeFlag = $env:AFC_RELEASE_SMOKE_TEST
 $PreviousFinalSuppressMessageboxes = $env:SUPPRESS_MESSAGEBOXES
 try {
@@ -489,8 +601,9 @@ try {
         }
         throw "最终发布目录原地启动自检失败，退出码 $($FinalSmokeProcess.ExitCode)。`n$FinalSmokeLogText"
     }
-    if (Test-Path -LiteralPath $FinalStartupLog -PathType Leaf) {
-        Remove-Item -LiteralPath $FinalStartupLog -Force
+    if ((-not $FinalStartupLogExisted) -and
+        (Test-Path -LiteralPath $FinalStartupLog -PathType Leaf)) {
+        Remove-SafeFile -Path $FinalStartupLog -AllowedParent $ReleaseDirectory
     }
 }
 finally {
@@ -509,11 +622,19 @@ finally {
 }
 Write-Host "最终发布目录原地启动自检通过: $FinalExecutable"
 
+# 当前版本的新调试目录和 ZIP 都验证成功后，才替换同版本的最小包。
+# 其他版本的调试目录和 ZIP 必须长期保留，不参与本次构建清理。
+if (Test-Path -LiteralPath $FinalMinimalArchive) {
+    Remove-SafeFile -Path $FinalMinimalArchive -AllowedParent $OutputRoot
+}
+[System.IO.File]::Move($StagedMinimalArchive, $FinalMinimalArchive)
+
 if (Test-Path -LiteralPath $ReleaseBuildRoot) {
     Remove-SafeDirectory -Path $ReleaseBuildRoot -AllowedParent $OutputRoot
 }
 
 Write-Host "发布构建与验证通过: $ReleaseDirectory"
+Write-Host "最小发布 ZIP: $FinalMinimalArchive"
 Write-Host "已清理 PyInstaller 中间目录: $ReleaseBuildRoot"
 
 if ($ResolvedArchiveDestination) {
@@ -525,13 +646,10 @@ if ($ResolvedArchiveDestination) {
     $ArchiveParent = Split-Path -Parent $ResolvedArchiveDestination
     $TemporaryArchive = Join-Path $ArchiveParent (".{0}.partial-{1}" -f $ProductName, [guid]::NewGuid().ToString("N"))
     try {
-        New-Item -ItemType Directory -Path $TemporaryArchive | Out-Null
-        Get-ChildItem -LiteralPath $ReleaseDirectory -Force | ForEach-Object {
-            if ((-not $_.PSIsContainer) -and ($RuntimeInputNames -icontains $_.Name)) {
-                return
-            }
-            Copy-Item -LiteralPath $_.FullName -Destination $TemporaryArchive -Recurse -Force
-        }
+        [System.IO.Compression.ZipFile]::ExtractToDirectory(
+            $FinalMinimalArchive,
+            $TemporaryArchive
+        )
 
         & $VerificationScript `
             -ReleaseDirectory $TemporaryArchive `

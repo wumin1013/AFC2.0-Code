@@ -24,7 +24,7 @@ class AFCReleaseApplication(
     AnalysisExportMixin,
     ConfigStateMixin,
 ):
-    """AFC2.0.2alpha 多文件发布版主类（轻量反解，不含 PIT/SMIF）。"""
+    """AFC2 多文件发布版主类（轻量反解，不含 PIT/SMIF）。"""
 
     release_mode = True
     enable_research_features = False

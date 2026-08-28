@@ -1,16 +1,33 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 from pathlib import Path
+import ast
 import os
 import sys
 
 
-PRODUCT_NAME = "AFC2.0.2alpha"
 DIAGNOSTIC_CONSOLE = os.environ.get("AFC_PYINSTALLER_DIAGNOSTIC_CONSOLE") == "1"
 # PyInstaller 提供的 SPECPATH 已是 spec 所在目录（packaging/）。
 PROJECT_ROOT = Path(SPECPATH).resolve().parent
 SOURCE_ROOT = PROJECT_ROOT / "src"
 ENTRY_POINT = SOURCE_ROOT / "project" / "release_main.py"
+VERSION_SOURCE = SOURCE_ROOT / "project" / "release_metadata.py"
+
+
+def read_release_version(path: Path) -> str:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for statement in tree.body:
+        if not isinstance(statement, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == "RELEASE_VERSION" for target in statement.targets):
+            continue
+        value = ast.literal_eval(statement.value)
+        if isinstance(value, str) and value:
+            return value
+    raise ValueError(f"未在版本文件中找到有效 RELEASE_VERSION: {path}")
+
+
+PRODUCT_NAME = read_release_version(VERSION_SOURCE)
 
 if not ENTRY_POINT.is_file():
     raise FileNotFoundError(f"发布入口不存在: {ENTRY_POINT}")

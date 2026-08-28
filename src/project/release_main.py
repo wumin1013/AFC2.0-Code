@@ -7,6 +7,14 @@ import time
 import traceback
 from pathlib import Path
 
+if __package__ in (None, ""):
+    _PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+    if str(_PACKAGE_ROOT) not in sys.path:
+        sys.path.insert(0, str(_PACKAGE_ROOT))
+    from project.release_metadata import RELEASE_VERSION
+else:
+    from .release_metadata import RELEASE_VERSION
+
 
 _RUNTIME_LOAD_RETRY_ATTEMPTS = 12
 _RUNTIME_LOAD_RETRY_DELAY_SECONDS = 0.5
@@ -79,7 +87,7 @@ def _startup_log_root() -> Path:
 
 def _write_startup_error(exc: BaseException) -> str:
     """尽最大努力记录 windowed EXE 启动错误，并返回实际日志路径。"""
-    content = "AFC2.0.2alpha 启动失败\n\n" + "".join(
+    content = f"{RELEASE_VERSION} 启动失败\n\n" + "".join(
         traceback.format_exception(type(exc), exc, exc.__traceback__)
     )
     primary_log = (
@@ -89,7 +97,7 @@ def _write_startup_error(exc: BaseException) -> str:
     )
     candidates = (
         primary_log,
-        Path(tempfile.gettempdir()) / "AFC2.0.2alpha-startup-error.log",
+        Path(tempfile.gettempdir()) / f"{RELEASE_VERSION}-startup-error.log",
     )
     for path in candidates:
         try:
@@ -104,7 +112,7 @@ def _write_startup_error(exc: BaseException) -> str:
 def _show_startup_error(components, exc: BaseException, log_path: str) -> None:
     if os.environ.get("SUPPRESS_MESSAGEBOXES") == "1":
         return
-    detail = f"AFC2.0.2alpha 无法启动：\n{exc}"
+    detail = f"{RELEASE_VERSION} 无法启动：\n{exc}"
     if log_path:
         detail += f"\n\n错误日志：\n{log_path}"
     messagebox = components.get("messagebox") if isinstance(components, dict) else None
@@ -117,7 +125,7 @@ def _show_startup_error(components, exc: BaseException, log_path: str) -> None:
     try:
         import ctypes
 
-        ctypes.windll.user32.MessageBoxW(None, detail, "AFC2.0.2alpha 启动失败", 0x10)
+        ctypes.windll.user32.MessageBoxW(None, detail, f"{RELEASE_VERSION} 启动失败", 0x10)
     except Exception:
         pass
 
@@ -132,7 +140,7 @@ def main() -> int:
         components["optimize_memory"]()
         root = components["tk"].Tk()
         root.withdraw()
-        root.title("AFC2.0.2alpha - 稳态区间划分")
+        root.title(f"{RELEASE_VERSION} - 稳态区间划分")
         style = components["ttk"].Style()
         components["configure_style"](style)
         app = components["application"](root)

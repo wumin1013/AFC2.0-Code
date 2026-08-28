@@ -28,6 +28,12 @@ from project.prediction_runtime import PredictionRuntimeMixin
 from project.processing_core import ProcessingCoreMixin
 from project.sample_manager import SampleManagerMixin
 from project.segmentation import SegmentationConfig, SegmentationPipeline
+from project.segmentation.features import (
+    build_atomic_segments,
+    compute_point_features,
+    standardize_input,
+)
+from project.segmentation.scorers import RuleSegmentScorer
 from project.ui_bootstrap import BootstrapUiMixin
 
 
@@ -963,6 +969,35 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
                 )
 
         self.assertTrue(observed_small_variation)
+
+    def test_single_point_steady_continuation_has_zero_slope_at_large_path_offset(self):
+        point_count = 3000
+        frame = _process_frame([10.0] * point_count)
+        # 模拟 AfoMilling trace 中随序号递增的 s(mm) 被现有契约作为
+        # 每点增量累计后形成的大横坐标，覆盖本次多文件导入断链场景。
+        frame["s"] = np.linspace(0.0, 1500.0, point_count)
+        config = _test_config()
+        standardized, _ = standardize_input(frame, config)
+        features = compute_point_features(standardized, config)
+        atoms = build_atomic_segments(features, config)
+        scorer = RuleSegmentScorer(config)
+        scorer.prepare(features, atoms)
+
+        target = 2760
+        duration = float(atoms[target].end_s - atoms[target].start_s)
+        slope = scorer._relative_path_slopes(
+            np.asarray([target], dtype=int),
+            target,
+            np.asarray([duration], dtype=float),
+            np.asarray([10.0], dtype=float),
+        )
+        continuation = scorer.score_steady_continuation_candidates(
+            (target,),
+            target,
+        )
+
+        np.testing.assert_array_equal(np.asarray([0.0]), slope)
+        self.assertTrue(np.isfinite(float(continuation[0])))
 
     def test_05_sample_mapping_success_or_failure_preserves_process_result(self):
         process_result = _run(

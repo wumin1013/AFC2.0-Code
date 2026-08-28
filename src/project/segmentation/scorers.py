@@ -905,9 +905,14 @@ class RuleSegmentScorer(SegmentScorer):
             sum_y = y_prefix[ends + 1] - y_prefix[starts]
         denominator = counts * sum_x2 - sum_x * sum_x
         slopes = np.zeros(len(starts), dtype=float)
-        valid = np.abs(denominator) > max(
-            float(self.config.path_tolerance_mm),
-            np.finfo(float).eps,
+        # 单点无法拟合斜率，理论值固定为 0。大行程坐标下，前缀平方和
+        # 的浮点消减可能让单点 denominator 产生伪非零值，进而误拒绝
+        # 本应合法的 steady 单原子续块并使全行程解码断链。
+        valid = (counts > 1.0) & (
+            np.abs(denominator) > max(
+                float(self.config.path_tolerance_mm),
+                np.finfo(float).eps,
+            )
         )
         slopes[valid] = (
             counts[valid] * sum_xy[valid] - sum_x[valid] * sum_y[valid]
