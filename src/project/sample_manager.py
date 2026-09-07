@@ -1074,8 +1074,37 @@ class SampleManagerMixin:
                 candidates.append("utf-16-be")
 
         candidates.append("utf-8-sig")
+        encoding_aliases = {
+            "936": "gb18030",
+            "cp936": "gb18030",
+            "gbk": "gb18030",
+            "gb2312": "gb18030",
+            "950": "big5",
+            "cp950": "big5",
+            "932": "shift_jis",
+            "cp932": "shift_jis",
+            "ms932": "shift_jis",
+            "949": "euc_kr",
+            "cp949": "euc_kr",
+            "ms949": "euc_kr",
+            "1252": "cp1252",
+        }
+        native_encodings = [locale.getpreferredencoding(False)]
+        try:
+            native_encodings.append(locale.getlocale()[1])
+        except (IndexError, TypeError, ValueError):
+            pass
+        # 无 BOM 的旧编码可能存在完全相同且均可严格解码的字节序列，例如
+        # GB18030 的“混合”也能解成 EUC-KR 的“살북”。这种歧义无法仅凭
+        # 内容消除，应优先采用文件生成环境的 Windows 区域代码页。
+        for native_encoding in native_encodings:
+            native_encoding = str(native_encoding or "").strip().casefold()
+            native_alias = encoding_aliases.get(native_encoding, native_encoding)
+            if native_alias:
+                candidates.append(native_alias)
+
         # 无 BOM 的日文/韩文旧编码与中文双字节编码有重叠。若候选解码中
-        # 出现该语言特有字符，优先于本机代码页，避免“能解码但名称乱码”。
+        # 出现该语言特有字符，在无法从本机代码页识别时再采用对应编码。
         language_hints = (
             (
                 "shift_jis",
@@ -1117,17 +1146,6 @@ class SampleManagerMixin:
                 and specific_count / max(east_asian_count, 1) >= minimum_ratio
             ):
                 candidates.append(encoding)
-        preferred = str(locale.getpreferredencoding(False) or "").strip().casefold()
-        preferred_alias = {
-            "cp936": "gb18030",
-            "gbk": "gb18030",
-            "gb2312": "gb18030",
-            "cp950": "big5",
-            "cp932": "shift_jis",
-            "ms932": "shift_jis",
-        }.get(preferred, preferred)
-        if preferred_alias:
-            candidates.append(preferred_alias)
         candidates.extend(
             ("gb18030", "big5", "shift_jis", "euc_jp", "euc_kr", "cp1252", "latin-1")
         )

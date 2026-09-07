@@ -1119,9 +1119,16 @@ class PlotSupportMixin:
         ax._time_line_refreshing = True
         try:
             axis_mode = getattr(ax, '_time_line_axis_mode', 'time')
-            if axis_mode == 'path':
+            if axis_mode in {'path', 'process_path'}:
                 positions = getattr(ax, '_time_line_positions', None)
-                self.apply_line_axis_on_path(ax, positions, mask)
+                line_numbers = getattr(ax, '_time_line_numbers', None)
+                self.apply_line_axis_on_positions(
+                    ax,
+                    line_numbers,
+                    positions,
+                    mask,
+                    axis_mode=axis_mode,
+                )
             else:
                 self.apply_line_axis_on_time(ax, mask)
         finally:
@@ -1302,19 +1309,33 @@ class PlotSupportMixin:
         self.bind_time_line_axis_updates(ax)
         return top_ax
 
-    def build_sample_line_position_spans(self, positions, mask):
-        """基于任意位置轴构建各程序行号的跨度。"""
-        if self.sample_data_line_numbers is None or positions is None:
+    def build_line_position_spans(self, line_numbers, positions, mask):
+        """基于显式程序行号和位置轴构建各行跨度。"""
+        if line_numbers is None or positions is None:
             return {}, []
 
-        line_arr = np.asarray(self.sample_data_line_numbers, dtype=int)
-        pos_arr = np.asarray(positions, dtype=float)
+        try:
+            line_values = np.asarray(line_numbers, dtype=float).reshape(-1)
+            pos_arr = np.asarray(positions, dtype=float).reshape(-1)
+        except (TypeError, ValueError):
+            return {}, []
+        if line_values.size != pos_arr.size:
+            return {}, []
+
+        valid_lines = np.isfinite(line_values)
+        line_arr = np.zeros(line_values.size, dtype=int)
+        line_arr[valid_lines] = np.rint(line_values[valid_lines]).astype(int)
         if pos_arr.size != len(line_arr):
             return {}, []
 
-        mask_arr = np.asarray(mask, dtype=bool) if mask is not None else np.ones(len(line_arr), dtype=bool)
+        mask_arr = (
+            np.asarray(mask, dtype=bool).reshape(-1).copy()
+            if mask is not None
+            else np.ones(len(line_arr), dtype=bool)
+        )
         if mask_arr.size != len(line_arr):
             return {}, []
+        mask_arr &= valid_lines & np.isfinite(pos_arr)
 
         spans_by_line = collections.defaultdict(list)
         ordered_spans = []
@@ -1345,12 +1366,53 @@ class PlotSupportMixin:
                 ordered_spans.append((ln, start_pos, end_pos))
         return spans_by_line, ordered_spans
 
-    def apply_line_axis_on_path(self, ax, sample_positions, sample_mask, max_ticks=60):
-        """在行程轴上方附加程序行号辅助坐标轴。"""
-        if self.sample_data_line_numbers is None or sample_positions is None:
+    def build_sample_line_position_spans(self, positions, mask):
+        """基于采样程序行号和任意位置轴构建各行跨度。"""
+        return self.build_line_position_spans(
+            getattr(self, "sample_data_line_numbers", None),
+            positions,
+            mask,
+        )
+
+    def apply_line_axis_on_positions(
+        self,
+        ax,
+        line_numbers,
+        positions,
+        mask,
+        *,
+        max_ticks=60,
+        axis_mode="path",
+    ):
+        """把显式程序行号映射到任意连续横轴，并创建顶部辅助轴。"""
+        if line_numbers is None or positions is None:
+            self.remove_line_axis_on_time(ax)
             return None
 
-        _, ordered_spans = self.build_sample_line_position_spans(sample_positions, sample_mask)
+        try:
+            line_arr = np.asarray(line_numbers, dtype=float).reshape(-1)
+            position_arr = np.asarray(positions, dtype=float).reshape(-1)
+        except (TypeError, ValueError):
+            self.remove_line_axis_on_time(ax)
+            return None
+        if line_arr.size != position_arr.size:
+            self.remove_line_axis_on_time(ax)
+            return None
+
+        mask_arr = (
+            np.asarray(mask, dtype=bool).reshape(-1).copy()
+            if mask is not None
+            else np.ones(line_arr.size, dtype=bool)
+        )
+        if mask_arr.size != line_arr.size:
+            self.remove_line_axis_on_time(ax)
+            return None
+
+        _, ordered_spans = self.build_line_position_spans(
+            line_arr,
+            position_arr,
+            mask_arr,
+        )
         if not ordered_spans:
             self.remove_line_axis_on_time(ax)
             return None
@@ -1375,26 +1437,41 @@ class PlotSupportMixin:
         if not visible_spans:
             visible_spans = anchor_spans
 
-        adaptive_tick_count = self.get_time_line_axis_capacity(ax, min_ticks=8, max_ticks=max_ticks)
-        visible_spans = self.select_time_line_spans(visible_spans, adaptive_tick_count)
-
-        tick_positions = []
-        tick_labels = []
-        for ln, anchor_pos, _start_pos, _end_pos in visible_spans:
-            tick_positions.append(float(anchor_pos))
-            tick_labels.append(str(int(ln)))
+        adaptive_tick_count = self.get_time_line_axis_capacity(
+            ax,
+            min_ticks=8,
+            max_ticks=max_ticks,
+        )
+        visible_spans = self.select_time_line_spans(
+            visible_spans,
+            adaptive_tick_count,
+        )
 
         top_ax = self._update_time_line_top_axis(
             ax,
-            tick_positions,
-            tick_labels,
+            [float(anchor_pos) for _ln, anchor_pos, _start, _end in visible_spans],
+            [str(int(ln)) for ln, _anchor, _start, _end in visible_spans],
         )
-        ax._time_line_mask = np.asarray(sample_mask, dtype=bool) if sample_mask is not None else None
-        ax._time_line_axis_mode = 'path'
-        ax._time_line_positions = np.asarray(sample_positions, dtype=float) if sample_positions is not None else None
+        ax._time_line_mask = mask_arr.copy()
+        ax._time_line_axis_mode = str(axis_mode or "path")
+        ax._time_line_numbers = line_arr.copy()
+        ax._time_line_positions = position_arr.copy()
         ax._time_line_view_key = self._get_time_line_view_key(ax)
         self.bind_time_line_axis_updates(ax)
         return top_ax
+
+    def apply_line_axis_on_path(self, ax, sample_positions, sample_mask, max_ticks=60):
+        """在行程轴上方附加程序行号辅助坐标轴。"""
+        if self.sample_data_line_numbers is None or sample_positions is None:
+            return None
+        return self.apply_line_axis_on_positions(
+            ax,
+            self.sample_data_line_numbers,
+            sample_positions,
+            sample_mask,
+            max_ticks=max_ticks,
+            axis_mode="path",
+        )
 
     def apply_line_axis(self, ax, line_numbers):
         """设置对齐行号刻度 - 使用自动定位器实现动态刻度调整"""
@@ -1666,7 +1743,7 @@ class PlotSupportMixin:
         except Exception:
             return f"{line_number}.{point_index}"
 
-    def collect_line_point_intervals_for_tool(self, program_name, tool_id):
+    def collect_line_point_intervals_for_tool(self, program_name, tool_id, *, include_types=False):
         """获取指定程序+刀具的空载/稳态区间行点范围（含区间均值）
         
         优先复用六态划分的权威采样投影；旧数据没有投影时，
@@ -1819,7 +1896,20 @@ class PlotSupportMixin:
                 else:
                     avg_value = 0.0
 
-                interval_strings.append(f"{start_lp}-{end_lp}:{avg_value:.6f}")
+                text = f"{start_lp}-{end_lp}:{avg_value:.6f}"
+                if include_types:
+                    is_idle = (
+                        bool(interval.get("is_idle_interval"))
+                        or str(interval.get("segment_type") or "").strip().lower() == "idle"
+                        or str(interval.get("kc_source") or "").strip().lower() == "idle"
+                        or str(interval.get("steady_subtype") or "").strip().lower() == "idle"
+                    )
+                    interval_strings.append({
+                        "text": text,
+                        "segment_type": "idle" if is_idle else "steady",
+                    })
+                else:
+                    interval_strings.append(text)
         
         return interval_strings
 

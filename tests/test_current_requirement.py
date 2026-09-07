@@ -1169,6 +1169,15 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
             quantized_harness.collect_line_point_intervals_for_tool("P1", "T0"),
         )
 
+        typed_intervals = quantized_harness.collect_line_point_intervals_for_tool(
+            "P1", "T0", include_types=True
+        )
+        self.assertEqual(["idle", "steady"], [item["segment_type"] for item in typed_intervals])
+        self.assertEqual(
+            ["20.0-20.1:15.000000", "20.3-20.5:50.000000"],
+            [item["text"] for item in typed_intervals],
+        )
+
         plotter = PlotSupportMixin()
         figure, axis = plt.subplots()
         try:
@@ -1231,6 +1240,23 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
                 "程序 MRR",
                 [line.get_label() for line in process_axis.lines],
             )
+            process_line_axis = getattr(
+                process_axis,
+                "_time_line_top_axis",
+                None,
+            )
+            self.assertIsNotNone(process_line_axis)
+            self.assertEqual("程序行号", process_line_axis.get_xlabel())
+            displayed_line_numbers = {
+                int(label.get_text())
+                for label in process_line_axis.get_xticklabels()
+                if label.get_text()
+            }
+            expected_line_numbers = set(
+                process_result.point_labels["line_no_raw"].astype(int)
+            )
+            self.assertTrue(displayed_line_numbers)
+            self.assertTrue(displayed_line_numbers.issubset(expected_line_numbers))
             process_fills = [
                 artist
                 for artist in process_axis.collections

@@ -9,6 +9,8 @@ from .shared import *
 
 
 class AnalysisExportMixin:
+    _RG_EXPORT_INTERVAL_LIMIT = 200
+
     def _default_segmentation_output_dir(self):
         """发布 EXE 直接写同目录；源码研究版保留 output/segmentation。"""
         if bool(getattr(self, "release_mode", False)) and IS_FROZEN:
@@ -297,6 +299,30 @@ class AnalysisExportMixin:
             self._resolve_process_segmentation_coordinates(point_labels)
         )
         process_mask = np.isfinite(process_x)
+        process_line_values = np.full(len(process_frame), np.nan, dtype=float)
+        for line_column in ("line_no_raw", "line_id"):
+            if line_column not in process_frame:
+                continue
+            candidate_lines = pd.to_numeric(
+                process_frame[line_column],
+                errors="coerce",
+            ).to_numpy(dtype=float)
+            missing_line_mask = ~np.isfinite(process_line_values)
+            process_line_values[missing_line_mask] = candidate_lines[
+                missing_line_mask
+            ]
+        line_axis_mask = process_mask & np.isfinite(process_line_values)
+        if np.any(line_axis_mask) and hasattr(
+            self,
+            "apply_line_axis_on_positions",
+        ):
+            self.apply_line_axis_on_positions(
+                ax,
+                process_line_values,
+                process_x,
+                line_axis_mask,
+                axis_mode="process_path",
+            )
         process_overlays = []
         overlay_getter = getattr(self, "get_optional_process_overlays", None)
         if callable(overlay_getter):
@@ -2033,8 +2059,7 @@ class AnalysisExportMixin:
             messagebox.showinfo(
                 "保存成功",
                 f"已导出: {os.path.basename(process_info_path)}\n"
-                + mapping_note
-                + (f"\n{feed_export_note}" if feed_export_note else ""),
+                + mapping_note,
             )
             return
         if not self.sample_programs:
@@ -2176,6 +2201,213 @@ class AnalysisExportMixin:
         ttk.Button(btn_frame, text="保存", width=12, command=do_save).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="取消", width=10, command=dialog.destroy).pack(side=tk.LEFT, padx=5)
 
+    @staticmethod
+    def _parse_rg_interval_coordinates(interval_text):
+        match = re.match(
+            r"^\s*(-?\d+)\.(\d+)-(-?\d+)\.(\d+)(?=:|$)",
+            str(interval_text or ""),
+        )
+        if match is None:
+            return None
+        return (
+            (int(match.group(1)), int(match.group(2))),
+            (int(match.group(3)), int(match.group(4))),
+        )
+
+    def _build_rg_coordinate_index(self, program_name, tool_id, intervals):
+        """构建当前程序/刀具内的零基行点坐标到采样索引映射。"""
+        target_coordinates = set()
+        for interval_text in intervals:
+            endpoints = self._parse_rg_interval_coordinates(interval_text)
+            if endpoints is not None:
+                target_coordinates.update(endpoints)
+        if not target_coordinates:
+            return {}
+        try:
+            line_numbers = np.asarray(
+                self.sample_data_line_numbers,
+                dtype=int,
+            ).reshape(-1)
+            point_indices = np.asarray(
+                self.sample_data_point_indices,
+                dtype=int,
+            ).reshape(-1)
+        except (AttributeError, TypeError, ValueError):
+            return {}
+        if line_numbers.size == 0 or line_numbers.size != point_indices.size:
+            return {}
+
+        candidate_mask = np.ones(line_numbers.size, dtype=bool)
+        mask_builder = getattr(self, "build_sample_mask", None)
+        program_number_getter = getattr(self, "get_program_number_by_name", None)
+        tool_ranges_getter = getattr(self, "get_tool_ranges_by_id", None)
+        if (
+            callable(mask_builder)
+            and callable(program_number_getter)
+            and callable(tool_ranges_getter)
+        ):
+            try:
+                resolved_mask = np.asarray(
+                    mask_builder(
+                        program_number_getter(program_name),
+                        tool_ranges_getter(program_name, tool_id),
+                    ),
+                    dtype=bool,
+                ).reshape(-1)
+            except Exception:
+                resolved_mask = np.asarray([], dtype=bool)
+            if resolved_mask.size == line_numbers.size:
+                candidate_mask = resolved_mask
+
+        coordinate_index = collections.defaultdict(list)
+        for sample_index in np.flatnonzero(candidate_mask):
+            coordinate = (
+                int(line_numbers[sample_index]),
+                int(point_indices[sample_index]),
+            )
+            if coordinate in target_coordinates:
+                coordinate_index[coordinate].append(int(sample_index))
+        return dict(coordinate_index)
+
+    @staticmethod
+    def _measure_rg_interval_sample_count(interval_text, coordinate_index):
+        """根据 .rg 行点端点还原区间在时域中的采样点数。"""
+        coordinates = AnalysisExportMixin._parse_rg_interval_coordinates(
+            interval_text
+        )
+        if coordinates is None:
+            return 0
+        start_coordinate, end_coordinate = coordinates
+        start_indices = coordinate_index.get(start_coordinate, ())
+        end_indices = coordinate_index.get(end_coordinate, ())
+        spans = [
+            int(end_index - start_index + 1)
+            for start_index in start_indices
+            for end_index in end_indices
+            if end_index >= start_index
+        ]
+        if spans:
+            return min(spans)
+        if start_coordinate[0] == end_coordinate[0]:
+            return abs(end_coordinate[1] - start_coordinate[1]) + 1
+        return 0
+
+    def _prepare_rg_export_rows(self, tools_to_save):
+        """按全局上限筛选时域最长的区间，再按行点坐标升序生成 RG 行。"""
+        rows = []
+        ranked_entries = []
+        sequence = 0
+        for program_name, tool_id, rg in tools_to_save:
+            mean_val, count, _ = self.compute_tool_measured_mean(
+                program_name,
+                tool_id,
+            )
+            if mean_val is None or count == 0:
+                continue
+            try:
+                ideal_val = float(mean_val) * float(rg)
+            except (TypeError, ValueError):
+                continue
+            typed_intervals = self.collect_line_point_intervals_for_tool(
+                program_name,
+                tool_id,
+                include_types=True,
+            )
+            intervals = [interval["text"] for interval in typed_intervals]
+            if not intervals:
+                continue
+
+            coordinate_index = self._build_rg_coordinate_index(
+                program_name,
+                tool_id,
+                intervals,
+            )
+            entries = []
+            for interval_order, interval_text in enumerate(intervals):
+                coordinates = self._parse_rg_interval_coordinates(interval_text)
+                if coordinates is None:
+                    coordinate_sort_key = (
+                        float("inf"),
+                        float("inf"),
+                        float("inf"),
+                        float("inf"),
+                        interval_order,
+                    )
+                else:
+                    start_coordinate, end_coordinate = coordinates
+                    coordinate_sort_key = (
+                        start_coordinate[0],
+                        start_coordinate[1],
+                        end_coordinate[0],
+                        end_coordinate[1],
+                        interval_order,
+                    )
+                entry = {
+                    "text": str(interval_text),
+                    "segment_type": typed_intervals[interval_order]["segment_type"],
+                    "sample_count": self._measure_rg_interval_sample_count(
+                        interval_text,
+                        coordinate_index,
+                    ),
+                    "interval_order": interval_order,
+                    "coordinate_sort_key": coordinate_sort_key,
+                    "sequence": sequence,
+                }
+                entries.append(entry)
+                ranked_entries.append(entry)
+                sequence += 1
+            rows.append({
+                "program_name": program_name,
+                "tool_id": tool_id,
+                "ideal_value": ideal_val,
+                "entries": entries,
+            })
+
+        interval_limit = int(self._RG_EXPORT_INTERVAL_LIMIT)
+        ranked_entries.sort(
+            key=lambda entry: (-entry["sample_count"], entry["sequence"])
+        )
+        selected_sequences = {
+            entry["sequence"] for entry in ranked_entries[:interval_limit]
+        }
+        prepared_rows = []
+        for row in rows:
+            selected_entries = [
+                entry
+                for entry in row["entries"]
+                if entry["sequence"] in selected_sequences
+            ]
+            selected_entries.sort(key=lambda entry: entry["coordinate_sort_key"])
+            if not selected_entries:
+                continue
+            prepared_rows.append({
+                "program_name": row["program_name"],
+                "tool_id": row["tool_id"],
+                "ideal_value": row["ideal_value"],
+                "intervals": [entry["text"] for entry in selected_entries],
+                "min_sample_count": min(entry["sample_count"] for entry in selected_entries),
+                "idle_count": sum(entry["segment_type"] == "idle" for entry in selected_entries),
+                "steady_count": sum(entry["segment_type"] == "steady" for entry in selected_entries),
+            })
+        return prepared_rows, len(ranked_entries), len(selected_sequences)
+
+    @staticmethod
+    def _rg_min_duration_note(export_rows):
+        """与筛选一致，以 SampleData 每点 1 ms 的口径报告已保存区间时长。"""
+        minimum = min((row["min_sample_count"] for row in export_rows), default=0)
+        if minimum <= 0:
+            return "最小时间：无法确定"
+        return f"最小时间：{minimum} ms"
+
+    def _rg_saved_dialog_text(self, export_rows, saved_interval_count):
+        idle_count = sum(row["idle_count"] for row in export_rows)
+        steady_count = sum(row["steady_count"] for row in export_rows)
+        return (
+            f"已保存区间：{saved_interval_count} 个\n"
+            f"空载：{idle_count} 个，稳态：{steady_count} 个\n"
+            f"{self._rg_min_duration_note(export_rows)}"
+        )
+
     def _do_save_interval_info(self, tools_to_save):
         """实际执行保存区间信息"""
         if (
@@ -2199,21 +2431,19 @@ class AnalysisExportMixin:
         
         output_path = os.path.join(output_dir, "SampleData.rg")
         try:
-            saved_lines = 0
+            export_rows, interval_count, saved_interval_count = (
+                self._prepare_rg_export_rows(tools_to_save)
+            )
             source_idx = int(self.sample_data_source.get())
             with open(output_path, 'w', encoding='utf-8') as f:
                 f.write(f"{source_idx}\n")
-                for program_name, tool_id, rg in tools_to_save:
-                    mean_val, count, _ = self.compute_tool_measured_mean(program_name, tool_id)
-                    if mean_val is None or count == 0:
-                        continue
-                    ideal_val = mean_val * rg
-                    intervals = self.collect_line_point_intervals_for_tool(program_name, tool_id)
-                    if not intervals:
-                        continue
-                    interval_text = ",".join(intervals)
-                    f.write(f"{program_name};{ideal_val:.6f};{interval_text};\n")
-                    saved_lines += 1
+                for row in export_rows:
+                    interval_text = ",".join(row["intervals"])
+                    f.write(
+                        f"{row['program_name']};{row['ideal_value']:.6f};"
+                        f"{interval_text};\n"
+                    )
+            saved_lines = len(export_rows)
             
             # 文件已保存，立即弹出提示
             if saved_lines == 0:
@@ -2223,8 +2453,16 @@ class AnalysisExportMixin:
                 feed_export_note = str(
                     getattr(self, "_last_processinfo_feed_export_status", "") or ""
                 )
+                omitted_interval_count = interval_count - saved_interval_count
+                interval_note = (
+                    f"可导出{interval_count}个，上限{self._RG_EXPORT_INTERVAL_LIMIT}个，"
+                    f"实际保存{saved_interval_count}个区间"
+                )
+                if omitted_interval_count > 0:
+                    interval_note += f"，舍弃{omitted_interval_count}个"
                 status_text = (
-                    f"区间信息已保存: {os.path.basename(output_path)} (共{saved_lines}行)"
+                    f"区间信息已保存: {os.path.basename(output_path)} "
+                    f"(共{saved_lines}行；{interval_note})"
                 )
                 if feed_export_note:
                     status_text += f"；{feed_export_note}"
@@ -2233,11 +2471,7 @@ class AnalysisExportMixin:
                 saved_programs = {program_name for program_name, _, _ in tools_to_save}
                 self._save_process_data_paths(output_dir, saved_programs)
 
-                detail = "结果已保存，请关闭该窗口"
-                if process_info_path:
-                    detail += f"\n同时导出: {os.path.basename(process_info_path)}"
-                if feed_export_note:
-                    detail += f"\n{feed_export_note}"
+                detail = self._rg_saved_dialog_text(export_rows, saved_interval_count)
                 messagebox.showinfo("保存成功", detail)
         except Exception as e:
             messagebox.showerror("导出失败", f"保存区间信息时发生错误:\n{str(e)}")
@@ -2447,33 +2681,32 @@ class AnalysisExportMixin:
 
         output_path = os.path.join(output_dir, "SampleData.rg")
         try:
-            saved_lines = 0
+            tools_to_save = []
+            for program_name, program_info in self.sample_programs.items():
+                tools = program_info.get("tools", {})
+                for tool_id in tools.keys():
+                    store = self.ideal_store.get((program_name, tool_id))
+                    if not store:
+                        continue
+                    try:
+                        rg = float(store.get("rg"))
+                    except (TypeError, ValueError):
+                        continue
+                    tools_to_save.append((program_name, tool_id, rg))
+
+            export_rows, interval_count, saved_interval_count = (
+                self._prepare_rg_export_rows(tools_to_save)
+            )
             source_idx = int(self.sample_data_source.get())
             with open(output_path, 'w', encoding='utf-8') as f:
                 f.write(f"{source_idx}\n")
-                for program_name, program_info in self.sample_programs.items():
-                    tools = program_info.get("tools", {})
-                    for tool_id in tools.keys():
-                        key = (program_name, tool_id)
-                        store = self.ideal_store.get(key)
-                        if not store:
-                            continue
-                        try:
-                            rg = float(store.get("rg"))
-                        except Exception:
-                            continue
-                        mean_val, count, _ = self.compute_tool_measured_mean(program_name, tool_id)
-                        if mean_val is None or count == 0:
-                            continue
-                        ideal_val = mean_val * rg
-                        if ideal_val is None:
-                            continue
-                        intervals = self.collect_line_point_intervals_for_tool(program_name, tool_id)
-                        if not intervals:
-                            continue
-                        interval_text = ",".join(intervals)
-                        f.write(f"{program_name};{ideal_val:.6f};{interval_text};\n")
-                        saved_lines += 1
+                for row in export_rows:
+                    interval_text = ",".join(row["intervals"])
+                    f.write(
+                        f"{row['program_name']};{row['ideal_value']:.6f};"
+                        f"{interval_text};\n"
+                    )
+            saved_lines = len(export_rows)
             if saved_lines == 0:
                 messagebox.showwarning("无可导出数据", "未找到已保存优化倍率的刀具区间")
                 return
@@ -2481,15 +2714,21 @@ class AnalysisExportMixin:
             feed_export_note = str(
                 getattr(self, "_last_processinfo_feed_export_status", "") or ""
             )
-            status_text = f"结果已保存: {os.path.basename(output_path)} (共{saved_lines}行)"
+            omitted_interval_count = interval_count - saved_interval_count
+            interval_note = (
+                f"可导出{interval_count}个，上限{self._RG_EXPORT_INTERVAL_LIMIT}个，"
+                f"实际保存{saved_interval_count}个区间"
+            )
+            if omitted_interval_count > 0:
+                interval_note += f"，舍弃{omitted_interval_count}个"
+            status_text = (
+                f"结果已保存: {os.path.basename(output_path)} "
+                f"(共{saved_lines}行；{interval_note})"
+            )
             if feed_export_note:
                 status_text += f"；{feed_export_note}"
             self.status_var_data.set(status_text)
-            detail = f"结果已保存:\n{output_path}\n共 {saved_lines} 行"
-            if process_info_path:
-                detail += f"\n同时导出:\n{process_info_path}"
-            if feed_export_note:
-                detail += f"\n{feed_export_note}"
+            detail = self._rg_saved_dialog_text(export_rows, saved_interval_count)
             messagebox.showinfo("保存完成", detail)
         except Exception as e:
             messagebox.showerror("导出失败", f"保存结果时发生错误:\n{str(e)}")

@@ -40,6 +40,7 @@ from project.release_prediction import (
     parse_iipinc_rows,
 )
 from project.release_metadata import RELEASE_VERSION
+import project.sample_manager as sample_manager_module
 from project.sample_manager import SampleManagerMixin
 from project.ui_bootstrap import (
     DEFAULT_DATA_PREVIEW_RATIO,
@@ -119,7 +120,9 @@ class _RgExportHarness(AnalysisExportMixin):
     def compute_tool_measured_mean(self, _program_name, _tool_id):
         return 10.0, 2, []
 
-    def collect_line_point_intervals_for_tool(self, _program_name, _tool_id):
+    def collect_line_point_intervals_for_tool(self, _program_name, _tool_id, *, include_types=False):
+        if include_types:
+            return [{"text": "10.0-11.0:10.000000", "segment_type": "steady"}]
         return ["10.0-11.0:10.000000"]
 
     def _save_process_info_csv(self, _output_dir):
@@ -127,6 +130,32 @@ class _RgExportHarness(AnalysisExportMixin):
 
     def _save_process_data_paths(self, _output_dir, _saved_programs=None):
         return None
+
+
+class _LimitedRgExportHarness(_RgExportHarness):
+    def __init__(self):
+        super().__init__()
+        self.sample_data_line_numbers = np.zeros(600, dtype=int)
+        self.sample_data_point_indices = np.arange(600, dtype=int)
+
+    def collect_line_point_intervals_for_tool(self, program_name, _tool_id, *, include_types=False):
+        if program_name == "P1":
+            lengths = range(1, 600, 2)
+            line_for_length = lambda length: 1000 - length
+        else:
+            lengths = range(2, 601, 2)
+            line_for_length = lambda length: length
+        intervals = [
+            f"{line_for_length(length)}.0-"
+            f"{line_for_length(length)}.{length - 1}:{float(length):.6f}"
+            for length in lengths
+        ]
+        if include_types:
+            return [
+                {"text": text, "segment_type": "idle" if program_name == "P1" else "steady"}
+                for text in intervals
+            ]
+        return intervals
 
 
 class _RootStub:
@@ -807,30 +836,145 @@ if missing:
             programs["2D10-曲面-中.NC"]["tools"]["T0"],
         )
 
+    def test_sample_program_txt_keeps_gb18030_mixed_path_name(self):
+        manager = SampleManagerMixin()
+        with TemporaryDirectory() as temp_dir:
+            txt_path = Path(temp_dir) / "SampleData.txt"
+            txt_path.write_bytes(
+                "3D10-混合路径.NC:4080455190:T0:15-43737;\r\n".encode(
+                    "gb18030"
+                )
+            )
+            programs = manager.parse_sample_program_file(txt_path)
+
+        self.assertEqual("gb18030", manager._sample_program_file_encoding)
+        self.assertIn("3D10-混合路径.NC", programs)
+        self.assertEqual(
+            [(15, 43737)],
+            programs["3D10-混合路径.NC"]["tools"]["T0"],
+        )
+
+    def test_sample_program_txt_uses_windows_code_page_when_host_forces_utf8(self):
+        manager = SampleManagerMixin()
+        with TemporaryDirectory() as temp_dir, patch.object(
+            sample_manager_module.locale,
+            "getpreferredencoding",
+            return_value="UTF-8",
+        ), patch.object(
+            sample_manager_module.locale,
+            "getlocale",
+            return_value=("Chinese (Simplified)_China", "936"),
+        ):
+            txt_path = Path(temp_dir) / "SampleData.txt"
+            txt_path.write_bytes(
+                "3D10-混合路径.NC:4080455190:T0:15-43737;\r\n".encode(
+                    "gb18030"
+                )
+            )
+            programs = manager.parse_sample_program_file(txt_path)
+
+        self.assertEqual("gb18030", manager._sample_program_file_encoding)
+        self.assertIn("3D10-混合路径.NC", programs)
+        self.assertEqual(
+            [(15, 43737)],
+            programs["3D10-混合路径.NC"]["tools"]["T0"],
+        )
+
+    def test_sample_program_txt_preserves_mixed_gcode_names_exactly(self):
+        program_names = (
+            "外形.NC",
+            "中文.nc",
+            "中.NC",
+            "混合.NC",
+            "路径.NC",
+            "3D10-混合路径.NC",
+            "3D10-混合 路径_#1+(A)@[试切].NC",
+            "零件 !#$%&'()+,-.;=@[]^_`{}~ 中文.NC",
+            "PART-01_A+B#2@(TEST)[R1].NC",
+        )
+        manager = SampleManagerMixin()
+        with patch.object(
+            sample_manager_module.locale,
+            "getpreferredencoding",
+            return_value="UTF-8",
+        ), patch.object(
+            sample_manager_module.locale,
+            "getlocale",
+            return_value=("Chinese (Simplified)_China", "936"),
+        ), TemporaryDirectory() as temp_dir:
+            txt_path = Path(temp_dir) / "SampleData.txt"
+            for program_name in program_names:
+                with self.subTest(program_name=program_name):
+                    txt_path.write_bytes(
+                        f"{program_name}:4080455190:T0:15-43737;\r\n".encode(
+                            "gb18030"
+                        )
+                    )
+                    programs = manager.parse_sample_program_file(txt_path)
+                    if not program_name.isascii():
+                        self.assertEqual(
+                            "gb18030", manager._sample_program_file_encoding
+                        )
+                    self.assertEqual([program_name], list(programs))
+                    self.assertEqual(
+                        [(15, 43737)],
+                        programs[program_name]["tools"]["T0"],
+                    )
+
+    def test_sample_program_txt_keeps_korean_code_page_when_host_forces_utf8(self):
+        manager = SampleManagerMixin()
+        with TemporaryDirectory() as temp_dir, patch.object(
+            sample_manager_module.locale,
+            "getpreferredencoding",
+            return_value="UTF-8",
+        ), patch.object(
+            sample_manager_module.locale,
+            "getlocale",
+            return_value=("Korean_Korea", "949"),
+        ):
+            txt_path = Path(temp_dir) / "SampleData.txt"
+            txt_path.write_bytes(
+                "외형:123:T0:1-9;\r\n".encode("euc_kr")
+            )
+            programs = manager.parse_sample_program_file(txt_path)
+
+        self.assertEqual("euc_kr", manager._sample_program_file_encoding)
+        self.assertIn("외형", programs)
+        self.assertEqual([(1, 9)], programs["외형"]["tools"]["T0"])
+
     def test_sample_program_txt_accepts_common_unicode_and_legacy_encodings(self):
         cases = (
-            ("utf-8-sig", "外形"),
-            ("utf-16", "外形"),
-            ("utf-16-le", "外形"),
-            ("utf-16-be", "外形"),
-            ("utf-32", "外形"),
-            ("utf-32-le", "外形"),
-            ("utf-32-be", "外形"),
-            ("big5", "外形"),
-            ("shift_jis", "外形テスト"),
-            ("euc_jp", "外形テスト"),
-            ("euc_kr", "외형"),
-            ("cp1252", "Contouré"),
+            ("utf-8-sig", "外形", "UTF-8", "936"),
+            ("utf-16", "外形", "UTF-8", "936"),
+            ("utf-16-le", "外形", "UTF-8", "936"),
+            ("utf-16-be", "外形", "UTF-8", "936"),
+            ("utf-32", "外形", "UTF-8", "936"),
+            ("utf-32-le", "外形", "UTF-8", "936"),
+            ("utf-32-be", "外形", "UTF-8", "936"),
+            ("big5", "外形", "UTF-8", "950"),
+            ("shift_jis", "外形テスト", "UTF-8", "932"),
+            ("euc_jp", "外形テスト", "euc_jp", None),
+            ("euc_kr", "외형", "UTF-8", "949"),
+            ("cp1252", "Contouré", "UTF-8", "1252"),
         )
         manager = SampleManagerMixin()
         with TemporaryDirectory() as temp_dir:
             txt_path = Path(temp_dir) / "SampleData.txt"
-            for source_encoding, program_name in cases:
+            for source_encoding, program_name, preferred, code_page in cases:
                 with self.subTest(source_encoding=source_encoding):
                     txt_path.write_bytes(
                         f"{program_name}:123:T0:1-9;\r\n".encode(source_encoding)
                     )
-                    programs = manager.parse_sample_program_file(txt_path)
+                    with patch.object(
+                        sample_manager_module.locale,
+                        "getpreferredencoding",
+                        return_value=preferred,
+                    ), patch.object(
+                        sample_manager_module.locale,
+                        "getlocale",
+                        return_value=(None, code_page),
+                    ):
+                        programs = manager.parse_sample_program_file(txt_path)
                     self.assertIn(program_name, programs)
                     self.assertEqual([(1, 9)], programs[program_name]["tools"]["T0"])
 
@@ -1516,6 +1660,103 @@ if missing:
             b"1\r\nP1;20.000000;10.0-11.0:10.000000;\r\n",
             raw,
         )
+
+    def test_rg_export_keeps_longest_200_then_writes_in_line_order(self):
+        import project.analysis_export as export_module
+
+        harness = _LimitedRgExportHarness()
+        harness._last_processinfo_feed_export_status = "iipinc.txt 指令进给测试信息"
+        with TemporaryDirectory() as temp_dir, patch.object(
+            export_module,
+            "OUTPUT_DIR",
+            Path(temp_dir),
+        ), patch.object(export_module.messagebox, "showinfo") as showinfo, patch.object(
+            export_module.messagebox,
+            "showwarning",
+        ):
+            harness._do_save_interval_info([
+                ("P1", "T0", 2.0),
+                ("P2", "T0", 2.0),
+            ])
+            lines = (Path(temp_dir) / "SampleData.rg").read_text(
+                encoding="utf-8"
+            ).splitlines()
+
+        intervals_by_program = {}
+        for line in lines[1:]:
+            program_name, _ideal_value, interval_text, _suffix = line.split(";")
+            intervals_by_program[program_name] = interval_text.split(",")
+        exported_lengths = {
+            program_name: [
+                int(float(interval.rsplit(":", 1)[1]))
+                for interval in intervals
+            ]
+            for program_name, intervals in intervals_by_program.items()
+        }
+        exported_start_lines = {
+            program_name: [
+                int(interval.split(".", 1)[0])
+                for interval in intervals
+            ]
+            for program_name, intervals in intervals_by_program.items()
+        }
+
+        self.assertEqual(200, sum(map(len, exported_lengths.values())))
+        self.assertEqual(list(range(599, 400, -2)), exported_lengths["P1"])
+        self.assertEqual(list(range(402, 601, 2)), exported_lengths["P2"])
+        self.assertEqual(
+            set(range(401, 601)),
+            {
+                length
+                for lengths in exported_lengths.values()
+                for length in lengths
+            },
+        )
+        for start_lines in exported_start_lines.values():
+            self.assertEqual(sorted(start_lines), start_lines)
+        detail = showinfo.call_args.args[1]
+        self.assertEqual("已保存区间：200 个\n空载：100 个，稳态：100 个\n最小时间：401 ms", detail)
+        self.assertNotIn("iipinc", detail)
+        self.assertNotIn("指令进给", detail)
+
+    def test_rg_limit_boundaries_and_minimum_duration(self):
+        harness = _RgExportHarness()
+        for count in (0, 1, 199, 200, 201):
+            with self.subTest(count=count):
+                harness.collect_line_point_intervals_for_tool = lambda *_, **__: [
+                    {"text": f"{length}.0-{length}.{length - 1}:10.000000", "segment_type": "idle"}
+                    for length in range(count, 0, -1)
+                ]
+                rows, total, saved = harness._prepare_rg_export_rows([("P1", "T0", 2.0)])
+                self.assertEqual(count, total)
+                self.assertEqual(min(count, 200), saved)
+                if count:
+                    minimum = max(1, count - 199)
+                    self.assertEqual(minimum, rows[0]["min_sample_count"])
+                    self.assertEqual(saved, rows[0]["idle_count"])
+                    self.assertEqual(0, rows[0]["steady_count"])
+                    self.assertEqual(
+                        list(range(minimum, count + 1)),
+                        [int(text.split(".")[0]) for text in rows[0]["intervals"]],
+                    )
+
+    def test_rg_alternate_save_dialog_reports_minimum_without_feed_details(self):
+        import project.analysis_export as export_module
+
+        harness = _LimitedRgExportHarness()
+        harness.ideal_store = {("P1", "T0"): {"rg": 2.0}, ("P2", "T0"): {"rg": 2.0}}
+        harness.sample_programs = {"P1": {"tools": {"T0": []}}, "P2": {"tools": {"T0": []}}}
+        harness._get_optimizable_interval_records = lambda: [1]
+        harness._last_processinfo_feed_export_status = "iipinc.txt 指令进给测试信息"
+        with TemporaryDirectory() as temp_dir, patch.object(
+            export_module, "OUTPUT_DIR", Path(temp_dir)
+        ), patch.object(export_module.messagebox, "showinfo") as showinfo:
+            harness.export_i_code()
+            self.assertTrue((Path(temp_dir) / "SampleData.rg").is_file())
+        detail = showinfo.call_args.args[1]
+        self.assertEqual("已保存区间：200 个\n空载：100 个，稳态：100 个\n最小时间：401 ms", detail)
+        self.assertNotIn("iipinc", detail)
+        self.assertNotIn("指令进给", detail)
 
 
 if __name__ == "__main__":
