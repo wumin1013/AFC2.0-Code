@@ -268,7 +268,7 @@ function Get-DebugDirectoryName {
 }
 
 $ProjectRoot = Get-NormalizedPath -Path (Join-Path $PSScriptRoot "..")
-$ReleaseVersionsRoot = Get-NormalizedPath -Path (Join-Path $ProjectRoot "release_versions")
+$ReleaseArchiveRoot = Get-NormalizedPath -Path (Join-Path (Split-Path -Parent $ProjectRoot) "历史归档/发布版本")
 $ReleaseVersionSource = Join-Path $ProjectRoot "src\project\release_metadata.py"
 $SpecPath = Join-Path $ProjectRoot "packaging\AFC2_onedir.spec"
 $ReleaseNotesTemplate = Join-Path $ProjectRoot "packaging\release_notes.txt"
@@ -305,11 +305,11 @@ if ($ArchiveDestination) {
 }
 
 if (-not $OutputRoot) {
-    $OutputRoot = $ReleaseVersionsRoot
+    $OutputRoot = $ReleaseArchiveRoot
 }
 $OutputRoot = Get-NormalizedPath -Path $OutputRoot -BasePath $ProjectRoot
-if (-not (Test-PathWithin -Candidate $OutputRoot -Parent $ReleaseVersionsRoot -AllowEqual)) {
-    throw "构建输出必须位于项目 release_versions 目录内: $OutputRoot"
+if (-not (Test-PathWithin -Candidate $OutputRoot -Parent $ReleaseArchiveRoot -AllowEqual)) {
+    throw "构建输出必须位于项目外层的「历史归档/发布版本」目录内: $OutputRoot"
 }
 
 $ResolvedPython = Resolve-AfcPython -RequestedPath $PythonPath
@@ -338,7 +338,7 @@ if ($ResolvedArchiveDestination -and $GitDirty) {
     throw "工作区有未提交修改；允许测试构建，但禁止正式归档。"
 }
 
-New-Item -ItemType Directory -Path $ReleaseVersionsRoot -Force | Out-Null
+New-Item -ItemType Directory -Path $ReleaseArchiveRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $OutputRoot -Force | Out-Null
 
 $FinalReleaseDirectory = Join-Path $OutputRoot $DebugDirectoryName
@@ -672,5 +672,5 @@ if ($ResolvedArchiveDestination) {
     }
 }
 else {
-    Write-Host "未提供 -ArchiveDestination；本次仅生成并验证测试发布目录，不执行正式归档。"
+    Write-Host "未提供 -ArchiveDestination；本次已将构建验证产物保存到历史归档的发布版本目录。"
 }
