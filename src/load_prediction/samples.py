@@ -11,7 +11,7 @@ from .common import version_of
 from .measurement import detect_encoding, resolve_position_policy, select_position_channels
 from .sample_rules import SAMPLE_RULES_VERSION, continuous_ids, task_masks
 from .experiment_protocol import protocol_folds, validate_round_metadata
-from ..process_path import uniform_path_boundaries, PROCESS_MAPPING_RULES_VERSION
+from afc_common.process_path import uniform_path_boundaries, PROCESS_MAPPING_RULES_VERSION
 
 PHYSICS_COLUMNS = ["ap_mm", "ae_mm", "feed_input_mm_min", "spindle_rpm", "diameter_mm", "teeth"]
 PATH_COLUMNS = ["normalized_main", "ap_over_d", "ae_over_d", "feed_over_reference", "curvature_times_d", "block_over_d"]

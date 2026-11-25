@@ -19,7 +19,7 @@ from .common import checkpoint, version_of
 from .feed import parse_nc
 from .measurement import detect_encoding, resolve_position_policy, select_position_channels
 from .sample_rules import SAMPLE_RULES_VERSION, contact_mask, continuous_ids, motion_mask, quality_pass
-from ..process_path import PROCESS_MAPPING_RULES_VERSION
+from afc_common.process_path import PROCESS_MAPPING_RULES_VERSION
 
 
 FEED_SAMPLE_SCHEMA = "afc.feed_samples.2"

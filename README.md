@@ -10,7 +10,7 @@
 
 ```powershell
 conda activate AFC
-python src/project/main.py
+python src/interval_analysis/main.py
 ```
 
 运行依赖记录在 `requirements.txt`。本机 `AFC` 环境可能与该文件的历史版本锁定存在差异，发布构建会在产物中记录实际参与构建的版本，不会自动安装或升级依赖。
@@ -33,7 +33,7 @@ python src/project/main.py
 
 ## 发布产物与版本规则
 
-当前发布版本由 `src/project/release_metadata.py` 中的 `RELEASE_VERSION` 唯一定义，当前值为 `AFC2.0.2alpha`。以后升级为 `AFC2.0.2beta`、`AFC2.0.3alpha` 等版本时，只修改这个常量；EXE 文件名、窗口标题、发布说明、构建清单、版本专属调试目录和最小 ZIP 名都会随之更新。调试目录中的阶段名首字母大写，例如 `alpha` 对应 `Alpha-debug`、`beta` 对应 `Beta-debug`。
+当前发布版本由 `src/interval_analysis/release_metadata.py` 中的 `RELEASE_VERSION` 唯一定义，当前值为 `AFC2.0.2alpha`。以后升级为 `AFC2.0.2beta`、`AFC2.0.3alpha` 等版本时，只修改这个常量；EXE 文件名、窗口标题、发布说明、构建清单、版本专属调试目录和最小 ZIP 名都会随之更新。调试目录中的阶段名首字母大写，例如 `alpha` 对应 `Alpha-debug`、`beta` 对应 `Beta-debug`。
 
 每个版本生成一套独立且长期保留的调试目录和最小发布包。当前 Alpha 版本为：
 
@@ -143,7 +143,7 @@ python scripts/verification/verify_segmentation_cases.py --help
 ## 项目目录
 
 ```text
-src/project/           主程序源码与入口
+src/                   按职责组织的源码与应用入口
 packaging/             PyInstaller spec 与发布说明模板
 config/                本机应用配置
 data/sample/           静态样例工艺数据
@@ -169,17 +169,17 @@ set MKL_THREADING_LAYER=SEQUENTIAL
 python -m pip install -r requirements-load-prediction.txt
 python scripts\load_prediction.py --help
 set PYTHONPATH=src
-python -m project.load_prediction.unified_cli --help
+python -m load_prediction.unified_cli --help
 ```
 
-src/project/load_prediction/ 保存切削功率模型、训练、评估和预测。src/project/spindle_runtime/ 提供单文件主轴功率模型包的加载和全位置推理。输入数据、模型权重和输出目录由调用方指定。论文 1 的研究初始权重及其采用回执见论文仓库的 models/。
+src/load_prediction/ 保存切削功率模型、训练、评估和预测。src/spindle_runtime/ 提供单文件主轴功率模型包的加载和全位置推理。输入数据、模型权重和输出目录由调用方指定。论文 1 的研究初始权重及其采用回执见论文仓库的 models/。
 
 ### 源码分工
 
 | 功能 | 代码入口 |
 | --- | --- |
-| 区间划分、理想值和 RG | project/segmentation/ 保存划分算法，interval_runtime.py 衔接区间应用，config_state.py 管理理想值，analysis_export.py 生成导出结果。 |
-| 负载预测研究模型 | project/load_prediction/ 保存物理主趋势、路径残差、训练、九折评价和研究预测入口。 |
-| 主轴功率部署推理 | project/spindle_runtime/ 加载单文件模型包并完成全工艺位置的主轴功率推理。 |
+| 区间划分、理想值和 RG | src/interval_analysis/ 保存区间应用、理想值、传统机理模型和 RG 导出。src/interval_analysis/segmentation/ 提供区间划分算法。 |
+| 负载预测研究模型 | src/load_prediction/ 保存物理主趋势、路径残差、训练、九折评价和研究预测入口。 |
+| 主轴功率部署推理 | src/spindle_runtime/ 加载单文件模型包并完成全工艺位置的主轴功率推理。 |
 
-project 是统一 Python 包。新功能按职责进入对应子包，共用的轨迹与配置处理由共同入口维护。
+源码直接按功能放在 src/ 下。后续论文使用独立实现时，新增相应功能包。共用轨迹处理在 src/afc_common/。

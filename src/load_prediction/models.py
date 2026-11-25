@@ -64,7 +64,7 @@ class ModelConfig:
 
 
 def _runtime():
-    # A host embedding AFC may have initialized NumPy before project.shared.
+    # A host embedding AFC may have initialized NumPy before interval_analysis.shared.
     # Fail recoverably instead of accepting multiple OpenMP runtimes.
     import sys
     if sys.platform == "win32":

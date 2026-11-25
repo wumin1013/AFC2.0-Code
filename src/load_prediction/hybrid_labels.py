@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .artifact_paths import archived_load_directory
 from .common import file_hash
 from .record_idle import _continuous_runs, _digest, _ranges, _record_idle_power, POLICY_VALUES
 
@@ -58,7 +59,7 @@ def verify_hybrid_evidence(evidence, records=(), *, base_dir=None,
                 or any(report.get("model", {}).get(k) != v for k, v in
                        dict(version=model.version, sha256=evidence["model_sha256"], original_status=model.status).items())):
             raise ValueError("混合协议必须保留原冻结模型身份和状态")
-        source_directory = (resolver.resolve(historical_consumer_source) / "src/project/load_prediction"
+        source_directory = (archived_load_directory(resolver.resolve(historical_consumer_source))
                             if historical_consumer_source is not None else Path(__file__).parent)
         for name in LABEL_SOURCES:
             if report.get("production_source_sha256", {}).get(name) != file_hash(source_directory / name):

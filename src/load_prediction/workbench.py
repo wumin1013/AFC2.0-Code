@@ -168,9 +168,9 @@ class LoadPredictionWorkbench(ttk.Frame):
             if not connected():
                 env = dict(os.environ)
                 env.update(PYTHONUTF8="1", MKL_THREADING_LAYER="SEQUENTIAL", OMP_NUM_THREADS="1", MPLBACKEND="Agg")
-                env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2]) + os.pathsep + env.get("PYTHONPATH", "")
+                env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1]) + os.pathsep + env.get("PYTHONPATH", "")
                 with (service.output_dir / "web_service.log").open("ab") as log:
-                    process = subprocess.Popen([sys.executable, "-m", "project.load_prediction.web_service", "--output-dir", str(service.output_dir)],
+                    process = subprocess.Popen([sys.executable, "-m", "load_prediction.web_service", "--output-dir", str(service.output_dir)],
                         env=env, stdout=log, stderr=subprocess.STDOUT,
                         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
                 for _ in range(40):

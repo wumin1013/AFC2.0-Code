@@ -22,12 +22,12 @@ try:
 except ModuleNotFoundError as exc:
     if exc.name not in {'afc_vendor', 'afc_vendor.load_prediction'}:
         raise
-    from project.load_prediction.feed import Segment, _arc
-    from project.load_prediction.feed_samples import _tangent, _curvature, _angle
-    from project.load_prediction.process_coordinates import reconstruct_process_coordinates, source_distance_compatible, source_cell_indices
-    from project.load_prediction.neural import prospective_residual_context, window_batches
-    from project.load_prediction.samples import PHYSICS_COLUMNS, NOMINAL_GEOMETRY_COLUMNS
-    from project.load_prediction.measurement import detect_encoding
+    from load_prediction.feed import Segment, _arc
+    from load_prediction.feed_samples import _tangent, _curvature, _angle
+    from load_prediction.process_coordinates import reconstruct_process_coordinates, source_distance_compatible, source_cell_indices
+    from load_prediction.neural import prospective_residual_context, window_batches
+    from load_prediction.samples import PHYSICS_COLUMNS, NOMINAL_GEOMETRY_COLUMNS
+    from load_prediction.measurement import detect_encoding
 
 STATUS = 'research_prediction_with_command_time_estimate'
 IN_COLS = PHYSICS_COLUMNS + ['curvature_per_mm', 'block_length_mm'] + NOMINAL_GEOMETRY_COLUMNS

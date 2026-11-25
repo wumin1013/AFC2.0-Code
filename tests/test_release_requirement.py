@@ -19,19 +19,19 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from project.input_idle import InputIdleMixin
-from project.analysis_export import AnalysisExportMixin
-from project.config_state import ConfigStateMixin
-from project.interval_runtime import IntervalRuntimeMixin
-from project.plot_support import PlotSupportMixin
-from project.processing_core import ProcessingCoreMixin
-from project.prediction_support import (
+from interval_analysis.input_idle import InputIdleMixin
+from interval_analysis.analysis_export import AnalysisExportMixin
+from interval_analysis.config_state import ConfigStateMixin
+from interval_analysis.interval_runtime import IntervalRuntimeMixin
+from interval_analysis.plot_support import PlotSupportMixin
+from interval_analysis.processing_core import ProcessingCoreMixin
+from interval_analysis.prediction_support import (
     append_inverse_prediction_channels,
     apply_steady_representative_prediction,
     fit_nonnegative_kc_ke,
     summarize_interval_kc_mode_statistics,
 )
-from project.release_prediction import (
+from interval_analysis.release_prediction import (
     IIPINC_FEED_SCALE,
     IIPINC_SINGLE_FEED_SCALE,
     IipincFormatError,
@@ -39,10 +39,10 @@ from project.release_prediction import (
     map_iipinc_feed_to_samples,
     parse_iipinc_rows,
 )
-from project.release_metadata import RELEASE_VERSION
-import project.sample_manager as sample_manager_module
-from project.sample_manager import SampleManagerMixin
-from project.ui_bootstrap import (
+from interval_analysis.release_metadata import RELEASE_VERSION
+import interval_analysis.sample_manager as sample_manager_module
+from interval_analysis.sample_manager import SampleManagerMixin
+from interval_analysis.ui_bootstrap import (
     DEFAULT_DATA_PREVIEW_RATIO,
     calculate_initial_window_geometry,
 )
@@ -425,7 +425,7 @@ sys.frozen = True
 sys.executable = str(Path(r'%s') / '%s.exe')
 sys._MEIPASS = str(Path(r'%s'))
 sys.path.insert(0, str(Path(r'%s')))
-import project.shared as shared
+import interval_analysis.shared as shared
 expected = Path(r'%s').resolve()
 if shared.OUTPUT_DIR != expected:
     raise SystemExit(f'OUTPUT_DIR={shared.OUTPUT_DIR}, expected={expected}')
@@ -443,8 +443,8 @@ if (expected / 'output').exists():
             self.assertEqual(0, completed.returncode, completed.stderr or completed.stdout)
 
     def test_release_runtime_files_do_not_create_output_subdirectory(self):
-        import project.analysis_export as export_module
-        import project.release_main as release_main
+        import interval_analysis.analysis_export as export_module
+        import interval_analysis.release_main as release_main
 
         with TemporaryDirectory() as temp_dir:
             release_root = Path(temp_dir).resolve()
@@ -475,19 +475,19 @@ if (expected / 'output').exists():
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(r'%s')))
-import project.release_app
+import interval_analysis.release_app
 forbidden = [
     name for name in sys.modules
     if name in {
-        'project.app',
-        'project.pit_model',
+        'interval_analysis.app',
+        'interval_analysis.pit_model',
         'sklearn',
     }
     or name.startswith('sklearn.')
 ]
 if forbidden:
     raise SystemExit('forbidden imports: ' + ','.join(sorted(forbidden)))
-required = {'project.prediction_support', 'project.release_prediction'}
+required = {'interval_analysis.prediction_support', 'interval_analysis.release_prediction'}
 missing = required.difference(sys.modules)
 if missing:
     raise SystemExit('missing imports: ' + ','.join(sorted(missing)))
@@ -503,7 +503,7 @@ if missing:
         self.assertEqual(0, completed.returncode, completed.stderr or completed.stdout)
 
     def test_release_mro_and_research_ui_are_isolated(self):
-        from project.release_app import AFCReleaseApplication
+        from interval_analysis.release_app import AFCReleaseApplication
 
         mro_names = {base.__name__ for base in AFCReleaseApplication.__mro__}
         self.assertNotIn("PitModelMixin", mro_names)
@@ -513,7 +513,7 @@ if missing:
         self.assertFalse(AFCReleaseApplication.enable_profile_config)
 
     def test_frozen_release_sets_unicode_tcl_tk_data_paths(self):
-        import project.release_main as release_main
+        import interval_analysis.release_main as release_main
 
         with TemporaryDirectory(prefix="AFC中文路径-") as temp_dir:
             internal_root = Path(temp_dir) / "_internal"
@@ -536,7 +536,7 @@ if missing:
                 self.assertEqual(str(tk_data.resolve()), os.environ["TK_LIBRARY"])
 
     def test_release_main_smoke_mode_initializes_without_entering_mainloop(self):
-        import project.release_main as release_main
+        import interval_analysis.release_main as release_main
 
         events = []
 
@@ -592,7 +592,7 @@ if missing:
         self.assertIn("destroy", events)
 
     def test_release_main_retries_transient_frozen_executable_lock(self):
-        import project.release_main as release_main
+        import interval_analysis.release_main as release_main
 
         components = {
             "application": lambda _root: None,
@@ -632,13 +632,13 @@ if missing:
         self.assertEqual(2, sleeper.call_count)
 
     def test_main_and_release_keep_parent_aligned_upper_window_geometry(self):
-        main_source = (SRC_ROOT / "project" / "main.py").read_text(
+        main_source = (SRC_ROOT / "interval_analysis" / "main.py").read_text(
             encoding="utf-8"
         )
-        release_source = (SRC_ROOT / "project" / "release_main.py").read_text(
+        release_source = (SRC_ROOT / "interval_analysis" / "release_main.py").read_text(
             encoding="utf-8"
         )
-        ui_source = (SRC_ROOT / "project" / "ui_bootstrap.py").read_text(
+        ui_source = (SRC_ROOT / "interval_analysis" / "ui_bootstrap.py").read_text(
             encoding="utf-8"
         )
 
@@ -673,8 +673,8 @@ if missing:
         for runtime_name in runtime_names:
             self.assertIn(runtime_name, spec_text)
 
-        self.assertNotIn('"project.prediction_support",', spec_text)
-        self.assertNotIn('"project.release_prediction",', spec_text)
+        self.assertNotIn('"interval_analysis.prediction_support",', spec_text)
+        self.assertNotIn('"interval_analysis.release_prediction",', spec_text)
         self.assertIn('"IPython",', spec_text)
         self.assertIn('"jedi",', spec_text)
         self.assertIn('"pkg_resources",', spec_text)
@@ -684,8 +684,8 @@ if missing:
         for runtime_name in runtime_names:
             self.assertIn(runtime_name, verifier_text)
         self.assertIn('$RequiredArchiveModules = @(', verifier_text)
-        self.assertIn('"project.prediction_support"', verifier_text)
-        self.assertIn('"project.release_prediction"', verifier_text)
+        self.assertIn('"interval_analysis.prediction_support"', verifier_text)
+        self.assertIn('"interval_analysis.release_prediction"', verifier_text)
         self.assertIn('"SampleData.rg"', verifier_text)
         self.assertIn('"ProcessDataPath.txt"', verifier_text)
         self.assertIn('$RuntimeInputPatterns = @("*.csv", "SampleData*.txt")', verifier_text)
@@ -719,10 +719,10 @@ if missing:
 
     def test_release_version_has_one_source_of_truth(self):
         self.assertEqual("AFC2.0.2alpha", RELEASE_VERSION)
-        release_main_source = (SRC_ROOT / "project" / "release_main.py").read_text(
+        release_main_source = (SRC_ROOT / "interval_analysis" / "release_main.py").read_text(
             encoding="utf-8"
         )
-        ui_source = (SRC_ROOT / "project" / "ui_bootstrap.py").read_text(
+        ui_source = (SRC_ROOT / "interval_analysis" / "ui_bootstrap.py").read_text(
             encoding="utf-8"
         )
         spec_source = (PROJECT_ROOT / "packaging" / "AFC2_onedir.spec").read_text(
@@ -739,7 +739,7 @@ if missing:
         self.assertIn("release_metadata.py", build_source)
 
     def test_public_plot_toolbar_has_default_hidden_prediction_option(self):
-        ui_source = (SRC_ROOT / "project" / "ui_bootstrap.py").read_text(
+        ui_source = (SRC_ROOT / "interval_analysis" / "ui_bootstrap.py").read_text(
             encoding="utf-8"
         )
         self.assertNotIn('"显示实测"', ui_source)
@@ -1018,7 +1018,7 @@ if missing:
             csv_path.write_text("1,2,3,4,P1\n", encoding="utf-8")
             txt_path.write_text("P1:1:T0:0-4;\n", encoding="utf-8")
             with patch(
-                "project.input_idle.filedialog.askopenfilenames",
+                "interval_analysis.input_idle.filedialog.askopenfilenames",
                 return_value=(str(csv_path), str(txt_path)),
             ):
                 manager.browse_sample_bundle()
@@ -1041,9 +1041,9 @@ if missing:
             csv_path = Path(temp_dir) / "SampleData.csv"
             csv_path.write_text("1,2,3,4,P1\n", encoding="utf-8")
             with patch(
-                "project.input_idle.filedialog.askopenfilenames",
+                "interval_analysis.input_idle.filedialog.askopenfilenames",
                 return_value=(str(csv_path),),
-            ), patch("project.input_idle.messagebox.showwarning") as warning:
+            ), patch("interval_analysis.input_idle.messagebox.showwarning") as warning:
                 manager.browse_sample_bundle()
 
         warning.assert_called_once()
@@ -1643,7 +1643,7 @@ if missing:
         )
 
     def test_rg_output_contract_does_not_gain_average_or_ratio_columns(self):
-        import project.analysis_export as export_module
+        import interval_analysis.analysis_export as export_module
 
         harness = _RgExportHarness()
         with TemporaryDirectory() as temp_dir, patch.object(
@@ -1662,7 +1662,7 @@ if missing:
         )
 
     def test_rg_export_keeps_longest_200_then_writes_in_line_order(self):
-        import project.analysis_export as export_module
+        import interval_analysis.analysis_export as export_module
 
         harness = _LimitedRgExportHarness()
         harness._last_processinfo_feed_export_status = "iipinc.txt 指令进给测试信息"
@@ -1741,7 +1741,7 @@ if missing:
                     )
 
     def test_rg_alternate_save_dialog_reports_minimum_without_feed_details(self):
-        import project.analysis_export as export_module
+        import interval_analysis.analysis_export as export_module
 
         harness = _LimitedRgExportHarness()
         harness.ideal_store = {("P1", "T0"): {"rg": 2.0}, ("P2", "T0"): {"rg": 2.0}}

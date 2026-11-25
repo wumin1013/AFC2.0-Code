@@ -7,7 +7,7 @@ if __package__ in (None, ""):
     package_root = Path(__file__).resolve().parent.parent
     if str(package_root) not in sys.path:
         sys.path.insert(0, str(package_root))
-    from project.shared import *
+    from interval_analysis.shared import *
 else:
     from .shared import *
 
@@ -58,7 +58,7 @@ def _configure_accent_button_style(style):
 
 def main() -> int:
     if __package__ in (None, ""):
-        from project.app import MillingAnalysisTool
+        from interval_analysis.app import MillingAnalysisTool
     else:
         from .app import MillingAnalysisTool
 

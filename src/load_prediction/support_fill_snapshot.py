@@ -11,11 +11,11 @@ import uuid
 import numpy as np
 import pandas as pd
 
-from .artifact_paths import ArtifactResolver
+from .artifact_paths import ArtifactResolver, archived_load_directory
 from .common import checkpoint, file_hash
 from .samples import SampleSet
 from .support_fill import SUPPORT_FILL_RULES_VERSION, fill_sample_from_process_source, fill_missing_process_support
-from .training_checkpoint import digest
+from .training_checkpoint import digest, source_fingerprints
 
 
 SCHEMA = "afc.support_fill_derivation.1"
@@ -30,21 +30,17 @@ def _require(condition, message):
 
 
 def archived_route_fingerprints(source):
-    """Read the same file set as source_fingerprints from an explicit archive."""
-    directory = Path(source) / "src/project/load_prediction"
+    """Read the same fingerprint fields from an explicit source archive."""
+    directory = archived_load_directory(source)
     _require(directory.is_dir(), "缺少归档负载消费者源码目录")
-    values = {path.name: file_hash(path) for path in sorted(directory.glob("*.py"))}
-    shared = [directory.parent / "process_path.py", directory.parent / "processing_core.py"]
-    shared.extend(sorted((directory.parent / "segmentation").glob("*.py")))
-    values.update({"shared/" + path.relative_to(directory.parent).as_posix(): file_hash(path) for path in shared})
-    return values
+    return source_fingerprints(directory)
 
 
 def implementation_identity():
     directory = Path(__file__).parent
     names = ("support_fill.py", "support_fill_snapshot.py", "samples.py", "common.py")
     return {**{name: file_hash(directory / name) for name in names},
-            "shared/process_path.py": file_hash(directory.parent / "process_path.py")}
+            "shared/process_path.py": file_hash(directory.parent / "afc_common" / "process_path.py")}
 
 
 def _inside(directory, filename):

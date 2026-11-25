@@ -269,11 +269,11 @@ function Get-DebugDirectoryName {
 
 $ProjectRoot = Get-NormalizedPath -Path (Join-Path $PSScriptRoot "..")
 $ReleaseArchiveRoot = Get-NormalizedPath -Path (Join-Path (Split-Path -Parent $ProjectRoot) "历史归档/发布版本")
-$ReleaseVersionSource = Join-Path $ProjectRoot "src\project\release_metadata.py"
+$ReleaseVersionSource = Join-Path $ProjectRoot "src\interval_analysis\release_metadata.py"
 $SpecPath = Join-Path $ProjectRoot "packaging\AFC2_onedir.spec"
 $ReleaseNotesTemplate = Join-Path $ProjectRoot "packaging\release_notes.txt"
 $VerificationScript = Join-Path $ProjectRoot "scripts\verification\verify_release_build.ps1"
-$ReleaseEntryPoint = Join-Path $ProjectRoot "src\project\release_main.py"
+$ReleaseEntryPoint = Join-Path $ProjectRoot "src\interval_analysis\release_main.py"
 
 foreach ($requiredFile in @(
     $ReleaseVersionSource,

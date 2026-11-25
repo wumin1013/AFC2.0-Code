@@ -106,13 +106,13 @@ P_pred = 250 + Kc × (ap × ae × F_command / 60) + Ke × ap
 发布包允许并必须包含轻量模块：
 
 ```text
-project.prediction_support
-project.release_prediction
+interval_analysis.prediction_support
+interval_analysis.release_prediction
 ```
 
 发布包仍不得包含：
 
-- `project.app`、`project.pit_model`；
+- `interval_analysis.app`、`interval_analysis.pit_model`；
 - PIT、SMIF、profile 前向预测入口；
 - scikit-learn、SciPy、joblib、threadpoolctl；
 - 项目 `.py` 源文件、配置、测试、用户数据或开发机绝对路径。
