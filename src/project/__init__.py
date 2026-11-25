@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-from .main import _cleanup_on_exit, _fast_startup, main, optimize_memory
-from .shared import PITEntry
-
 __all__ = [
     "MillingAnalysisTool",
     "PITEntry",
@@ -14,7 +11,19 @@ __all__ = [
 
 
 def __getattr__(name):
-    """延迟导入研究版主类，避免发布入口加载机理模型与 sklearn。"""
+    """Keep data/model commands independent of the desktop runtime."""
+    if name in {"main", "optimize_memory", "_fast_startup", "_cleanup_on_exit"}:
+        from importlib import import_module
+
+        module = import_module(".main", __name__)
+        for public in ("main", "optimize_memory", "_fast_startup", "_cleanup_on_exit"):
+            globals()[public] = getattr(module, public)
+        return globals()[name]
+    if name == "PITEntry":
+        from .shared import PITEntry
+
+        globals()[name] = PITEntry
+        return PITEntry
     if name == "MillingAnalysisTool":
         from .app import MillingAnalysisTool
 

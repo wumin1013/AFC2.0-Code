@@ -38,7 +38,7 @@ python src/project/main.py
 每个版本生成一套独立且长期保留的调试目录和最小发布包。当前 Alpha 版本为：
 
 ```text
-release_versions/
+../历史归档/发布版本/
 ├─ AFC2.0.2Alpha-debug/
 │  ├─ AFC2.0.2alpha.exe
 │  ├─ _internal/
@@ -92,13 +92,13 @@ iipinc.txt        # 可选；缺失或无效时使用工艺信息中的 F
   -PythonPath 'C:\path\to\AFC\python.exe'
 ```
 
-默认生成 `release_versions/AFC2.0.2Alpha-debug/` 和 `release_versions/AFC2.0.2alpha.zip`。脚本先构建并验证纯净候选目录，再从该候选目录生成 ZIP、解压 ZIP 并再次完整验证；两者均成功后才替换当前版本的调试目录、恢复该版本的调试现场并替换同版本 ZIP。其他版本的 `*-debug/` 与 ZIP 保持独立并长期保留。构建验证通过后会自动删除 `.build-AFC2.0.2alpha` 中间目录；如需在构建前清理失败构建留下的缓存，可增加 `-CleanBuild`。脚本只操作当前版本的发布产物和专用构建中间目录，不会清理其他版本或源码研究模式的 `output/`。
+默认生成 `../历史归档/发布版本/AFC2.0.2Alpha-debug/` 和 `../历史归档/发布版本/AFC2.0.2alpha.zip`。脚本先构建并验证纯净候选目录，再从该候选目录生成 ZIP、解压 ZIP 并再次完整验证；两者均成功后才替换当前版本的调试目录、恢复该版本的调试现场并替换同版本 ZIP。其他版本的 `*-debug/` 与 ZIP 保持独立并长期保留。构建验证通过后会自动删除 `.build-AFC2.0.2alpha` 中间目录；如需在构建前清理失败构建留下的缓存，可增加 `-CleanBuild`。脚本只操作当前版本的发布产物和专用构建中间目录，不会清理其他版本或源码研究模式的 `output/`。
 
 ```powershell
 & .\scripts\build_release.ps1 -CleanBuild
 ```
 
-如需在 `release_versions/` 之外额外留存正式归档，必须显式提供完整目标目录，且要求 Git 工作区干净；脚本会从已经验证的最小 ZIP 解压归档，不会带入任何版本调试目录的数据：
+如需在 `../历史归档/发布版本/` 之外额外留存正式归档，必须显式提供完整目标目录，且要求 Git 工作区干净；脚本会从已经验证的最小 ZIP 解压归档，不会带入任何版本调试目录的数据：
 
 ```powershell
 & .\scripts\build_release.ps1 `
@@ -154,7 +154,32 @@ tests/                 自动化回归测试
 docs/                  需求与技术文档
 archive/               不参与当前运行的历史源码
 output/                源码研究模式的程序输出和临时结果
-release_versions/      各版本独立调试目录与当前最小 ZIP（不纳入 Git）
+../历史归档/发布版本/      各版本独立调试目录与当前最小 ZIP（不纳入 Git）
 ```
 
-`config/app_config.json`、`data/runtime/`、`profiles/cache/`、`output/` 和 `release_versions/` 属于本机可变内容，均不纳入版本管理。发布构建不会复制这些目录，也不会复制 `data/sample/` 或 `profiles/`。
+`config/app_config.json`、`data/runtime/`、`profiles/cache/`、`output/` 和 `../历史归档/发布版本/` 属于本机可变内容，均不纳入版本管理。发布构建不会复制这些目录，也不会复制 `data/sample/` 或 `profiles/`。
+
+## 负载预测与主轴功率
+
+负载预测使用 NumPy 2 系列，依赖文件按已验收的研究环境固定版本。在 Windows 的 Anaconda Prompt 中启用供负载预测独立使用的 AFC 环境。
+
+```bat
+conda activate AFC
+set MKL_THREADING_LAYER=SEQUENTIAL
+python -m pip install -r requirements-load-prediction.txt
+python scripts\load_prediction.py --help
+set PYTHONPATH=src
+python -m project.load_prediction.unified_cli --help
+```
+
+src/project/load_prediction/ 保存切削功率模型、训练、评估和预测。src/project/spindle_runtime/ 提供单文件主轴功率模型包的加载和全位置推理。输入数据、模型权重和输出目录由调用方指定。论文 1 的研究初始权重及其采用回执见论文仓库的 models/。
+
+### 源码分工
+
+| 功能 | 代码入口 |
+| --- | --- |
+| 区间划分、理想值和 RG | project/segmentation/ 保存划分算法，interval_runtime.py 衔接区间应用，config_state.py 管理理想值，analysis_export.py 生成导出结果。 |
+| 负载预测研究模型 | project/load_prediction/ 保存物理主趋势、路径残差、训练、九折评价和研究预测入口。 |
+| 主轴功率部署推理 | project/spindle_runtime/ 加载单文件模型包并完成全工艺位置的主轴功率推理。 |
+
+project 是统一 Python 包。新功能按职责进入对应子包，共用的轨迹与配置处理由共同入口维护。

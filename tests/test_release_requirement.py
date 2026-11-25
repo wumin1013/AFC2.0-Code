@@ -690,11 +690,11 @@ if missing:
         self.assertIn('"ProcessDataPath.txt"', verifier_text)
         self.assertIn('$RuntimeInputPatterns = @("*.csv", "SampleData*.txt")', verifier_text)
 
-    def test_build_script_uses_dedicated_release_versions_directory(self):
+    def test_build_script_uses_historical_release_archive_directory(self):
         build_script = (PROJECT_ROOT / "scripts" / "build_release.ps1").read_text(
             encoding="utf-8"
         )
-        self.assertIn('Join-Path $ProjectRoot "release_versions"', build_script)
+        self.assertIn('Join-Path (Split-Path -Parent $ProjectRoot) "历史归档/发布版本"', build_script)
         self.assertIn("Get-DebugDirectoryName", build_script)
         self.assertIn(
             "$DebugDirectoryName = Get-DebugDirectoryName -ProductName $ProductName",

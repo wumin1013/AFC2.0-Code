@@ -12,8 +12,13 @@ htmlcov/
 /data/runtime/
 /profiles/cache/
 /output/
-/release_versions/
 /build/
 /dist/
 
 *.log
+
+# Local research weights and named pytest work directories
+/.pytest_tmp_*/
+*.pt
+*.pth
+*.ckpt
