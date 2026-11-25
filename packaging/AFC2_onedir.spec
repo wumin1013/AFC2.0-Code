@@ -10,8 +10,8 @@ DIAGNOSTIC_CONSOLE = os.environ.get("AFC_PYINSTALLER_DIAGNOSTIC_CONSOLE") == "1"
 # PyInstaller 提供的 SPECPATH 已是 spec 所在目录（packaging/）。
 PROJECT_ROOT = Path(SPECPATH).resolve().parent
 SOURCE_ROOT = PROJECT_ROOT / "src"
-ENTRY_POINT = SOURCE_ROOT / "project" / "release_main.py"
-VERSION_SOURCE = SOURCE_ROOT / "project" / "release_metadata.py"
+ENTRY_POINT = SOURCE_ROOT / "interval_analysis" / "release_main.py"
+VERSION_SOURCE = SOURCE_ROOT / "interval_analysis" / "release_metadata.py"
 
 
 def read_release_version(path: Path) -> str:
@@ -35,8 +35,8 @@ if not ENTRY_POINT.is_file():
 # 发布入口必须在导入图层面与研究应用隔离。这里的 excludes 是第二道保护，
 # scripts/verification/verify_release_build.ps1 还会检查最终 CArchive/PYZ。
 EXCLUDED_MODULES = [
-    "project.app",
-    "project.pit_model",
+    "interval_analysis.app",
+    "interval_analysis.pit_model",
     "sklearn",
     "scipy",
     "joblib",

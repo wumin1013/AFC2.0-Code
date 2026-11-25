@@ -18,23 +18,23 @@ import numpy as np
 import pandas as pd
 from matplotlib.collections import PolyCollection
 
-from project.academic_workbench import AcademicWorkbenchMixin
-from project.analysis_export import AnalysisExportMixin
-from project.app import MillingAnalysisTool
-from project.pit_model import PitModelMixin
-from project.pit_viewer import PitViewerMixin
-from project.plot_support import PlotSupportMixin
-from project.prediction_runtime import PredictionRuntimeMixin
-from project.processing_core import ProcessingCoreMixin
-from project.sample_manager import SampleManagerMixin
-from project.segmentation import SegmentationConfig, SegmentationPipeline
-from project.segmentation.features import (
+from interval_analysis.academic_workbench import AcademicWorkbenchMixin
+from interval_analysis.analysis_export import AnalysisExportMixin
+from interval_analysis.app import MillingAnalysisTool
+from interval_analysis.pit_model import PitModelMixin
+from interval_analysis.pit_viewer import PitViewerMixin
+from interval_analysis.plot_support import PlotSupportMixin
+from interval_analysis.prediction_runtime import PredictionRuntimeMixin
+from interval_analysis.processing_core import ProcessingCoreMixin
+from interval_analysis.sample_manager import SampleManagerMixin
+from interval_analysis.segmentation import SegmentationConfig, SegmentationPipeline
+from interval_analysis.segmentation.features import (
     build_atomic_segments,
     compute_point_features,
     standardize_input,
 )
-from project.segmentation.scorers import RuleSegmentScorer
-from project.ui_bootstrap import BootstrapUiMixin
+from interval_analysis.segmentation.scorers import RuleSegmentScorer
+from interval_analysis.ui_bootstrap import BootstrapUiMixin
 
 
 def _process_frame(mrr_values: list[float], *, step_mm: float = 0.1) -> pd.DataFrame:
@@ -531,7 +531,7 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
             data_path = Path(temp_dir) / "measurement.csv"
             data_path.write_text(payload, encoding="utf-8")
             with patch(
-                "project.processing_core.pd.read_csv",
+                "interval_analysis.processing_core.pd.read_csv",
                 wraps=pd.read_csv,
             ) as batch_reader:
                 result = parser.parse_channel_data_file(data_path)
@@ -693,8 +693,8 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
         self.assertEqual(2, len(sync_count))
 
     def test_main_ui_removes_smif_and_data_analysis_pages(self):
-        ui_source = (SRC_ROOT / "project" / "ui_bootstrap.py").read_text(encoding="utf-8")
-        workbench_source = (SRC_ROOT / "project" / "academic_workbench.py").read_text(encoding="utf-8")
+        ui_source = (SRC_ROOT / "interval_analysis" / "ui_bootstrap.py").read_text(encoding="utf-8")
+        workbench_source = (SRC_ROOT / "interval_analysis" / "academic_workbench.py").read_text(encoding="utf-8")
 
         self.assertIn('self.notebook.add(self.data_processing_tab, text="主页面")', ui_source)
         self.assertIn('self.notebook.add(self.pit_tab, text="PIT")', ui_source)
@@ -1199,7 +1199,7 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
         export_harness._segmentation_sample_projection_records = []
         with (
             patch("builtins.open") as mocked_open,
-            patch("project.analysis_export.messagebox.showwarning") as warning,
+            patch("interval_analysis.analysis_export.messagebox.showwarning") as warning,
         ):
             export_harness._do_save_interval_info([])
         warning.assert_called_once()
@@ -1459,8 +1459,8 @@ class CurrentRequirementRegressionTests(unittest.TestCase):
 
         with (
             TemporaryDirectory() as temporary_dir,
-            patch("project.analysis_export.OUTPUT_DIR", Path(temporary_dir)),
-            patch("project.analysis_export.messagebox.showinfo") as showinfo,
+            patch("interval_analysis.analysis_export.OUTPUT_DIR", Path(temporary_dir)),
+            patch("interval_analysis.analysis_export.messagebox.showinfo") as showinfo,
         ):
             harness.save_interval_info()
             process_info_path = Path(temporary_dir) / "ProcessInfo.csv"

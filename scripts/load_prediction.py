@@ -8,8 +8,8 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from project.load_prediction.common import json_value
-from project.load_prediction.training_service import TrainingService
+from load_prediction.common import json_value
+from load_prediction.training_service import TrainingService
 
 
 def main():
@@ -26,7 +26,7 @@ def main():
     args = parser.parse_args()
     service = TrainingService(args.output_dir)
     if args.action == "web":
-        from project.load_prediction.web_service import create_server
+        from load_prediction.web_service import create_server
         server = create_server(port=args.port, output_dir=args.output_dir)
         print(f"http://127.0.0.1:{server.server_port}", flush=True)
         try:
@@ -46,7 +46,7 @@ def main():
         result = service.experiments()
     elif args.action == "train" or args.action == "experiment" and request.get("execute"):
         # The CLI waits while its durable background process performs training.
-        from project.load_prediction.job_service import JobService, TERMINAL
+        from load_prediction.job_service import JobService, TERMINAL
         import time
         if args.action == "experiment":
             request["mode"] = "experiment"

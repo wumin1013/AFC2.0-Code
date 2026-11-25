@@ -298,6 +298,8 @@ if ($LASTEXITCODE -ne 0) {
     throw "无法读取 PyInstaller CArchive/PYZ。"
 }
 $ForbiddenArchiveModules = @(
+    "interval_analysis.app",
+    "interval_analysis.pit_model",
     "project.app",
     "project.pit_model",
     "sklearn",
@@ -321,9 +323,13 @@ foreach ($moduleName in $ForbiddenArchiveModules) {
     }
 }
 $RequiredArchiveModules = @(
-    "project.prediction_support",
-    "project.release_prediction"
+    "interval_analysis.prediction_support",
+    "interval_analysis.release_prediction"
 )
+# Published releases before the source split retain the original PYZ module names.
+if ($ArchiveModules -contains "project.release_prediction") {
+    $RequiredArchiveModules = @("project.prediction_support", "project.release_prediction")
+}
 foreach ($moduleName in $RequiredArchiveModules) {
     $matchedModule = $ArchiveModules | Where-Object {
         $_.Equals($moduleName, [System.StringComparison]::OrdinalIgnoreCase)
@@ -339,7 +345,7 @@ import sys
 import zipfile
 
 root = pathlib.Path(sys.argv[1])
-forbidden = ("project/app", "project/pit_model", "sklearn", "scipy", "joblib", "threadpoolctl")
+forbidden = ("interval_analysis/app", "interval_analysis/pit_model", "project/app", "project/pit_model", "sklearn", "scipy", "joblib", "threadpoolctl")
 violations = []
 for archive in root.rglob("*.zip"):
     try:

@@ -2,7 +2,7 @@
 import numpy as np
 import pandas as pd
 from .samples import read_process_table
-from ..segmentation import SegmentationConfig, SegmentationPipeline
+from interval_analysis.segmentation import SegmentationConfig, SegmentationPipeline
 
 
 def prepare_event_process(path, plan, *, line_offset=0):

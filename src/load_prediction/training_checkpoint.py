@@ -21,12 +21,20 @@ def digest(value):
                                     allow_nan=False, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
-def source_fingerprints():
-    directory = Path(__file__).parent
+def source_fingerprints(directory=None):
+    directory = Path(__file__).parent if directory is None else Path(directory)
+    source_root = directory.parent
+    historical = source_root.name == "project"
+    analysis = source_root if historical else source_root / "interval_analysis"
+    common = source_root if historical else source_root / "afc_common"
+
     fingerprints = {p.name: file_hash(p) for p in sorted(directory.glob("*.py"))}
-    shared = [directory.parent / "process_path.py", directory.parent / "processing_core.py"]
-    shared.extend(sorted((directory.parent / "segmentation").glob("*.py")))
-    fingerprints.update({"shared/" + p.relative_to(directory.parent).as_posix(): file_hash(p) for p in shared})
+    fingerprints["shared/process_path.py"] = file_hash(common / "process_path.py")
+    fingerprints["shared/processing_core.py"] = file_hash(analysis / "processing_core.py")
+    fingerprints.update({
+        "shared/segmentation/" + p.name: file_hash(p)
+        for p in sorted((analysis / "segmentation").glob("*.py"))
+    })
     return fingerprints
 
 

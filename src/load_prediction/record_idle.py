@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .artifact_paths import archived_load_directory
 from .common import file_hash, json_value
 
 MODE = "record_idle_labels"
@@ -69,7 +70,7 @@ def verify_record_idle_evidence(evidence, records=(), *, base_dir=None,
         from .base_qualification import _embedded
         if _embedded(report.get("selection_policy_artifact"), "平台选择规则") != policy:
             raise ValueError("平台选择规则与嵌入的冻结规则不一致")
-        source_directory = (resolver.resolve(historical_consumer_source) / "src/project/load_prediction"
+        source_directory = (archived_load_directory(resolver.resolve(historical_consumer_source))
                             if historical_consumer_source is not None else Path(__file__).parent)
         for name in LABEL_SOURCES:
             if report.get("production_source_sha256", {}).get(name) != file_hash(source_directory / name):

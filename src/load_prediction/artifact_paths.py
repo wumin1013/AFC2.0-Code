@@ -95,3 +95,10 @@ class ArtifactResolver:
                     raise ValueError("迁移解析结果越出已核验目标目录")
                 return result
         return _local_absolute(path)
+
+
+def archived_load_directory(source):
+    """Locate the model source in a current or historical source archive."""
+    source_dir = Path(source) / "src"
+    current = source_dir / "load_prediction"
+    return current if current.is_dir() else source_dir / "project" / "load_prediction"

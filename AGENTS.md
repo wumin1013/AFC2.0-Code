@@ -118,20 +118,20 @@ GitHub 保存正式功能源码、运行入口、依赖配置和必要说明。�
 ## 项目目录与路径规则
 
 - 使用 Conda 虚拟环境 `AFC` 运行、测试和验证本项目。
-- 主程序源码放在 `src/project/`，不得把业务数据或运行输出放入源码包。
+- 源码按职责直接放在 `src/` 下的子包中。区间和理想值入口在 `interval_analysis/`，论文模型各自维护功能包，共用函数在 `afc_common/`。业务数据和运行输出存于本地数据目录。
 - `tests/` 和 `scripts/verification/` 是预留目录；当前按用户要求不包含测试或验证代码。未来只有在明确需求要求时才能重新添加。
 - 静态样例数据放在 `data/sample/`，可变运行状态放在 `data/runtime/`。
 - 本机应用配置放在 `config/`，正式案例配置放在 `profiles/`，派生 profile 缓存放在 `profiles/cache/`。
 - 程序生成的表格、图片、日志和临时结果统一放在 `output/`，不得重新散落到项目根目录。
 - 文档放在 `docs/`；不参与当前运行的历史源码仅放在 `archive/`。
-- 新增路径必须优先使用 `pathlib`，并基于 `src/project/shared.py` 中的项目根目录常量定位，不得依赖当前工作目录。
+- 新增路径必须优先使用 `pathlib`，并基于 `src/interval_analysis/shared.py` 中的项目根目录常量定位，不得依赖当前工作目录。
 - 外部实验数据目录通过用户配置指定，不得在源码中新增机器相关的绝对路径。
 - `config/app_config.json`、`data/runtime/`、`profiles/cache/`、`output/` 和 Python/pytest 缓存属于本机可变内容，不纳入版本管理。
 
 ## 发布版管理规则
 
 - 版本调试目录与最小 ZIP 统一保存在项目父级的「历史归档/发布版本」。打包脚本默认使用该路径，并保存版本校验与既有调试数据。
-- 发布版本以 `src/project/release_metadata.py` 的 `RELEASE_VERSION` 为唯一来源。升级 alpha、beta 或补丁版本时只修改该常量，不得在构建脚本、PyInstaller spec 或界面代码中另设版本号。
+- 发布版本以 `src/interval_analysis/release_metadata.py` 的 `RELEASE_VERSION` 为唯一来源。升级 alpha、beta 或补丁版本时只修改该常量，不得在构建脚本、PyInstaller spec 或界面代码中另设版本号。
 - 每个发布版本使用独立的 `AFC<版本><阶段>-debug/` 调试目录和 `AFC<版本>.zip` 最小包，阶段名首字母大写，例如 `AFC2.0.2Alpha-debug/`、`AFC2.0.2Beta-debug/`。所有已发布版本必须长期保留；构建新版本不得迁移、覆盖或删除其他版本的调试目录或 ZIP。
 - 同一版本调试目录中的调试输入、运行结果、`config/`、`data/` 及其他调试现场必须保留；重建只能替换 EXE、`_internal/`、发布说明、构建清单和 SHA-256 清单。替换前必须备份该版本的调试现场，替换后逐文件校验 SHA-256。
 - 每个版本的 `AFC<版本>.zip` 都是该版本的干净交付物，只能从未混入调试现场的 PyInstaller 候选目录生成。ZIP 不得包含 CSV/TXT 运行输入、结果文件、本机配置、运行状态、源码、测试、缓存或机器绝对路径。

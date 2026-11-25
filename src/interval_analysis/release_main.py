@@ -11,7 +11,7 @@ if __package__ in (None, ""):
     _PACKAGE_ROOT = Path(__file__).resolve().parent.parent
     if str(_PACKAGE_ROOT) not in sys.path:
         sys.path.insert(0, str(_PACKAGE_ROOT))
-    from project.release_metadata import RELEASE_VERSION
+    from interval_analysis.release_metadata import RELEASE_VERSION
 else:
     from .release_metadata import RELEASE_VERSION
 
@@ -42,14 +42,14 @@ def _load_runtime_components():
         package_root = Path(__file__).resolve().parent.parent
         if str(package_root) not in sys.path:
             sys.path.insert(0, str(package_root))
-        from project.main import (
+        from interval_analysis.main import (
             _cleanup_on_exit,
             _configure_accent_button_style,
             _fast_startup,
             optimize_memory,
         )
-        from project.release_app import AFCReleaseApplication
-        from project.shared import messagebox, tk, ttk
+        from interval_analysis.release_app import AFCReleaseApplication
+        from interval_analysis.shared import messagebox, tk, ttk
     else:
         from .main import _cleanup_on_exit, _configure_accent_button_style, _fast_startup, optimize_memory
         from .release_app import AFCReleaseApplication

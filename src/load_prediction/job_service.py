@@ -161,14 +161,14 @@ class JobService:
                 output = (directory / "worker.log").open("ab")
                 env = dict(os.environ)
                 env.update(PYTHONUTF8="1", MKL_THREADING_LAYER="SEQUENTIAL", OMP_NUM_THREADS="1", MPLBACKEND="Agg")
-                env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2]) + os.pathsep + env.get("PYTHONPATH", "")
+                env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1]) + os.pathsep + env.get("PYTHONPATH", "")
                 try:
                     request = json.loads(_read_text(directory / "request.json"))
                     from .load_device import request_cpu_threads
                     cpu_threads, _ = request_cpu_threads(request)
                     if cpu_threads is not None:
                         env["OMP_NUM_THREADS"] = str(cpu_threads)
-                    process = subprocess.Popen([sys.executable, "-m", "project.load_prediction.job_service", "--worker", str(directory)],
+                    process = subprocess.Popen([sys.executable, "-m", "load_prediction.job_service", "--worker", str(directory)],
                         env=env, stdout=output, stderr=subprocess.STDOUT,
                         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
                     state.update(status="running", started_at=_now(), pid=process.pid)

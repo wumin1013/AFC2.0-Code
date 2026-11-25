@@ -21,7 +21,7 @@ from .feed_samples import FEED_FEATURE_COLUMNS, FeedSample
 from .samples import PHYSICS_COLUMNS, PATH_COLUMNS, SampleSet
 from .evaluation_policy import group_key, scoring_parameters
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_OUTPUT = PROJECT_ROOT / "output" / "load_prediction" / "service"
 SERVICE_SCHEMA = "afc.training_service.1"
 
@@ -1630,7 +1630,7 @@ class TrainingService:
             return
         from .experiment_protocol import PROGRAM_FEATURES, validate_round_metadata
         from .sample_rules import SAMPLE_RULES_VERSION
-        from ..process_path import PROCESS_MAPPING_RULES_VERSION
+        from afc_common.process_path import PROCESS_MAPPING_RULES_VERSION
         source = snapshot["source_snapshot"]
         command_alignment = bool(source.get("command_alignment_derivation"))
         if command_alignment:

@@ -20,7 +20,7 @@ if str(SRC_ROOT) not in sys.path:
 
 import pandas as pd
 
-from project.segmentation import SegmentationConfig, SegmentationPipeline
+from interval_analysis.segmentation import SegmentationConfig, SegmentationPipeline
 
 
 PROCESS_COLUMNS = (

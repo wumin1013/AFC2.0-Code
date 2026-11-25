@@ -18,7 +18,7 @@ import uuid
 import numpy as np
 import pandas as pd
 
-from .artifact_paths import ArtifactResolver
+from .artifact_paths import ArtifactResolver, archived_load_directory
 from .base_qualification import _embedded, embedded_json_artifact
 from .common import checkpoint, file_hash, save_json
 from .feed_samples import align_spatial_channels
@@ -82,13 +82,13 @@ def frame_digest(frame, columns):
 
 
 def _sources(source_root=None):
-    directory = Path(source_root) / "src/project/load_prediction" if source_root is not None else Path(__file__).parent
+    directory = archived_load_directory(source_root) if source_root is not None else Path(__file__).parent
     return {name: file_hash(directory / name) for name in RULE_FILES}
 
 
 def verify_parent_alignment_defaults(producer_source):
     """The historical service supplied no custom alignment tolerance arguments."""
-    folder = Path(producer_source) / "src/project/load_prediction"
+    folder = archived_load_directory(producer_source)
     tree = ast.parse((folder / "samples.py").read_text(encoding="utf-8"))
     function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "prepare_load_samples")
     defaults = {arg.arg: ast.literal_eval(value) for arg, value in zip(function.args.kwonlyargs, function.args.kw_defaults)
@@ -174,7 +174,7 @@ def verify_derivation(snapshot, samples, *, directory, consumer_report,
     resolver = ArtifactResolver(artifact_relocations)
     consumer_source = (resolver.resolve(historical_consumer_source)
                        if historical_consumer_source is not None else None)
-    consumer_directory = (consumer_source / "src/project/load_prediction"
+    consumer_directory = (archived_load_directory(consumer_source)
                           if consumer_source is not None else Path(__file__).parent)
     rule_sources = _sources(consumer_source)
     link = snapshot["source_snapshot"].get("main_stability_refresh", {})
@@ -272,7 +272,7 @@ def refresh_main_stability(service, *, parent_service_output, parent_snapshot_id
     producer_report_path = _inside(parent_dir, parent_evidence["report_path"])
     producer_report = _checked_json(producer_report_path, parent_evidence["report_sha256"])
     for name in LABEL_SOURCES:
-        _require(file_hash(Path(producer_source) / "src/project/load_prediction" / name)
+        _require(file_hash(archived_load_directory(producer_source) / name)
                  == producer_report["production_source_sha256"][name], "原标签producer源码身份不符")
     alignment_contract = verify_parent_alignment_defaults(producer_source)
     decision = embedded_json_artifact(decision_path)
@@ -290,7 +290,7 @@ def refresh_main_stability(service, *, parent_service_output, parent_snapshot_id
         producer_dir = staging / "parent_producer"
         producer_dir.mkdir()
         for name in LABEL_SOURCES:
-            shutil.copyfile(Path(producer_source) / "src/project/load_prediction" / name, producer_dir / name)
+            shutil.copyfile(archived_load_directory(producer_source) / name, producer_dir / name)
         items, receipts, dependencies = [], [], {}
         for item in parent["records"]:
             checkpoint(cancel)
