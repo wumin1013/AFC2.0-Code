@@ -10,6 +10,7 @@ htmlcov/
 
 /config/app_config.json
 /data/runtime/
+/data/paper[0-9]*/
 /profiles/cache/
 /output/
 /build/

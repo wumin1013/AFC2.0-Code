@@ -4,6 +4,7 @@ import csv
 from pathlib import Path
 
 from matplotlib.collections import PolyCollection
+from .plot_figure import create_plot_figure
 
 from .shared import *
 
@@ -150,7 +151,8 @@ class AnalysisExportMixin:
             )
 
         x_values = np.arange(actual.size, dtype=float)
-        fig, ax = plt.subplots(1, 1, figsize=(16, 5.8), dpi=120)
+        fig = create_plot_figure(figsize=(16, 5.8), dpi=120)
+        ax = fig.subplots()
         try:
             fig.patch.set_facecolor(PLOT_FIG_BG)
             self.apply_plot_style(ax, grid=True)
@@ -234,7 +236,8 @@ class AnalysisExportMixin:
     ):
         """保存仅依赖 ProcessInfo 的程序 MRR 与六态背景图。"""
 
-        fig, ax = plt.subplots(1, 1, figsize=(16, 5.8), dpi=120)
+        fig = create_plot_figure(figsize=(16, 5.8), dpi=120)
+        ax = fig.subplots()
         try:
             fig.patch.set_facecolor(PLOT_FIG_BG)
             self.apply_plot_style(ax, grid=True)
@@ -281,7 +284,8 @@ class AnalysisExportMixin:
         intervals = self._coerce_segmentation_dataframe(result, "intervals")
         if point_labels.empty:
             return False
-        fig, ax = plt.subplots(figsize=(16, 8), dpi=100)
+        fig = create_plot_figure(figsize=(16, 8), dpi=100)
+        ax = fig.subplots()
         fig.patch.set_facecolor(PLOT_FIG_BG)
         self.apply_plot_style(ax, grid=True)
         show_interval_states = self._plot_option_enabled(
@@ -646,7 +650,8 @@ class AnalysisExportMixin:
             and np.array_equal(previous_line_axis_mask, projected_mask)
         )
         if not reused_measurement_figure:
-            fig, sample_ax = plt.subplots(figsize=(16, 7.2), dpi=100)
+            fig = create_plot_figure(figsize=(16, 7.2), dpi=100)
+            sample_ax = fig.subplots()
             fig.patch.set_facecolor(PLOT_FIG_BG)
             self.apply_plot_style(sample_ax, grid=True)
             preview_limit = int(getattr(self, "preview_plot_max_points", 60000) or 60000)
@@ -2069,14 +2074,10 @@ class AnalysisExportMixin:
                 "缺少程序/刀具信息，未生成 SampleData.rg",
             )
             return
-        if not self._get_optimizable_interval_records():
-            messagebox.showwarning(
-                "无可优化区间",
-                f"{os.path.basename(process_info_path)} 已保存；"
-                "当前没有可映射的空载或稳态区间，未生成 SampleData.rg",
-            )
+        if not self._get_steady_interval_records():
+            self._do_save_interval_info([])
             return
-        
+
         # 收集所有可导出的刀具
         exportable_tools = []
         for program_name, program_info in self.sample_programs.items():
@@ -2445,9 +2446,10 @@ class AnalysisExportMixin:
                     )
             saved_lines = len(export_rows)
             
-            # 文件已保存，立即弹出提示
             if saved_lines == 0:
-                messagebox.showwarning("无可导出数据", "未找到有效的刀具区间信息")
+                detail = "已保存 SampleData.rg，可优化区间为 0 个。完整六态结果见 ProcessInfo.csv。"
+                self.status_var_data.set(detail)
+                messagebox.showinfo("保存完成", detail)
             else:
                 process_info_path = self._save_process_info_csv(output_dir)
                 feed_export_note = str(
@@ -4433,11 +4435,14 @@ class AnalysisExportMixin:
             plot_mode = "overlay"
             if self.sample_plot_mode.get() != plot_mode:
                 self.sample_plot_mode.set(plot_mode)
+            # Embed this Figure in the existing Tk canvas. pyplot.subplots()
+            # would create another Tk root and initialize Tcl/Tk again.
+            fig2 = create_plot_figure(figsize=(16, 9), dpi=100)
             if plot_mode == "stacked":
-                fig2, (axes_act, axes_pred) = plt.subplots(2, 1, sharex=True, figsize=(16, 9), dpi=100)
+                axes_act, axes_pred = fig2.subplots(2, 1, sharex=True)
                 overlay_secondary = False
             else:
-                fig2, ax2 = plt.subplots(figsize=(16, 9), dpi=100)
+                ax2 = fig2.subplots()
                 axes_pred = ax2
                 if show_base_prediction:
                     axes_act = ax2.twinx()

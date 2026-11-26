@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 
 from .shared import *
+from afc_common.process_path import uniform_path_boundaries
 
 PROCESS_LAYOUT_DIRECT_SEQ = "direct_seq"
 PROCESS_LAYOUT_DIRECT_NO_SEQ = "direct_no_seq"
@@ -1226,7 +1227,8 @@ class ProcessingCoreMixin:
             end_coords = tuple(motion_info["end_coords"])
             group_length = float(motion_info["segment_length"]) if calculate_path else 0.0
             group_count = len(group_rows)
-            group_step = group_length / group_count if group_count else 0.0
+            group_bounds = uniform_path_boundaries(group_length, group_count)
+            group_origin = cumulative_total
 
             for offset, row in enumerate(group_rows):
                 ratio = (offset + 1) / group_count if group_count else 1.0
@@ -1236,9 +1238,9 @@ class ProcessingCoreMixin:
                 if motion_info["motion_type"] is not None:
                     row["type"] = motion_info["motion_type"]
                 if calculate_path:
-                    row["s"] = group_step
-                    row["path_start"] = cumulative_total
-                    cumulative_total += group_step
+                    row["s"] = group_bounds[offset + 1] - group_bounds[offset]
+                    row["path_start"] = group_origin + group_bounds[offset]
+                    cumulative_total = group_origin + group_bounds[offset + 1]
                     row["path_end"] = cumulative_total
                     row["path_cumulative"] = cumulative_total
             previous_coords = end_coords
@@ -1262,11 +1264,13 @@ class ProcessingCoreMixin:
                     pass
                 group_end += 1
             group_count = group_end - row_index
-            group_step = group_total / group_count if group_count else 0.0
+            group_bounds = uniform_path_boundaries(group_total, group_count)
+            group_origin = cumulative_total
             for offset in range(row_index, group_end):
-                rows[offset]["s"] = group_step
-                rows[offset]["path_start"] = cumulative_total
-                cumulative_total += group_step
+                local = offset - row_index
+                rows[offset]["s"] = group_bounds[local + 1] - group_bounds[local]
+                rows[offset]["path_start"] = group_origin + group_bounds[local]
+                cumulative_total = group_origin + group_bounds[local + 1]
                 rows[offset]["path_end"] = cumulative_total
                 rows[offset]["path_cumulative"] = cumulative_total
             row_index = group_end
@@ -1407,13 +1411,14 @@ class ProcessingCoreMixin:
                 end_coords = start_coords
 
             group_count = len(group_rows)
-            group_step = group_length / group_count if group_count else 0.0
+            group_bounds = uniform_path_boundaries(group_length, group_count)
+            group_origin = cumulative_total
             for offset, row in enumerate(group_rows):
-                row["path_start"] = cumulative_total
-                cumulative_total += group_step
+                row["path_start"] = group_origin + group_bounds[offset]
+                cumulative_total = group_origin + group_bounds[offset + 1]
                 row["path_end"] = cumulative_total
                 row["path_cumulative"] = cumulative_total
-                row["s"] = group_step
+                row["s"] = group_bounds[offset + 1] - group_bounds[offset]
                 if speed_value > 0 and not bool(row.get("_has_input_spindle_speed")):
                     row["S"] = speed_value
                 if motion_type:
@@ -1965,7 +1970,8 @@ class ProcessingCoreMixin:
             return "actual_load"
         if signal_name == "实际速度" and axis_name in {"X轴", "Y轴", "Z轴"}:
             return f"axis_feed_{axis_name[0].lower()}"
-        if signal_name == "程序行号" and axis_name == "AX":
+        # 不同采集配置将程序行号标记为 AX 或 X轴；先匹配信号名，避免误取轴位置。
+        if signal_name == "程序行号" and axis_name in {"AX", "X轴"}:
             return "program_line"
         return None
 

@@ -118,15 +118,19 @@ GitHub 保存正式功能源码、运行入口、依赖配置和必要说明。�
 ## 项目目录与路径规则
 
 - 使用 Conda 虚拟环境 `AFC` 运行、测试和验证本项目。
-- 源码按职责直接放在 `src/` 下的子包中。区间和理想值入口在 `interval_analysis/`，论文模型各自维护功能包，共用函数在 `afc_common/`。业务数据和运行输出存于本地数据目录。
+- 源码按用途直接在 `src/` 下分包。同一功能的训练、推理和运行入口归入同一功能包。
+- `src/spindle_power/load_prediction/` 管理主轴功率预测的样本准备、模型训练、九折评价和研究入口。`src/spindle_power/spindle_runtime/` 负责同一功能的模型包加载和全行程推理。
+- `src/interval_analysis/` 管理稳态区间划分、理想值和 RG 生成。`src/afc_common/` 管理多个功能共用的工艺路径等基础实现。
+- 新论文先复用已有功能包。新增独立功能时，在 `src/` 下按该功能命名建包。
 - `tests/` 和 `scripts/verification/` 是预留目录；当前按用户要求不包含测试或验证代码。未来只有在明确需求要求时才能重新添加。
-- 静态样例数据放在 `data/sample/`，可变运行状态放在 `data/runtime/`。
+- 最小运行样例放在 `data/sample/`。源码桌面版的运行状态、默认导出和启动错误日志放在 `data/runtime/`。发布版的默认导出和启动错误日志写在 EXE 同目录。
+- 本地实验样本、训练检查点、评估结果和日志按论文编号存入 `data/paper<N>/`，各次实验按批次建子目录。当前负载预测实验归论文 1，服务默认写入 `data/paper1/service/`。共享原始资料归工作区的「数据资料」。
 - 本机应用配置放在 `config/`，正式案例配置放在 `profiles/`，派生 profile 缓存放在 `profiles/cache/`。
-- 程序生成的表格、图片、日志和临时结果统一放在 `output/`，不得重新散落到项目根目录。
+- 新产物按上述数据目录写入。迁移历史实验批次时按相对路径复核每个文件的 SHA-256，在本地归档保存迁移清单。
 - 文档放在 `docs/`；不参与当前运行的历史源码仅放在 `archive/`。
-- 新增路径必须优先使用 `pathlib`，并基于 `src/interval_analysis/shared.py` 中的项目根目录常量定位，不得依赖当前工作目录。
+- 新增路径使用 `pathlib`。默认路径基于所属功能的源码位置定位项目根目录，显式输入路径由调用方提供。
 - 外部实验数据目录通过用户配置指定，不得在源码中新增机器相关的绝对路径。
-- `config/app_config.json`、`data/runtime/`、`profiles/cache/`、`output/` 和 Python/pytest 缓存属于本机可变内容，不纳入版本管理。
+- 代码仓库的 `data/` 只收录必要的静态运行样例。`data/paper<N>/`、`data/runtime/`、本机配置和缓存留在本地。
 
 ## 发布版管理规则
 

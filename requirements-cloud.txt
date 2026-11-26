@@ -1,0 +1,11 @@
+# Core versions observed in the verified AFC environment, 2026-10-16.
+# Install the NVIDIA wheel separately:
+# python -m pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+# This file does not change the local AFC environment or old requirements.
+numpy==2.2.5
+pandas==2.3.3
+scipy==1.15.3
+scikit-learn==1.7.1
+matplotlib==3.10.7
+threadpoolctl==3.5.0
+pytest==9.0.2

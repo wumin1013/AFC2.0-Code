@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .plot_figure import create_plot_figure
+
 from .shared import *
 from .release_metadata import RELEASE_VERSION
 
@@ -334,7 +336,7 @@ class BootstrapUiMixin:
         # 值: {"rg": float, "updated_at": str (ISO格式)}
         # 理想值 = 均值 × rg，运行时计算，不持久化
         self.ideal_store: Dict[Tuple[str, str], Dict] = {}
-        # 源码研究版写入 output/；冻结发布版的 OUTPUT_DIR 就是 EXE 所在目录。
+        # 源码运行结果写入 data/runtime，冻结发布版写入 EXE 所在目录。
         runtime_directories = [CONFIG_DIR, RUNTIME_DATA_DIR, OUTPUT_DIR]
         if self.enable_profile_config:
             runtime_directories.extend((PROFILE_DIR, PROFILE_CACHE_DIR))
@@ -398,6 +400,10 @@ class BootstrapUiMixin:
         self.create_data_processing_tab()
         if self.enable_research_features:
             self.create_pit_tab()
+            from spindle_power.load_prediction.training_service import DEFAULT_OUTPUT
+            from spindle_power.load_prediction.workbench import LoadPredictionWorkbench
+            self.load_prediction_tab = LoadPredictionWorkbench(self.notebook, DEFAULT_OUTPUT.parent)
+            self.notebook.add(self.load_prediction_tab, text="负载预测")
         # self.create_steady_state_tab()  # 已合并到工艺信息分析页
         
         # 初始化图表
@@ -446,7 +452,8 @@ class BootstrapUiMixin:
         fig_height = 8
         
         # 数据处理标签页的图表 - 使用较低DPI加快启动
-        self.fig_data, self.ax_data = plt.subplots(figsize=(fig_width, fig_height), dpi=80)
+        self.fig_data = create_plot_figure(figsize=(fig_width, fig_height), dpi=80)
+        self.ax_data = self.fig_data.subplots()
         
         # 设置白色背景
         self.fig_data.patch.set_facecolor('white')
@@ -789,7 +796,8 @@ class BootstrapUiMixin:
             font=UI_FONT_SMALL, foreground=UI_COLOR_TEXT_MUTED,
         )
         self.idle_curve_hint_label.grid(row=0, column=0, sticky="w", pady=(0, 4))
-        self.fig_idle_curve, self.ax_idle_curve = plt.subplots(figsize=(6.2, 2.35), dpi=90)
+        self.fig_idle_curve = create_plot_figure(figsize=(6.2, 2.35), dpi=90)
+        self.ax_idle_curve = self.fig_idle_curve.subplots()
         self.fig_idle_curve.patch.set_facecolor(PLOT_FIG_BG)
         self.ax_idle_curve.set_facecolor(PLOT_AX_BG)
         self.fig_idle_curve.subplots_adjust(left=0.08, right=0.985, top=0.88, bottom=0.24)

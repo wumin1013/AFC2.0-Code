@@ -93,7 +93,7 @@ def _write_startup_error(exc: BaseException) -> str:
     primary_log = (
         _startup_log_root() / "startup-error.log"
         if getattr(sys, "frozen", False)
-        else _startup_log_root() / "output" / "startup-error.log"
+        else _startup_log_root() / "data" / "runtime" / "startup-error.log"
     )
     candidates = (
         primary_log,

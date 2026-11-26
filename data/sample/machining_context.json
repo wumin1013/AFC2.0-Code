@@ -1,0 +1,14 @@
+{
+  "schema_version": "1.0",
+  "machine": {
+    "model": "200C-2"
+  },
+  "tool": {
+    "name": "硬质铝合金三刃立铣刀D10",
+    "diameter_mm": 10,
+    "flutes": 3
+  },
+  "workpiece": {
+    "material": "6061铝"
+  }
+}

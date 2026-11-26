@@ -5,6 +5,8 @@ import csv
 import bisect
 from pathlib import Path
 
+from .plot_figure import create_plot_figure
+
 from .shared import *
 
 
@@ -2000,7 +2002,8 @@ class InputIdleMixin:
         )
         chart_hint_label.grid(row=0, column=0, sticky="w", pady=(0, 4))
 
-        fig_idle_detail, ax_idle_detail = plt.subplots(figsize=(7.4, 3.0), dpi=100)
+        fig_idle_detail = create_plot_figure(figsize=(7.4, 3.0), dpi=100)
+        ax_idle_detail = fig_idle_detail.subplots()
         fig_idle_detail.patch.set_facecolor(PLOT_FIG_BG)
         ax_idle_detail.set_facecolor(PLOT_AX_BG)
         fig_idle_detail.subplots_adjust(left=0.08, right=0.985, top=0.88, bottom=0.24)

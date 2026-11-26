@@ -509,6 +509,54 @@ def _fill_heights_at_x(collections, x_values) -> np.ndarray:
 
 
 class CurrentRequirementRegressionTests(unittest.TestCase):
+    def test_experiment_channel_parser_accepts_program_line_axis_aliases(self):
+        parser = ProcessingCoreMixin()
+        parser.detect_file_encoding = lambda _path: "gbk"
+        headers = [
+            "<ChannelInfo>,<False>,<5>,<实际速度>,<5>,<SP轴>,<0>,<1>,<1>,<10>",
+            "<ChannelInfo>,<True>,<107>,<G寄存器>,<0>,<X轴>,<432>",
+            "<ChannelInfo>,<False>,<1>,<指令位置>,<0>,<X轴>,<0>",
+            "<ChannelInfo>,<False>,<5>,<实际速度>,<0>,<X轴>,<0>",
+            "<ChannelInfo>,<False>,<5>,<实际速度>,<1>,<Y轴>,<0>",
+            "<ChannelInfo>,<False>,<5>,<实际速度>,<2>,<Z轴>,<0>",
+            "<ChannelInfo>,<False>,<12>,<程序行号>,<0>,<{axis}>,<0>",
+        ]
+        rows = [
+            [8000, -25, -210.5, 3, 4, 0, 0],
+            [288000, 6, -211.5, 0, 5, 12, 651],
+        ]
+        with TemporaryDirectory() as temp_dir:
+            data_path = Path(temp_dir) / "measurement.csv"
+            for axis in ("AX", "X轴"):
+                for order in (list(range(7)), [1, 6, 2, 3, 4, 5, 0]):
+                    with self.subTest(axis=axis, order=order):
+                        payload = ["<Scope>"]
+                        payload.extend(headers[index].format(axis=axis) for index in order)
+                        payload.extend(
+                            "<ChannelData>," + ",".join(str(row[index]) for index in order) + ","
+                            for row in rows
+                        )
+                        data_path.write_text("\n".join(payload), encoding="gbk")
+                        result = parser.parse_channel_data_file(data_path)
+
+                        self.assertEqual(2, result["sample_count"])
+                        self.assertEqual(order.index(6), result["channel_columns"]["program_line"])
+                        np.testing.assert_array_equal(result["program_line"], [0, 651])
+                        np.testing.assert_allclose(result["actual_load"], [25, 6])
+                        np.testing.assert_allclose(result["actual_feed_speed"], [5, 13])
+                        # 通道头倍率不同也保留采样转速原值，由采集端修正。
+                        np.testing.assert_array_equal(result["actual_spindle_speed"], [8000, 288000])
+
+    def test_experiment_program_line_alias_does_not_match_axis_position(self):
+        parser = ProcessingCoreMixin()
+        for signal_name in ("指令位置", "实际位置"):
+            tokens = ["ChannelInfo", "False", "1", signal_name, "0", "X轴", "0"]
+            with self.subTest(signal_name=signal_name):
+                self.assertIsNone(parser._match_channel_info_key(tokens))
+        self.assertIsNone(parser._match_channel_info_key(
+            ["ChannelInfo", "False", "12", "程序行号", "0", "Y轴", "0"]
+        ))
+
     def test_experiment_channel_parser_batch_reads_only_required_columns(self):
         payload = "\n".join((
             "<Scope>",

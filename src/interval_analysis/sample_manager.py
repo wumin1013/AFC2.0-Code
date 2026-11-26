@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .plot_figure import create_plot_figure
+
 import codecs
 import locale
 
@@ -44,7 +46,8 @@ class SampleManagerMixin:
         self.sample_data_valid_mask = valid_mask
         self.sample_data_valid_blocks = valid_blocks
 
-        fig, ax = plt.subplots(figsize=(16, 9), dpi=100)
+        fig = create_plot_figure(figsize=(16, 9), dpi=100)
+        ax = fig.subplots()
         fig.patch.set_facecolor(PLOT_FIG_BG)
         self.apply_plot_style(ax, grid=False)
         self.apply_tool_background(ax, program_name, None if display_mode == "program" else tool_id)

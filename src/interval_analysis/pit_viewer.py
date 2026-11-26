@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .plot_figure import create_plot_figure
+
 from .shared import *
 
 
@@ -199,7 +201,8 @@ class PitViewerMixin:
         container = getattr(self, "pit_plot_container", None)
         if container is None:
             return None, None
-        fig, axes = plt.subplots(4, 2, figsize=(13.5, 8.0), dpi=90, squeeze=False)
+        fig = create_plot_figure(figsize=(13.5, 8.0), dpi=90)
+        axes = fig.subplots(4, 2, squeeze=False)
         fig.patch.set_facecolor(PLOT_FIG_BG)
         fig.subplots_adjust(left=0.075, right=0.985, top=0.94, bottom=0.075, hspace=0.42, wspace=0.20)
         canvas = FigureCanvasTkAgg(fig, master=container)

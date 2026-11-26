@@ -14,13 +14,19 @@ from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
 
 os.environ.setdefault("MPLBACKEND", "TkAgg")
+# Windows Conda MKL and optional CPU PyTorch can ship different OpenMP DLLs.
+# Select sequential MKL before numpy initializes it; never allow duplicate OMP.
+if sys.platform == "win32":
+    os.environ.setdefault("MKL_THREADING_LAYER", "SEQUENTIAL")
 gc.set_threshold(10000, 10, 10)
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import matplotlib
-matplotlib.use("TkAgg")
+# Offline preparation and tests explicitly select Agg; never override it with
+# a GUI backend. The desktop application keeps TkAgg as its default above.
+matplotlib.use(os.environ["MPLBACKEND"])
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -120,7 +126,7 @@ RUNTIME_DATA_DIR = PROJECT_ROOT / "data" / "runtime"
 PROFILE_DIR = PROJECT_ROOT / "profiles"
 PROFILE_CACHE_DIR = PROFILE_DIR / "cache"
 # 冻结发布版的结果直接写到 EXE 同目录；源码研究版继续集中写入项目 output/。
-OUTPUT_DIR = PROJECT_ROOT if IS_FROZEN else PROJECT_ROOT / "output"
+OUTPUT_DIR = PROJECT_ROOT if IS_FROZEN else RUNTIME_DATA_DIR
 
 # 仅使用目标 Windows 已安装字体的回退链。发布包不携带来源不明的字体文件。
 simhei_path = ""

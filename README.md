@@ -71,7 +71,7 @@ SampleData.txt
 iipinc.txt        # 可选；缺失或无效时使用工艺信息中的 F
 ```
 
-`iipinc.txt` 第一列是一基物理行号；程序自动识别单行格式和相邻双行重复格式：单行逐行使用且第八列乘以 `0.6`，严格双行重复时每对只保留一行且第八列乘以 `0.6×10^-4`，并允许末尾存在与数据行数一致的 `Total periods <数量>` 汇总行。文件有效但个别行缺失时只回退该行的编程 F。保存结果时，发布版 `ProcessInfo.csv` 的 F 会按同一行内中点规则替换为指令进给，MRR 随写出的 F 重新计算；未覆盖点保留原编程 F，并在保存提示中报告。程序不轮询或热重载，绘图切换会复用按文件大小和修改时间建立的内存缓存。发布目录必须可写，不建议放入 `Program Files`。发布 EXE 生成的 `SampleData.rg`、`ProcessInfo.csv`、图片、表格和错误日志直接写到 EXE 同目录，不创建 `output` 子目录；源码研究模式仍写项目 `output/`。
+`iipinc.txt` 第一列是一基物理行号；程序自动识别单行格式和相邻双行重复格式：单行逐行使用且第八列乘以 `0.6`，严格双行重复时每对只保留一行且第八列乘以 `0.6×10^-4`，并允许末尾存在与数据行数一致的 `Total periods <数量>` 汇总行。文件有效但个别行缺失时只回退该行的编程 F。保存结果时，发布版 `ProcessInfo.csv` 的 F 会按同一行内中点规则替换为指令进给，MRR 随写出的 F 重新计算；未覆盖点保留原编程 F，并在保存提示中报告。程序不轮询或热重载，绘图切换会复用按文件大小和修改时间建立的内存缓存。发布目录必须可写，不建议放入 `Program Files`。发布 EXE 生成的 `SampleData.rg`、`ProcessInfo.csv`、图片、表格和错误日志直接写到 EXE 同目录。源码研究模式的桌面默认导出和启动日志写入 `data/runtime/`。
 
 工艺信息通常导入 `AfoMilling_origin_trace_*.txt`；程序保存出的 `ProcessInfo.csv` 也可重新导入。解析器按表头区分两种布局：AfoMilling 可带首列“序号”，ProcessInfo 不带该列；两者的 N 都按一基程序物理行号读取，内部统一转换为零基行号。
 
@@ -92,7 +92,7 @@ iipinc.txt        # 可选；缺失或无效时使用工艺信息中的 F
   -PythonPath 'C:\path\to\AFC\python.exe'
 ```
 
-默认生成 `../历史归档/发布版本/AFC2.0.2Alpha-debug/` 和 `../历史归档/发布版本/AFC2.0.2alpha.zip`。脚本先构建并验证纯净候选目录，再从该候选目录生成 ZIP、解压 ZIP 并再次完整验证；两者均成功后才替换当前版本的调试目录、恢复该版本的调试现场并替换同版本 ZIP。其他版本的 `*-debug/` 与 ZIP 保持独立并长期保留。构建验证通过后会自动删除 `.build-AFC2.0.2alpha` 中间目录；如需在构建前清理失败构建留下的缓存，可增加 `-CleanBuild`。脚本只操作当前版本的发布产物和专用构建中间目录，不会清理其他版本或源码研究模式的 `output/`。
+默认生成 `../历史归档/发布版本/AFC2.0.2Alpha-debug/` 和 `../历史归档/发布版本/AFC2.0.2alpha.zip`。脚本先构建并验证纯净候选目录，再从该候选目录生成 ZIP、解压 ZIP 并再次完整验证；两者均成功后才替换当前版本的调试目录、恢复该版本的调试现场并替换同版本 ZIP。其他版本的 `*-debug/` 与 ZIP 保持独立并长期保留。构建验证通过后会自动删除 `.build-AFC2.0.2alpha` 中间目录；如需在构建前清理失败构建留下的缓存，可增加 `-CleanBuild`。脚本的清理范围限于当前版本的发布产物和专用构建中间目录。
 
 ```powershell
 & .\scripts\build_release.ps1 -CleanBuild
@@ -169,17 +169,17 @@ set MKL_THREADING_LAYER=SEQUENTIAL
 python -m pip install -r requirements-load-prediction.txt
 python scripts\load_prediction.py --help
 set PYTHONPATH=src
-python -m load_prediction.unified_cli --help
+python -m spindle_power.load_prediction.unified_cli --help
 ```
 
-src/load_prediction/ 保存切削功率模型、训练、评估和预测。src/spindle_runtime/ 提供单文件主轴功率模型包的加载和全位置推理。输入数据、模型权重和输出目录由调用方指定。论文 1 的研究初始权重及其采用回执见论文仓库的 models/。
+主轴功率预测集中在 `src/spindle_power/`，包含训练与研究入口 `load_prediction/` 和单文件模型加载与全行程推理 `spindle_runtime/`。论文 1 的实验批次保存在本地 `data/paper1/`，训练服务默认写入 `data/paper1/service/`。论文采用的研究初始权重及回执见独立论文仓库的 `models/`。
 
 ### 源码分工
 
 | 功能 | 代码入口 |
 | --- | --- |
 | 区间划分、理想值和 RG | src/interval_analysis/ 保存区间应用、理想值、传统机理模型和 RG 导出。src/interval_analysis/segmentation/ 提供区间划分算法。 |
-| 负载预测研究模型 | src/load_prediction/ 保存物理主趋势、路径残差、训练、九折评价和研究预测入口。 |
-| 主轴功率部署推理 | src/spindle_runtime/ 加载单文件模型包并完成全工艺位置的主轴功率推理。 |
+| 负载预测研究模型 | `src/spindle_power/load_prediction/` 保存物理主趋势、路径残差、训练、九折评价和研究预测入口。 |
+| 主轴功率部署推理 | `src/spindle_power/spindle_runtime/` 加载单文件模型包并完成全工艺位置的主轴功率推理。 |
 
 源码直接按功能放在 src/ 下。后续论文使用独立实现时，新增相应功能包。共用轨迹处理在 src/afc_common/。
