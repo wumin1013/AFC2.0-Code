@@ -183,8 +183,8 @@ class ProcessingCoreMixin:
         """判断是否为工艺信息表头行。"""
         return self._detect_process_header_layout(tokens) is not None
 
-    def _detect_process_path_semantics_hint(self, tokens):
-        """按表头契约区分逐行行程与显式累计行程。"""
+    def _detect_process_path_semantics_hint(self, tokens, *, default="incremental"):
+        """优先使用表头明确声明的行程含义。"""
         for token in tokens or []:
             if self._canonicalize_process_header_token(token) != "s(mm)":
                 continue
@@ -199,9 +199,7 @@ class ProcessingCoreMixin:
                 or "perrow" in normalized
             ):
                 return "incremental"
-            # 普通 s / s(mm) 的固定契约是当前行增量，不再根据数值
-            # 是否恰好单调来猜测累计语义。
-            return "incremental"
+            return default
         return None
 
     def _parse_process_numeric(self, token, prefix=""):
@@ -283,8 +281,7 @@ class ProcessingCoreMixin:
             "feed_rate": float(feed_val),
             "gcode_content": gcode_content,
             "spindle_speed": float(spindle_val) if spindle_val is not None else None,
-            # 普通 s(mm) 固定是逐行增量；只有显式 cumulative 表头
-            # 才使用累计语义。这里先保留原始数值，稍后统一生成路径。
+            # 保留表中的数值，由文件级规则区分累计位置和逐点增量。
             "path_value": float(path_value) if path_value is not None else None,
             "path_column_present": s_token is not None,
             # MRR 列只参与布局定位。其单元格既不解析、也不校验，业务 MRR
@@ -1087,7 +1084,7 @@ class ProcessingCoreMixin:
         return getattr(config, name, default)
 
     def _validate_input_path(self, rows):
-        """按列契约全局验证行程；普通 s 默认是逐点增量。"""
+        """按表头声明和输入格式验证行程。"""
         try:
             path_tolerance = max(float(self._get_segmentation_config_value("path_tolerance_mm", 1e-8)), 0.0)
         except (TypeError, ValueError):
@@ -1139,6 +1136,13 @@ class ProcessingCoreMixin:
             current >= previous - path_tolerance * max(1.0, abs(previous), abs(current))
             for previous, current in zip(values, values[1:])
         )
+        if semantics_hint == "original_txt":
+            # 原工艺 TXT 的同一表头也见于旧增量文件。保留真实回落或
+            # 固定步长的旧输入，明确声明累计的文件仍按累计规则校验。
+            if cumulative_monotonic and values[-1] - values[0] > path_tolerance:
+                semantics_hint = "cumulative"
+            else:
+                semantics_hint = ""
         cumulative_span = float(max(values[-1], 0.0)) if values else 0.0
         incremental_values = [max(value, 0.0) for value in values]
         incremental_total = float(sum(incremental_values))
@@ -1276,36 +1280,28 @@ class ProcessingCoreMixin:
             row_index = group_end
 
     def _apply_input_path_positions(self, rows, semantics):
-        """按已判定的累计/增量语义生成统一累计 path_start/path_end。"""
-        if semantics == "incremental":
+        """用已验证的逐点距离生成路径边界。"""
+        if semantics == "incremental" and not any(row.get("_input_path_semantics_hint") for row in rows):
+            # 无明确逐点增量契约的旧格式沿用按指令长度分配。
             for row in rows:
                 if bool(row.get("_is_synthetic_fill")):
                     row["s"] = 0.0
-                    continue
-                try:
-                    segment_length = float(row.get("_input_path_value", 0.0) or 0.0)
-                except Exception:
-                    segment_length = 0.0
-                row["s"] = max(segment_length, 0.0)
-            # 同一指令含多个工艺点时，把该指令总行程确定性地均分到各点。
+                else:
+                    row["s"] = max(float(row["_input_path_value"]), 0.0)
             self._assign_group_distributed_path_positions(rows)
             return
 
         previous_end = 0.0
         for row in rows:
-            if bool(row.get("_is_synthetic_fill")):
-                end_val = previous_end
-            else:
-                try:
-                    end_val = float(row.get("_input_path_value"))
-                except (TypeError, ValueError):
-                    end_val = previous_end
-                if end_val < previous_end:
-                    end_val = previous_end
-            row["s"] = max(end_val - previous_end, 0.0)
+            end_val = previous_end
+            if not bool(row.get("_is_synthetic_fill")):
+                value = float(row["_input_path_value"])
+                end_val = max(value, previous_end) if semantics == "cumulative" else previous_end + max(value, 0.0)
+            row["s"] = end_val - previous_end
+            row["path_start"] = previous_end
+            row["path_end"] = end_val
+            row["path_cumulative"] = end_val
             previous_end = end_val
-        # 累计值先转换为逐点增量，再按同一指令的全部工艺点均分。
-        self._assign_group_distributed_path_positions(rows)
 
     def _resolve_exact_nc_state_for_process_row(self, raw_line_number, gcode_content):
         """以已验证文件行号为锚点，并用显式 N 做一致性校验。"""
@@ -2136,25 +2132,21 @@ class ProcessingCoreMixin:
                     source_file_line_count += 1
                     if str(line).strip():
                         raw_nonempty_row_count += 1
-                    raw_csv_line = str(line or "").strip().lstrip("\ufeff")
-                    if (
-                        raw_csv_line
-                        and "," in raw_csv_line
-                        and (
-                            process_layout is None
-                            or self._process_tokens_may_be_header(
-                                [raw_csv_line.split(",", 1)[0]],
-                                layout_hint=process_layout,
-                            )
-                        )
-                    ):
+                    raw_line = line.strip().lstrip("\ufeff")
+                    comma_separated = "," in raw_line
+                    first_field = raw_line.split(",", 1) if comma_separated else raw_line.split(maxsplit=1)
+                    if raw_line and self._process_tokens_may_be_header(first_field[:1], layout_hint=process_layout):
                         try:
-                            header_tokens = next(csv.reader([raw_csv_line]))
-                        except Exception:
+                            header_tokens = next(csv.reader([raw_line])) if comma_separated else raw_line.split()
+                        except csv.Error:
                             header_tokens = []
-                        if self._detect_process_header_layout(header_tokens):
+                        header_layout = self._detect_process_header_layout(header_tokens)
+                        if header_layout:
+                            default_semantics = "incremental" if comma_separated else None
+                            if not comma_separated and header_layout == PROCESS_LAYOUT_DIRECT_SEQ:
+                                default_semantics = "original_txt"
                             process_path_semantics_hint = (
-                                self._detect_process_path_semantics_hint(header_tokens)
+                                self._detect_process_path_semantics_hint(header_tokens, default=default_semantics)
                             )
                     previous_layout = process_layout
                     parsed, process_layout = self.parse_gcode_line(line, layout_hint=process_layout, return_layout=True)
